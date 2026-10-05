@@ -40,7 +40,102 @@ Docker 镜像、源码编译、配置与部署教程见下文。
 
 ---
 
-## 快速开始（Docker，推荐）
+## 部署方式
+
+有三种部署方式，按需选择：
+
+| 方式 | 适用场景 | 状态 |
+| --- | --- | --- |
+| **二进制 + systemd** | 最轻量，无 Docker 环境 | ✅ 推荐 |
+| **Docker / Compose** | 容器化环境 | ⚠️ 镜像暂不可用（见下） |
+| **源码编译** | 需要定制修改 | ✅ 可用 |
+
+---
+
+## 方式一：二进制部署（Linux）
+
+### 1. 下载二进制
+
+到 [Releases 页面](https://github.com/bitscr/new-api/releases) 下载对应架构的压缩包：
+
+```bash
+# 查看机器架构
+uname -m   # x86_64 → amd64；aarch64 → arm64
+
+# 下载并解压（以 amd64 为例，文件名以实际 Release 为准）
+wget https://github.com/bitscr/new-api/releases/latest/download/new-api-linux-amd64.tar.gz
+tar -xzf new-api-linux-amd64.tar.gz
+sudo mv new-api-linux-amd64 /usr/local/bin/new-api
+sudo chmod +x /usr/local/bin/new-api
+```
+
+> ⚠️ **目前 Releases 页面还没有任何已发布版本。** 二进制由 CI 自动构建发布：当仓库打了 `v*` tag 或手动触发「Build release binaries」workflow 后，会产生 `new-api-linux-amd64.tar.gz` / `new-api-linux-arm64.tar.gz` 资产。在第一个 Release 出现之前，请先用「方式三：源码编译」得到二进制。
+
+### 2. 准备目录与配置
+
+```bash
+sudo useradd -r -s /usr/sbin/nologin newapi 2>/dev/null || true
+sudo mkdir -p /opt/new-api/{data,logs,web}
+sudo chown -R newapi:newapi /opt/new-api
+
+# 如需使用 MySQL / PostgreSQL / Redis，编辑 /opt/new-api/env：
+sudo tee /opt/new-api/env > /dev/null <<'EOF'
+# SQL_DSN=postgresql://user:password@localhost:5432/new-api
+# REDIS_CONN_STRING=redis://:password@localhost:6379
+EOF
+```
+
+> 二进制内置前端资源（`go:embed`），**不需要**单独的 `web/dist` 目录。
+
+### 3. systemd 服务
+
+```bash
+sudo tee /etc/systemd/system/new-api.service > /dev/null <<'EOF'
+[Unit]
+Description=New API Service
+After=network.target
+
+[Service]
+User=newapi
+WorkingDirectory=/opt/new-api
+EnvironmentFile=/opt/new-api/env
+ExecStart=/usr/local/bin/new-api --port 3000 --log-dir /opt/new-api/logs
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now new-api
+sudo systemctl status new-api
+```
+
+### 4. 验证与初始化
+
+```bash
+curl http://localhost:3000/api/status
+```
+
+浏览器打开 <http://服务器IP:3000> 完成管理员初始化。
+
+### 常用运维命令
+
+```bash
+sudo systemctl restart new-api     # 重启
+journalctl -u new-api -f           # 查看实时日志
+ls /opt/new-api/logs               # 落盘日志目录
+```
+
+---
+
+## 方式二：Docker 部署
+
+> ⚠️ **镜像暂不可用**：GHCR 发布流水线目前构建失败（push 阶段被拒），`ghcr.io/bitscr/new-api` 尚无可用镜像。修复后会更新本节；当前请使用方式一或方式三。
+
+<details>
+<summary>Docker 命令（待镜像可用后生效）</summary>
 
 ### 1. 拉取镜像并运行（默认 SQLite）
 
@@ -74,9 +169,11 @@ curl http://localhost:3000/api/status
 
 返回 `{"success":true,...}` 即服务正常。
 
+</details>
+
 ---
 
-## Docker Compose 部署（Redis + 数据库）
+## 方式二补充：Docker Compose 部署（Redis + 数据库）
 
 仓库内自带 `docker-compose.yml`，默认组合为 **Redis + PostgreSQL**（也可改用 MySQL），包含健康检查与持久化卷：
 
@@ -95,7 +192,7 @@ docker compose up -d
 
 ---
 
-## 源码编译安装
+## 方式三：源码编译安装
 
 ### 前置要求
 
@@ -173,7 +270,7 @@ export SQL_DSN="user:password@tcp(host:3306)/new-api"
 | `ERROR_LOG_ENABLED` | 是否启用错误日志记录 | `true` |
 | `BATCH_UPDATE_ENABLED` | 是否启用批量更新 | `true` |
 | `NODE_NAME` | 节点名称（审计日志标识；多实例建议设置） | `node-1` |
-| `STREAMING_TIMEOUT` | 流模式无响应超时（秒），默认 `120` | `300` |
+| `STREAMING_TIMEOUT` | 流模式无响应超时（秒），默认 `300` | `300` |
 | `SYNC_FREQUENCY` | 需要定期数据库同步时设置（秒） | `60` |
 
 ---
@@ -210,6 +307,19 @@ server {
 ---
 
 ## 升级与备份
+
+**二进制方式升级：**
+
+```bash
+# 1. 下载新版二进制（见 Releases）
+wget https://github.com/bitscr/new-api/releases/latest/download/new-api-linux-amd64.tar.gz
+tar -xzf new-api-linux-amd64.tar.gz
+
+# 2. 替换二进制并重启
+sudo mv new-api-linux-amd64 /usr/local/bin/new-api
+sudo chmod +x /usr/local/bin/new-api
+sudo systemctl restart new-api
+```
 
 **Docker Compose 升级：**
 

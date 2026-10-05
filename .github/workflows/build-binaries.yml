@@ -1,0 +1,68 @@
+name: Build release binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and publish Linux binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Write version
+        run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "$VERSION" > VERSION
+
+      - name: Build frontend
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION="$(cat ../VERSION)" bun run build
+
+      - name: Build and package binaries
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" \
+              -o "release/new-api-linux-$arch" .
+            tar -C release -czf "release/new-api-linux-$arch.tar.gz" "new-api-linux-$arch"
+            sha256sum "release/new-api-linux-$arch.tar.gz" > "release/new-api-linux-$arch.tar.gz.sha256"
+          done
+          ls -lh release/
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            release/*.tar.gz
+            release/*.sha256
+          generate_release_notes: true
