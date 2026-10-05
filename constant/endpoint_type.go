@@ -1,0 +1,26 @@
+package constant
+
+type EndpointType string
+
+const (
+	EndpointTypeTypeSafeSystemOne     EndpointType = "typesafe-systemone"
+	EndpointTypeOpenAI                EndpointType = "openai"
+	EndpointTypeOpenAIResponse        EndpointType = "openai-response"
+	EndpointTypeOpenAIResponseCompact EndpointType = "openai-response-compact"
+	EndpointTypeAnthropic             EndpointType = "anthropic"
+	EndpointTypeGemini                EndpointType = "gemini"
+	EndpointTypeJinaRerank            EndpointType = "jina-rerank"
+	EndpointTypeCohereChat            EndpointType = "cohere-chat"
+	EndpointTypeCohereRerank          EndpointType = "cohere-rerank"
+	EndpointTypeCohereEmbeddings      EndpointType = "cohere-embeddings"
+	EndpointTypeImageGeneration       EndpointType = "image-generation"
+	EndpointTypeEmbeddings            EndpointType = "embeddings"
+	EndpointTypeOpenAIVideo           EndpointType = "openai-video"
+	EndpointTypeBatchGeneration       EndpointType = "batch-generation"
+	EndpointTypeAudioSpeech           EndpointType = "audio-speech"
+	EndpointTypeAudioTranscription    EndpointType = "audio-transcription"
+	//EndpointTypeMidjourney     EndpointType = "midjourney-proxy"
+	//EndpointTypeSuno           EndpointType = "suno-proxy"
+	//EndpointTypeKling          EndpointType = "kling"
+	//EndpointTypeJimeng         EndpointType = "jimeng"
+)

@@ -1,0 +1,113 @@
+/*
+Copyright (C) 2026 bitscr
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For licensing inquiries, please open an issue at https://github.com/bitscr/new-api/issues
+*/
+
+import React, { useContext, useEffect, useRef } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
+import {
+  API,
+  showError,
+  showSuccess,
+  updateAPI,
+  setUserData,
+} from '../../helpers';
+import { UserContext } from '../../context/User';
+import Loading from '../common/ui/Loading';
+import { getOAuthCallbackParams } from '../../helpers/oauthCallback';
+
+const OAuth2Callback = (props) => {
+  const { t } = useTranslation();
+  const [searchParams] = useSearchParams();
+  const [userState, userDispatch] = useContext(UserContext);
+  const navigate = useNavigate();
+
+  // 防止 React 18 Strict Mode 下重复执行
+  const hasExecuted = useRef(false);
+
+  // 最大重试次数
+  const MAX_RETRIES = 3;
+
+  const failurePath = userState.user ? '/console/personal' : '/login';
+
+  const sendCode = async (params, retry = 0) => {
+    try {
+      const { data: resData } = await API.get(
+        `/api/oauth/${encodeURIComponent(props.type)}?${params.toString()}`,
+        { skipErrorHandler: true },
+      );
+
+      const { success, message, data } = resData;
+
+      if (!success) {
+        // 业务错误不重试，直接显示错误
+        showError(message || t('授权失败'));
+        navigate(failurePath, { replace: true });
+        return;
+      }
+
+      if (data?.action === 'bind') {
+        showSuccess(t('绑定成功！'));
+        navigate('/console/personal');
+      } else {
+        userDispatch({ type: 'login', payload: data });
+        localStorage.setItem('user', JSON.stringify(data));
+        setUserData(data);
+        updateAPI();
+        showSuccess(t('登录成功！'));
+        navigate('/console/token');
+      }
+    } catch (error) {
+      // 网络错误等可重试
+      if (!error.response && retry < MAX_RETRIES && !params.has('error')) {
+        // 递增的退避等待
+        await new Promise((resolve) => setTimeout(resolve, (retry + 1) * 2000));
+        return sendCode(params, retry + 1);
+      }
+
+      // 重试次数耗尽，提示错误并返回设置页面
+      showError(
+        error.response?.data?.message || error.message || t('授权失败'),
+      );
+      navigate(failurePath, { replace: true });
+    }
+  };
+
+  useEffect(() => {
+    // 防止 React 18 Strict Mode 下重复执行
+    if (hasExecuted.current) {
+      return;
+    }
+    hasExecuted.current = true;
+
+    const params = getOAuthCallbackParams(searchParams);
+
+    // 参数缺失直接返回
+    if (!params.get('code') && !params.get('error')) {
+      showError(t('未获取到授权码'));
+      navigate(failurePath, { replace: true });
+      return;
+    }
+
+    sendCode(params);
+  }, []);
+
+  return <Loading />;
+};
+
+export default OAuth2Callback;

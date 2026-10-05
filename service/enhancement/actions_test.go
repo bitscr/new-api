@@ -1,0 +1,572 @@
+package enhancement
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func setupUserPurgeTestDB(t *testing.T) {
+	t.Helper()
+
+	originalDB := model.DB
+	originalLogDB := model.LOG_DB
+	originalUsingSQLite := common.UsingSQLite
+	originalUsingMySQL := common.UsingMySQL
+	originalUsingPostgreSQL := common.UsingPostgreSQL
+	originalRedisEnabled := common.RedisEnabled
+
+	common.UsingSQLite = true
+	common.UsingMySQL = false
+	common.UsingPostgreSQL = false
+	common.RedisEnabled = false
+
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	model.LOG_DB = db
+
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Log{}))
+
+	t.Cleanup(func() {
+		sqlDB, err := db.DB()
+		if err == nil {
+			_ = sqlDB.Close()
+		}
+		model.DB = originalDB
+		model.LOG_DB = originalLogDB
+		common.UsingSQLite = originalUsingSQLite
+		common.UsingMySQL = originalUsingMySQL
+		common.UsingPostgreSQL = originalUsingPostgreSQL
+		common.RedisEnabled = originalRedisEnabled
+	})
+}
+
+func setupRiskActionTestDB(t *testing.T) {
+	t.Helper()
+
+	originalDB := model.DB
+	originalLogDB := model.LOG_DB
+	originalUsingSQLite := common.UsingSQLite
+	originalUsingMySQL := common.UsingMySQL
+	originalUsingPostgreSQL := common.UsingPostgreSQL
+	originalRedisEnabled := common.RedisEnabled
+
+	common.UsingSQLite = true
+	common.UsingMySQL = false
+	common.UsingPostgreSQL = false
+	common.RedisEnabled = false
+
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	model.LOG_DB = db
+
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.IPBan{}, &model.Log{}))
+
+	t.Cleanup(func() {
+		sqlDB, err := db.DB()
+		if err == nil {
+			_ = sqlDB.Close()
+		}
+		model.DB = originalDB
+		model.LOG_DB = originalLogDB
+		common.UsingSQLite = originalUsingSQLite
+		common.UsingMySQL = originalUsingMySQL
+		common.UsingPostgreSQL = originalUsingPostgreSQL
+		common.RedisEnabled = originalRedisEnabled
+		model.InitIPBanCache()
+	})
+}
+
+func setupModelStatusOptionTestDB(t *testing.T) {
+	t.Helper()
+
+	originalDB := model.DB
+	originalLogDB := model.LOG_DB
+	originalUsingSQLite := common.UsingSQLite
+	originalUsingMySQL := common.UsingMySQL
+	originalUsingPostgreSQL := common.UsingPostgreSQL
+	originalRedisEnabled := common.RedisEnabled
+	originalOptionMap := common.OptionMap
+
+	common.UsingSQLite = true
+	common.UsingMySQL = false
+	common.UsingPostgreSQL = false
+	common.RedisEnabled = false
+	common.OptionMap = map[string]string{}
+
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB = db
+	model.LOG_DB = db
+
+	require.NoError(t, db.AutoMigrate(&model.Option{}))
+
+	t.Cleanup(func() {
+		sqlDB, err := db.DB()
+		if err == nil {
+			_ = sqlDB.Close()
+		}
+		model.DB = originalDB
+		model.LOG_DB = originalLogDB
+		common.UsingSQLite = originalUsingSQLite
+		common.UsingMySQL = originalUsingMySQL
+		common.UsingPostgreSQL = originalUsingPostgreSQL
+		common.RedisEnabled = originalRedisEnabled
+		common.OptionMap = originalOptionMap
+	})
+}
+
+func seedPurgeUser(t *testing.T, id int, role int, status int, softDeleted bool) {
+	t.Helper()
+
+	user := model.User{
+		Id:       id,
+		Username: fmt.Sprintf("purge_user_%d", id),
+		Password: "password",
+		Role:     role,
+		Status:   status,
+		AffCode:  fmt.Sprintf("aff_%d", id),
+	}
+	require.NoError(t, model.DB.Create(&user).Error)
+	if softDeleted {
+		require.NoError(t, model.DB.Delete(&user).Error)
+	}
+}
+
+func seedRiskUser(t *testing.T, username string) model.User {
+	t.Helper()
+
+	user := model.User{
+		Username: username,
+		Password: "password",
+		Role:     common.RoleCommonUser,
+		Status:   common.UserStatusEnabled,
+		AffCode:  "aff_" + username,
+	}
+	require.NoError(t, model.DB.Create(&user).Error)
+	return user
+}
+
+func seedRiskToken(t *testing.T, userId int, name string) model.Token {
+	t.Helper()
+
+	token := model.Token{
+		UserId:      userId,
+		Name:        name,
+		Key:         "sk-" + name,
+		Status:      common.TokenStatusEnabled,
+		RemainQuota: 100,
+	}
+	require.NoError(t, model.DB.Create(&token).Error)
+	return token
+}
+
+func requirePurgeUserExists(t *testing.T, id int, expected bool) {
+	t.Helper()
+
+	var count int64
+	require.NoError(t, model.DB.Unscoped().Model(&model.User{}).Where("id = ?", id).Count(&count).Error)
+	if expected {
+		require.Equal(t, int64(1), count)
+		return
+	}
+	require.Equal(t, int64(0), count)
+}
+
+func requireBatchUser(t *testing.T, id int, status int, disableReason string, deleted bool) {
+	t.Helper()
+
+	var user model.User
+	require.NoError(t, model.DB.Unscoped().First(&user, id).Error)
+	require.Equal(t, status, user.Status)
+	require.Equal(t, disableReason, user.DisableReason)
+	require.Equal(t, deleted, user.DeletedAt.Valid)
+}
+
+func TestSaveModelStatusRequestCountHideThreshold(t *testing.T) {
+	setupModelStatusOptionTestDB(t)
+
+	cfg := setting.GetEnhancementSetting()
+	originalThreshold := cfg.ModelStatusRequestCountHideThreshold
+	t.Cleanup(func() {
+		cfg.ModelStatusRequestCountHideThreshold = originalThreshold
+		ClearModelStatusPublicCache()
+	})
+
+	require.NoError(t, SaveModelStatusOption("model_status_request_count_hide_threshold", "12", 1))
+	require.Equal(t, 12, cfg.ModelStatusRequestCountHideThreshold)
+
+	var option model.Option
+	require.NoError(t, model.DB.Where("key = ?", "enhancement_setting.model_status_request_count_hide_threshold").First(&option).Error)
+	require.Equal(t, "12", option.Value)
+}
+
+func TestSaveModelStatusOneMinuteSlots(t *testing.T) {
+	setupModelStatusOptionTestDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Log{}))
+	cfg := setting.GetEnhancementSetting()
+	original := cfg.ModelStatusSlotMinutes
+	t.Cleanup(func() {
+		cfg.ModelStatusSlotMinutes = original
+		ClearModelStatusPublicCache()
+	})
+
+	require.NoError(t, SaveModelStatusOption("model_status_slot_minutes", "1", 1))
+	require.Equal(t, 1, ModelStatusConfig(false)["slot_minutes"])
+	status, err := ModelStatusForGroupWindow("default", "one-minute-model", ModelStatusWindowHalfHour, false)
+	require.NoError(t, err)
+	require.Len(t, status.SlotData, 30)
+	for _, slot := range status.SlotData {
+		require.Equal(t, int64(60), slot.EndTime-slot.StartTime)
+	}
+	for _, value := range []string{"0", "-1", "1441", "1.5"} {
+		require.Error(t, SaveModelStatusOption("model_status_slot_minutes", value, 1))
+	}
+	require.Equal(t, 1, cfg.ModelStatusSlotMinutes)
+}
+
+func TestSaveModelStatusShortWindowsAppliesTimeRange(t *testing.T) {
+	for _, tc := range []struct {
+		window  string
+		minutes int
+	}{
+		{window: "0.5h", minutes: 30},
+		{window: "1h", minutes: 60},
+		{window: "6h", minutes: 360},
+		{window: "12h", minutes: 720},
+	} {
+		t.Run(tc.window, func(t *testing.T) {
+			setupModelStatusOptionTestDB(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.Log{}))
+			configureModelStatusIgnoredErrorKeywords(t, false, nil)
+
+			cfg := setting.GetEnhancementSetting()
+			originalMinutes := cfg.ModelStatusTimeWindowMins
+			t.Cleanup(func() {
+				cfg.ModelStatusTimeWindowMins = originalMinutes
+				ClearModelStatusPublicCache()
+			})
+
+			now := common.GetTimestamp()
+			seedModelStatusLogs(t, model.DB,
+				model.Log{ModelName: "short-window", Group: "default", Type: model.LogTypeConsume, CreatedAt: now - 60},
+				model.Log{ModelName: "short-window", Group: "default", Type: model.LogTypeError, CreatedAt: now - int64(tc.minutes*60) - 60},
+			)
+
+			for _, value := range []string{tc.window, fmt.Sprint(tc.minutes)} {
+				require.NoError(t, SaveModelStatusOption("model_status_time_window_mins", value, 1))
+				require.Equal(t, tc.window, ModelStatusConfig(true)["current_window"])
+				require.Equal(t, tc.window, ModelStatusWindowFromMinutes(tc.minutes))
+
+				var option model.Option
+				require.NoError(t, model.DB.Where("key = ?", "enhancement_setting.model_status_time_window_mins").First(&option).Error)
+				require.Equal(t, fmt.Sprint(tc.minutes), option.Value)
+
+				status, err := ModelStatusForGroupWindow("default", "short-window", ModelStatusConfiguredWindow(), false)
+				require.NoError(t, err)
+				require.Equal(t, tc.window, status.TimeWindow)
+				require.Equal(t, tc.minutes, status.TimeWindowMinutes)
+				require.Equal(t, int64(1), status.TotalRequests)
+				require.Equal(t, int64(1), status.SuccessCount)
+				require.Zero(t, status.ErrorCount)
+				require.NotEmpty(t, status.SlotData)
+				require.Equal(t, int64(tc.minutes*60), status.SlotData[len(status.SlotData)-1].EndTime-status.SlotData[0].StartTime)
+			}
+		})
+	}
+}
+
+func TestSaveModelStatusRequestCountHideThresholdRejectsInvalidValues(t *testing.T) {
+	setupModelStatusOptionTestDB(t)
+
+	for _, value := range []string{"-1", "1000001", "1.5", "true", "abc"} {
+		err := SaveModelStatusOption("model_status_request_count_hide_threshold", value, 1)
+		require.Error(t, err, "value %q should be rejected", value)
+	}
+}
+
+func TestPurgeSoftDeletedUsersAdminDeletesOnlyCommonUsers(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	seedPurgeUser(t, 101, common.RoleCommonUser, common.UserStatusEnabled, true)
+	seedPurgeUser(t, 102, common.RoleAdminUser, common.UserStatusEnabled, true)
+	seedPurgeUser(t, 103, common.RoleRootUser, common.UserStatusEnabled, true)
+	seedPurgeUser(t, 104, common.RoleCommonUser, common.UserStatusDisabled, false)
+
+	deleted, err := PurgeSoftDeletedUsers(900, common.RoleAdminUser)
+
+	require.NoError(t, err)
+	require.Equal(t, int64(1), deleted)
+	requirePurgeUserExists(t, 101, false)
+	requirePurgeUserExists(t, 102, true)
+	requirePurgeUserExists(t, 103, true)
+	requirePurgeUserExists(t, 104, true)
+}
+
+func TestPurgeSoftDeletedUsersRootDeletesOnlyCommonUsers(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	seedPurgeUser(t, 201, common.RoleCommonUser, common.UserStatusEnabled, true)
+	seedPurgeUser(t, 202, common.RoleAdminUser, common.UserStatusEnabled, true)
+	seedPurgeUser(t, 203, common.RoleRootUser, common.UserStatusEnabled, true)
+	seedPurgeUser(t, 204, common.RoleCommonUser, common.UserStatusDisabled, false)
+
+	deleted, err := PurgeSoftDeletedUsers(900, common.RoleRootUser)
+
+	require.NoError(t, err)
+	require.Equal(t, int64(1), deleted)
+	requirePurgeUserExists(t, 201, false)
+	requirePurgeUserExists(t, 202, true)
+	requirePurgeUserExists(t, 203, true)
+	requirePurgeUserExists(t, 204, true)
+}
+
+func TestBatchManageUsersEnablesOnlyDisabledCommonUsers(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	seedPurgeUser(t, 301, common.RoleCommonUser, common.UserStatusDisabled, false)
+	seedPurgeUser(t, 302, common.RoleCommonUser, common.UserStatusEnabled, false)
+	seedPurgeUser(t, 303, common.RoleAdminUser, common.UserStatusDisabled, false)
+	seedPurgeUser(t, 304, common.RoleRootUser, common.UserStatusDisabled, false)
+	seedPurgeUser(t, 305, common.RoleCommonUser, common.UserStatusDisabled, true)
+	require.NoError(t, model.DB.Unscoped().Model(&model.User{}).Where("id IN ?", []int{301, 303, 304, 305}).Update("disable_reason", "review").Error)
+
+	result, err := BatchManageUsers("enable_disabled", "", 900, common.RoleRootUser)
+
+	require.NoError(t, err)
+	require.Equal(t, BatchManageUsersResult{Action: "enable_disabled", Affected: 1}, result)
+	requireBatchUser(t, 301, common.UserStatusEnabled, "", false)
+	requireBatchUser(t, 302, common.UserStatusEnabled, "", false)
+	requireBatchUser(t, 303, common.UserStatusDisabled, "review", false)
+	requireBatchUser(t, 304, common.UserStatusDisabled, "review", false)
+	requireBatchUser(t, 305, common.UserStatusDisabled, "review", true)
+}
+
+func TestBatchManageUsersDisablesOnlyEnabledCommonUsers(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	seedPurgeUser(t, 401, common.RoleCommonUser, common.UserStatusEnabled, false)
+	seedPurgeUser(t, 402, common.RoleCommonUser, common.UserStatusDisabled, false)
+	seedPurgeUser(t, 403, common.RoleAdminUser, common.UserStatusEnabled, false)
+	seedPurgeUser(t, 404, common.RoleRootUser, common.UserStatusEnabled, false)
+	seedPurgeUser(t, 405, common.RoleCommonUser, common.UserStatusEnabled, true)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 402).Update("disable_reason", "existing").Error)
+
+	result, err := BatchManageUsers("disable_enabled", "  maintenance  ", 900, common.RoleAdminUser)
+
+	require.NoError(t, err)
+	require.Equal(t, BatchManageUsersResult{Action: "disable_enabled", Affected: 1}, result)
+	requireBatchUser(t, 401, common.UserStatusDisabled, "maintenance", false)
+	requireBatchUser(t, 402, common.UserStatusDisabled, "existing", false)
+	requireBatchUser(t, 403, common.UserStatusEnabled, "", false)
+	requireBatchUser(t, 404, common.UserStatusEnabled, "", false)
+	requireBatchUser(t, 405, common.UserStatusEnabled, "", true)
+}
+
+func TestBatchManageUsersRejectsInvalidDisableReason(t *testing.T) {
+	setupUserPurgeTestDB(t)
+
+	_, err := BatchManageUsers("disable_enabled", "   ", 900, common.RoleAdminUser)
+	require.ErrorContains(t, err, "cannot be empty")
+
+	_, err = BatchManageUsers("disable_enabled", strings.Repeat("a", 256), 900, common.RoleAdminUser)
+	require.ErrorContains(t, err, "cannot exceed 255")
+}
+
+func TestBatchManageUsersSoftDeletesOnlyDisabledCommonUsers(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	seedPurgeUser(t, 501, common.RoleCommonUser, common.UserStatusDisabled, false)
+	seedPurgeUser(t, 502, common.RoleCommonUser, common.UserStatusEnabled, false)
+	seedPurgeUser(t, 503, common.RoleAdminUser, common.UserStatusDisabled, false)
+	seedPurgeUser(t, 504, common.RoleRootUser, common.UserStatusDisabled, false)
+	seedPurgeUser(t, 505, common.RoleCommonUser, common.UserStatusDisabled, true)
+
+	result, err := BatchManageUsers("delete_disabled", "", 900, common.RoleRootUser)
+
+	require.NoError(t, err)
+	require.Equal(t, BatchManageUsersResult{Action: "delete_disabled", Affected: 1}, result)
+	requireBatchUser(t, 501, common.UserStatusDisabled, "", true)
+	requireBatchUser(t, 502, common.UserStatusEnabled, "", false)
+	requireBatchUser(t, 503, common.UserStatusDisabled, "", false)
+	requireBatchUser(t, 504, common.UserStatusDisabled, "", false)
+	requireBatchUser(t, 505, common.UserStatusDisabled, "", true)
+}
+
+func TestBatchManageUsersPermanentlyDeletesOnlyActiveDisabledCommonUsers(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	seedPurgeUser(t, 601, common.RoleCommonUser, common.UserStatusDisabled, false)
+	seedPurgeUser(t, 602, common.RoleCommonUser, common.UserStatusEnabled, false)
+	seedPurgeUser(t, 603, common.RoleAdminUser, common.UserStatusDisabled, false)
+	seedPurgeUser(t, 604, common.RoleRootUser, common.UserStatusDisabled, false)
+	seedPurgeUser(t, 605, common.RoleCommonUser, common.UserStatusDisabled, true)
+
+	result, err := BatchManageUsers("purge_disabled", "", 900, common.RoleRootUser)
+
+	require.NoError(t, err)
+	require.Equal(t, BatchManageUsersResult{Action: "purge_disabled", Affected: 1}, result)
+	requirePurgeUserExists(t, 601, false)
+	requireBatchUser(t, 602, common.UserStatusEnabled, "", false)
+	requireBatchUser(t, 603, common.UserStatusDisabled, "", false)
+	requireBatchUser(t, 604, common.UserStatusDisabled, "", false)
+	requireBatchUser(t, 605, common.UserStatusDisabled, "", true)
+}
+
+func TestBatchManageUsersValidatesPermissionActionAndEmptyResult(t *testing.T) {
+	setupUserPurgeTestDB(t)
+
+	_, err := BatchManageUsers("enable_disabled", "", 900, common.RoleCommonUser)
+	require.ErrorContains(t, err, "admin permission required")
+
+	_, err = BatchManageUsers("unknown", "", 900, common.RoleAdminUser)
+	require.ErrorContains(t, err, "unsupported batch user action")
+
+	result, err := BatchManageUsers("enable_disabled", "", 900, common.RoleAdminUser)
+	require.NoError(t, err)
+	require.Equal(t, BatchManageUsersResult{Action: "enable_disabled", Affected: 0}, result)
+
+	var auditCount int64
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("type = ?", model.LogTypeManage).Count(&auditCount).Error)
+	require.Equal(t, int64(1), auditCount)
+}
+
+func TestCreateRiskIPBansCreatesPermanentAutoBanAndSkipsExisting(t *testing.T) {
+	setupRiskActionTestDB(t)
+	require.NoError(t, model.CreateIPBan(&model.IPBan{
+		Target: "203.0.113.20",
+		Reason: "existing",
+	}))
+
+	result, err := CreateRiskIPBans(RiskIPBanRequest{
+		Targets: []string{"203.0.113.10", "203.0.113.10", "203.0.113.20"},
+		Reason:  "risk reason",
+	}, 900)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result["created"])
+	require.Equal(t, 1, result["skipped"])
+
+	var ban model.IPBan
+	require.NoError(t, model.DB.First(&ban, "target = ?", "203.0.113.10").Error)
+	require.Equal(t, "risk reason", ban.Reason)
+	require.Zero(t, ban.ExpiresAt)
+	require.True(t, ban.AutoBanUser)
+	require.Equal(t, 900, ban.CreatedBy)
+
+	var logCount int64
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("type = ?", model.LogTypeManage).Count(&logCount).Error)
+	require.GreaterOrEqual(t, logCount, int64(1))
+}
+
+func TestCreateRiskIPBansRejectsEmptyAndTooManyTargets(t *testing.T) {
+	setupRiskActionTestDB(t)
+
+	_, err := CreateRiskIPBans(RiskIPBanRequest{}, 900)
+	require.Error(t, err)
+
+	targets := make([]string, 0, MaxBatchOperation+1)
+	for i := 1; i <= MaxBatchOperation+1; i++ {
+		targets = append(targets, fmt.Sprintf("203.0.113.%d", i))
+	}
+	_, err = CreateRiskIPBans(RiskIPBanRequest{Targets: targets, Reason: "risk"}, 900)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "limit")
+}
+
+func TestBanSharedTokenIPUsersLimitsToSelectedIntersectedUsers(t *testing.T) {
+	setupRiskActionTestDB(t)
+	first := seedRiskUser(t, "risk-first")
+	second := seedRiskUser(t, "risk-second")
+	third := seedRiskUser(t, "risk-third")
+	firstToken := seedRiskToken(t, first.Id, "first-token")
+	secondToken := seedRiskToken(t, second.Id, "second-token")
+	thirdToken := seedRiskToken(t, third.Id, "third-token")
+	now := common.GetTimestamp()
+	require.NoError(t, model.LOG_DB.Create(&[]model.Log{
+		{UserId: first.Id, Username: first.Username, TokenId: firstToken.Id, TokenName: firstToken.Name, Type: model.LogTypeConsume, CreatedAt: now - 30, Ip: "203.0.113.7"},
+		{UserId: second.Id, Username: second.Username, TokenId: secondToken.Id, TokenName: secondToken.Name, Type: model.LogTypeConsume, CreatedAt: now - 20, Ip: "203.0.113.7"},
+		{UserId: third.Id, Username: third.Username, TokenId: thirdToken.Id, TokenName: thirdToken.Name, Type: model.LogTypeConsume, CreatedAt: now - 10, Ip: "203.0.113.8"},
+	}).Error)
+	selected := []int{second.Id, third.Id, 99999}
+
+	result, err := BanSharedTokenIPUsers("203.0.113.7", IPRiskQuery{Start: now - 60, End: now + 1}, 900, common.RoleRootUser, "selected risk", &selected, 5)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result["success"])
+	require.Equal(t, 1, result["total_users"])
+
+	var users []model.User
+	require.NoError(t, model.DB.Order("id asc").Find(&users, "id IN ?", []int{first.Id, second.Id, third.Id}).Error)
+	require.Equal(t, common.UserStatusEnabled, users[0].Status)
+	require.Equal(t, common.UserStatusDisabled, users[1].Status)
+	require.Equal(t, "selected risk", users[1].DisableReason)
+	require.Equal(t, int64(5), users[1].DisableDurationMinutes)
+	require.GreaterOrEqual(t, users[1].DisableUntil, now+300)
+	require.Equal(t, common.UserStatusEnabled, users[2].Status)
+}
+
+func TestBanSharedTokenIPUsersWithoutSelectionKeepsExistingAllUsersBehavior(t *testing.T) {
+	setupRiskActionTestDB(t)
+	first := seedRiskUser(t, "risk-all-first")
+	second := seedRiskUser(t, "risk-all-second")
+	firstToken := seedRiskToken(t, first.Id, "all-first-token")
+	secondToken := seedRiskToken(t, second.Id, "all-second-token")
+	now := common.GetTimestamp()
+	require.NoError(t, model.LOG_DB.Create(&[]model.Log{
+		{UserId: first.Id, Username: first.Username, TokenId: firstToken.Id, TokenName: firstToken.Name, Type: model.LogTypeConsume, CreatedAt: now - 30, Ip: "203.0.113.9"},
+		{UserId: second.Id, Username: second.Username, TokenId: secondToken.Id, TokenName: secondToken.Name, Type: model.LogTypeConsume, CreatedAt: now - 20, Ip: "203.0.113.9"},
+	}).Error)
+
+	result, err := BanSharedTokenIPUsers("203.0.113.9", IPRiskQuery{Start: now - 60, End: now + 1}, 900, common.RoleRootUser, "all risk", nil)
+
+	require.NoError(t, err)
+	require.Equal(t, 2, result["success"])
+	require.Equal(t, 2, result["total_users"])
+
+	var disabled int64
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id IN ? AND status = ?", []int{first.Id, second.Id}, common.UserStatusDisabled).Count(&disabled).Error)
+	require.Equal(t, int64(2), disabled)
+}
+
+func TestManualBanAndEnableResetAllDisableFields(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	user := model.User{Username: "timed-user", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}
+	require.NoError(t, model.DB.Create(&user).Error)
+	require.NoError(t, BanUser(user.Id, 999, common.RoleRootUser, "timed", 5))
+	require.NoError(t, model.DB.First(&user, user.Id).Error)
+	require.Equal(t, int64(5), user.DisableDurationMinutes)
+	require.Greater(t, user.DisableUntil, time.Now().Unix())
+	require.NoError(t, BanUser(user.Id, 999, common.RoleRootUser, "permanent"))
+	require.NoError(t, model.DB.First(&user, user.Id).Error)
+	require.Zero(t, user.DisableUntil)
+	require.Zero(t, user.DisableDurationMinutes)
+	require.NoError(t, UnbanUser(user.Id, 999, common.RoleRootUser))
+	require.NoError(t, model.DB.First(&user, user.Id).Error)
+	require.Empty(t, user.DisableReason)
+	require.Equal(t, common.UserStatusEnabled, user.Status)
+}
+
+func TestBatchUserDisableExpiryProtectsFromDeletion(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	user := model.User{Username: "batch-timed", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}
+	require.NoError(t, model.DB.Create(&user).Error)
+	result, err := BatchManageUsers("disable_enabled", "timed", 999, common.RoleRootUser, 2)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), result.Affected)
+	require.NoError(t, model.DB.First(&user, user.Id).Error)
+	require.Equal(t, int64(2), user.DisableDurationMinutes)
+	require.NoError(t, model.DB.Model(&user).Update("disable_until", time.Now().Unix()-1).Error)
+	result, err = BatchManageUsers("delete_disabled", "", 999, common.RoleRootUser)
+	require.NoError(t, err)
+	require.Zero(t, result.Affected)
+	require.NoError(t, model.DB.First(&user, user.Id).Error)
+	require.Equal(t, common.UserStatusEnabled, user.Status)
+}

@@ -1,0 +1,718 @@
+/*
+Copyright (C) 2026 bitscr
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For licensing inquiries, please open an issue at https://github.com/bitscr/new-api/issues
+*/
+
+import React from 'react';
+import { Button, Progress, Tag, Typography } from '@douyinfe/semi-ui';
+import {
+  Music,
+  FileText,
+  FileDown,
+  HelpCircle,
+  CheckCircle,
+  Pause,
+  Clock,
+  Play,
+  XCircle,
+  Loader,
+  List,
+  Sparkles,
+  Image,
+} from 'lucide-react';
+import {
+  TASK_ACTION_FIRST_TAIL_GENERATE,
+  TASK_ACTION_GENERATE,
+  TASK_ACTION_IMAGE_EDIT,
+  TASK_ACTION_IMAGE_GENERATION,
+  TASK_ACTION_AUDIO_GENERATION,
+  TASK_ACTION_BATCH_INFERENCE,
+  TASK_ACTION_MUSIC_GENERATION,
+  TASK_ACTION_PPT,
+  TASK_ACTION_PSD,
+  TASK_ACTION_REFERENCE_GENERATE,
+  TASK_ACTION_TEXT_GENERATE,
+  TASK_ACTION_VOICE_CLONE,
+  TASK_ACTION_REMIX_GENERATE,
+} from '../../../constants/common.constant';
+import { CHANNEL_OPTIONS } from '../../../constants/channel.constants';
+import { renderModelTag, stringToColor } from '../../../helpers/render';
+import { extractImageResults } from '../../../helpers/taskImages';
+import { Avatar, Space } from '@douyinfe/semi-ui';
+
+const colors = [
+  'amber',
+  'blue',
+  'cyan',
+  'green',
+  'grey',
+  'indigo',
+  'light-blue',
+  'lime',
+  'orange',
+  'pink',
+  'purple',
+  'red',
+  'teal',
+  'violet',
+  'yellow',
+];
+
+// Render functions
+const renderTimestamp = (timestampInSeconds) => {
+  const date = new Date(timestampInSeconds * 1000); // 从秒转换为毫秒
+
+  const year = date.getFullYear(); // 获取年份
+  const month = ('0' + (date.getMonth() + 1)).slice(-2); // 获取月份，从0开始需要+1，并保证两位数
+  const day = ('0' + date.getDate()).slice(-2); // 获取日期，并保证两位数
+  const hours = ('0' + date.getHours()).slice(-2); // 获取小时，并保证两位数
+  const minutes = ('0' + date.getMinutes()).slice(-2); // 获取分钟，并保证两位数
+  const seconds = ('0' + date.getSeconds()).slice(-2); // 获取秒钟，并保证两位数
+
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`; // 格式化输出
+};
+
+function renderDuration(submit_time, finishTime) {
+  if (!submit_time || !finishTime) return '-';
+  const durationSec = finishTime - submit_time;
+  if (durationSec < 0) return '-';
+  const color =
+    durationSec > 60 ? 'red' : durationSec > 10 ? 'yellow' : 'green';
+  const durationText = durationSec === 0 ? '< 1 s' : `${durationSec} s`;
+
+  // 返回带有样式的颜色标签
+  return (
+    <Tag color={color} shape='circle'>
+      {durationText}
+    </Tag>
+  );
+}
+
+const renderType = (type, t) => {
+  switch (type) {
+    case 'MUSIC':
+      return (
+        <Tag color='grey' shape='circle' prefixIcon={<Music size={14} />}>
+          {t('生成音乐')}
+        </Tag>
+      );
+    case 'LYRICS':
+      return (
+        <Tag color='pink' shape='circle' prefixIcon={<FileText size={14} />}>
+          {t('生成歌词')}
+        </Tag>
+      );
+    case TASK_ACTION_GENERATE:
+      return (
+        <Tag color='blue' shape='circle' prefixIcon={<Sparkles size={14} />}>
+          {t('图生视频')}
+        </Tag>
+      );
+    case TASK_ACTION_TEXT_GENERATE:
+      return (
+        <Tag color='blue' shape='circle' prefixIcon={<Sparkles size={14} />}>
+          {t('文生视频')}
+        </Tag>
+      );
+    case TASK_ACTION_FIRST_TAIL_GENERATE:
+      return (
+        <Tag color='blue' shape='circle' prefixIcon={<Sparkles size={14} />}>
+          {t('首尾生视频')}
+        </Tag>
+      );
+    case TASK_ACTION_REFERENCE_GENERATE:
+      return (
+        <Tag color='blue' shape='circle' prefixIcon={<Sparkles size={14} />}>
+          {t('参照生视频')}
+        </Tag>
+      );
+    case TASK_ACTION_REMIX_GENERATE:
+      return (
+        <Tag color='blue' shape='circle' prefixIcon={<Sparkles size={14} />}>
+          {t('视频Remix')}
+        </Tag>
+      );
+    case TASK_ACTION_PPT:
+      return (
+        <Tag color='teal' shape='circle' prefixIcon={<FileText size={14} />}>
+          {t('生成PPT')}
+        </Tag>
+      );
+    case TASK_ACTION_PSD:
+      return (
+        <Tag color='purple' shape='circle' prefixIcon={<FileText size={14} />}>
+          {t('生成PSD')}
+        </Tag>
+      );
+    case TASK_ACTION_IMAGE_GENERATION:
+      return (
+        <Tag color='green' shape='circle' prefixIcon={<Image size={14} />}>
+          {t('图片生成')}
+        </Tag>
+      );
+    case TASK_ACTION_IMAGE_EDIT:
+      return (
+        <Tag color='green' shape='circle' prefixIcon={<Image size={14} />}>
+          {t('图片编辑')}
+        </Tag>
+      );
+    case TASK_ACTION_AUDIO_GENERATION:
+      return (
+        <Tag color='cyan' shape='circle' prefixIcon={<Play size={14} />}>
+          {t('生成语音')}
+        </Tag>
+      );
+    case TASK_ACTION_MUSIC_GENERATION:
+      return (
+        <Tag color='violet' shape='circle' prefixIcon={<Music size={14} />}>
+          {t('生成音乐')}
+        </Tag>
+      );
+    case TASK_ACTION_VOICE_CLONE:
+      return (
+        <Tag color='purple' shape='circle' prefixIcon={<Sparkles size={14} />}>
+          {t('音色克隆')}
+        </Tag>
+      );
+    case TASK_ACTION_BATCH_INFERENCE:
+      return (
+        <Tag color='indigo' shape='circle' prefixIcon={<List size={14} />}>
+          {t('批量推理')}
+        </Tag>
+      );
+    default:
+      return (
+        <Tag color='white' shape='circle' prefixIcon={<HelpCircle size={14} />}>
+          {t('未知')}
+        </Tag>
+      );
+  }
+};
+
+const renderPlatform = (platform, t) => {
+  let option = CHANNEL_OPTIONS.find(
+    (opt) => String(opt.value) === String(platform),
+  );
+  if (option) {
+    return (
+      <Tag color={option.color} shape='circle'>
+        {option.label}
+      </Tag>
+    );
+  }
+  switch (platform) {
+    case 'suno':
+      return (
+        <Tag color='green' shape='circle'>
+          Suno
+        </Tag>
+      );
+    default:
+      return (
+        <Tag color='white' shape='circle'>
+          {t('未知')}
+        </Tag>
+      );
+  }
+};
+
+const getTaskModelName = (record) => {
+  return (
+    record?.model_name ||
+    record?.properties?.origin_model_name ||
+    record?.properties?.upstream_model_name ||
+    ''
+  );
+};
+
+const getEditableFileResult = (record) => {
+  const data = record?.data || {};
+  const itemResult = Array.isArray(data?.items) ? data.items[0]?.result : null;
+  const result = data?.result || itemResult || {};
+  return {
+    primaryUrl: result?.primary_url || record?.result_url || '',
+    zipUrl: result?.zip_url || '',
+  };
+};
+
+const getImageResultCount = (record) => {
+  return extractImageResults(record).length;
+};
+
+const audioTaskActions = new Set([
+  TASK_ACTION_AUDIO_GENERATION,
+  TASK_ACTION_MUSIC_GENERATION,
+  TASK_ACTION_VOICE_CLONE,
+]);
+
+const getAudioClips = (record) => {
+  const isAudioTask =
+    record?.platform === 'suno' || audioTaskActions.has(record?.action);
+  if (!isAudioTask) return [];
+  const clips = [];
+  const seen = new Set();
+  const modelName = getTaskModelName(record);
+
+  const addClip = (clip, fallbackTitle = modelName) => {
+    if (!clip || typeof clip !== 'object') return;
+    if (clip.type && clip.type !== 'audio') return;
+    const audioUrl = clip.audio_url || clip.url;
+    if (!audioUrl || seen.has(audioUrl)) return;
+    seen.add(audioUrl);
+    const duration =
+      clip.duration ||
+      clip.metadata?.duration ||
+      (clip.duration_ms ? clip.duration_ms / 1000 : undefined);
+    clips.push({
+      ...clip,
+      audio_url: audioUrl,
+      title: clip.title || fallbackTitle || 'Audio',
+      duration,
+    });
+  };
+
+  const data = record?.data;
+  if (Array.isArray(data)) {
+    data.forEach((clip) => addClip(clip));
+  } else if (data && typeof data === 'object') {
+    if (Array.isArray(data.data)) {
+      data.data.forEach((clip) => addClip(clip));
+    }
+    const outcome = data.outcome || data.data?.outcome;
+    if (outcome && typeof outcome === 'object') {
+      if (outcome.audio_url) {
+        addClip({
+          ...outcome,
+          audio_url: outcome.audio_url,
+        });
+      }
+      if (Array.isArray(outcome.media_urls)) {
+        outcome.media_urls.forEach((clip) => addClip(clip));
+      }
+      if (Array.isArray(outcome.medias)) {
+        outcome.medias.forEach((clip) => addClip(clip));
+      }
+    }
+  }
+
+  if (isAudioTask && record?.result_url) {
+    addClip({ audio_url: record.result_url });
+  }
+  return clips;
+};
+
+const renderDownloadButton = (href, label) => {
+  if (!href) {
+    return null;
+  }
+  return (
+    <a href={href} target='_blank' rel='noreferrer'>
+      <Button size='small' theme='borderless' icon={<FileDown size={14} />}>
+        {label}
+      </Button>
+    </a>
+  );
+};
+
+const getBatchResultUrls = (record) => {
+  const urls = [];
+  const seen = new Set();
+  const addUrl = (url) => {
+    if (typeof url !== 'string' || !/^https?:\/\//.test(url) || seen.has(url)) {
+      return;
+    }
+    seen.add(url);
+    urls.push(url);
+  };
+
+  const outcome = record?.data?.outcome || record?.data?.data?.outcome;
+  if (Array.isArray(outcome?.output_download_urls)) {
+    outcome.output_download_urls.forEach(addUrl);
+  }
+  addUrl(outcome?.output_url);
+  addUrl(record?.result_url);
+  return urls;
+};
+
+const renderStatus = (type, t) => {
+  switch (type) {
+    case 'SUCCESS':
+      return (
+        <Tag
+          color='green'
+          shape='circle'
+          prefixIcon={<CheckCircle size={14} />}
+        >
+          {t('成功')}
+        </Tag>
+      );
+    case 'NOT_START':
+      return (
+        <Tag color='grey' shape='circle' prefixIcon={<Pause size={14} />}>
+          {t('未启动')}
+        </Tag>
+      );
+    case 'SUBMITTED':
+      return (
+        <Tag color='yellow' shape='circle' prefixIcon={<Clock size={14} />}>
+          {t('队列中')}
+        </Tag>
+      );
+    case 'IN_PROGRESS':
+      return (
+        <Tag color='blue' shape='circle' prefixIcon={<Play size={14} />}>
+          {t('执行中')}
+        </Tag>
+      );
+    case 'FAILURE':
+      return (
+        <Tag color='red' shape='circle' prefixIcon={<XCircle size={14} />}>
+          {t('失败')}
+        </Tag>
+      );
+    case 'QUEUED':
+      return (
+        <Tag color='orange' shape='circle' prefixIcon={<List size={14} />}>
+          {t('排队中')}
+        </Tag>
+      );
+    case 'UNKNOWN':
+      return (
+        <Tag color='white' shape='circle' prefixIcon={<HelpCircle size={14} />}>
+          {t('未知')}
+        </Tag>
+      );
+    case '':
+      return (
+        <Tag color='grey' shape='circle' prefixIcon={<Loader size={14} />}>
+          {t('正在提交')}
+        </Tag>
+      );
+    default:
+      return (
+        <Tag color='white' shape='circle' prefixIcon={<HelpCircle size={14} />}>
+          {t('未知')}
+        </Tag>
+      );
+  }
+};
+
+export const getTaskLogsColumns = ({
+  t,
+  COLUMN_KEYS,
+  copyText,
+  openContentModal,
+  isAdminUser,
+  openVideoModal,
+  openAudioModal,
+  openImageModal,
+}) => {
+  return [
+    {
+      key: COLUMN_KEYS.SUBMIT_TIME,
+      title: t('提交时间'),
+      dataIndex: 'submit_time',
+      render: (text, record, index) => {
+        return <div>{text ? renderTimestamp(text) : '-'}</div>;
+      },
+    },
+    {
+      key: COLUMN_KEYS.FINISH_TIME,
+      title: t('结束时间'),
+      dataIndex: 'finish_time',
+      render: (text, record, index) => {
+        return <div>{text ? renderTimestamp(text) : '-'}</div>;
+      },
+    },
+    {
+      key: COLUMN_KEYS.DURATION,
+      title: t('花费时间'),
+      dataIndex: 'finish_time',
+      render: (finish, record) => {
+        const start = record.start_time || record.submit_time;
+        return <>{finish ? renderDuration(start, finish) : '-'}</>;
+      },
+    },
+    {
+      key: COLUMN_KEYS.CHANNEL,
+      title: t('渠道'),
+      dataIndex: 'channel_id',
+      render: (text, record, index) => {
+        return isAdminUser ? (
+          <div>
+            <Tag
+              color={colors[parseInt(text) % colors.length]}
+              size='large'
+              shape='circle'
+              onClick={() => {
+                copyText(text);
+              }}
+            >
+              {text}
+            </Tag>
+          </div>
+        ) : (
+          <></>
+        );
+      },
+    },
+    {
+      key: COLUMN_KEYS.USERNAME,
+      title: t('用户'),
+      dataIndex: 'username',
+      render: (userId, record, index) => {
+        if (!isAdminUser) {
+          return <></>;
+        }
+        const displayText = String(record.username || userId || '?');
+        return (
+          <Space>
+            <Avatar size='extra-small' color={stringToColor(displayText)}>
+              {displayText.slice(0, 1)}
+            </Avatar>
+            <Typography.Text>{displayText}</Typography.Text>
+          </Space>
+        );
+      },
+    },
+    {
+      key: COLUMN_KEYS.PLATFORM,
+      title: t('平台'),
+      dataIndex: 'platform',
+      render: (text, record, index) => {
+        return <div>{renderPlatform(text, t)}</div>;
+      },
+    },
+    {
+      key: COLUMN_KEYS.MODEL,
+      title: t('模型'),
+      dataIndex: 'model_name',
+      render: (text, record, index) => {
+        const modelName = getTaskModelName(record);
+        if (!modelName) {
+          return '-';
+        }
+        return (
+          <div>
+            {renderModelTag(modelName, {
+              onClick: () => {
+                copyText(modelName);
+              },
+            })}
+          </div>
+        );
+      },
+    },
+    {
+      key: COLUMN_KEYS.TYPE,
+      title: t('类型'),
+      dataIndex: 'action',
+      render: (text, record, index) => {
+        return <div>{renderType(text, t)}</div>;
+      },
+    },
+    {
+      key: COLUMN_KEYS.TASK_ID,
+      title: t('任务ID'),
+      dataIndex: 'task_id',
+      render: (text, record, index) => {
+        return (
+          <Typography.Text
+            ellipsis={{ showTooltip: true }}
+            onClick={() => {
+              openContentModal(JSON.stringify(record, null, 2));
+            }}
+          >
+            <div>{text}</div>
+          </Typography.Text>
+        );
+      },
+    },
+    {
+      key: COLUMN_KEYS.REQUEST_ID,
+      title: t('Request ID'),
+      dataIndex: 'request_id',
+      render: (text, record, index) => {
+        if (!text) {
+          return '-';
+        }
+        return (
+          <Typography.Text
+            ellipsis={{ showTooltip: true }}
+            style={{ maxWidth: 180 }}
+            onClick={() => {
+              copyText(text);
+            }}
+          >
+            {text}
+          </Typography.Text>
+        );
+      },
+    },
+    {
+      key: COLUMN_KEYS.TASK_STATUS,
+      title: t('任务状态'),
+      dataIndex: 'status',
+      render: (text, record, index) => {
+        return <div>{renderStatus(text, t)}</div>;
+      },
+    },
+    {
+      key: COLUMN_KEYS.PROGRESS,
+      title: t('进度'),
+      dataIndex: 'progress',
+      render: (text, record, index) => {
+        return (
+          <div>
+            {isNaN(text?.replace('%', '')) ? (
+              text || '-'
+            ) : (
+              <Progress
+                stroke={
+                  record.status === 'FAILURE'
+                    ? 'var(--semi-color-warning)'
+                    : null
+                }
+                percent={text ? parseInt(text.replace('%', '')) : 0}
+                showInfo={true}
+                aria-label='task progress'
+                style={{ minWidth: '160px' }}
+              />
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      key: COLUMN_KEYS.FAIL_REASON,
+      title: t('详情'),
+      dataIndex: 'fail_reason',
+      fixed: 'right',
+      render: (text, record, index) => {
+        // Audio task preview (Suno, GMICLOUD Speech / Voice Clone / Music)
+        const audioClips = getAudioClips(record);
+        if (record.status === 'SUCCESS' && audioClips.length > 0) {
+          return (
+            <a
+              href='#'
+              onClick={(e) => {
+                e.preventDefault();
+                openAudioModal(audioClips);
+              }}
+            >
+              {t('点击预览音频')}
+            </a>
+          );
+        }
+
+        // 视频预览：优先使用 result_url，兼容旧数据 fail_reason 中的 URL
+        const isVideoTask =
+          record.action === TASK_ACTION_GENERATE ||
+          record.action === TASK_ACTION_TEXT_GENERATE ||
+          record.action === TASK_ACTION_FIRST_TAIL_GENERATE ||
+          record.action === TASK_ACTION_REFERENCE_GENERATE ||
+          record.action === TASK_ACTION_REMIX_GENERATE;
+        const isSuccess = record.status === 'SUCCESS';
+        const resultUrl = record.result_url;
+        const hasResultUrl =
+          typeof resultUrl === 'string' && /^https?:\/\//.test(resultUrl);
+        const isEditableFileTask =
+          record.action === TASK_ACTION_PPT ||
+          record.action === TASK_ACTION_PSD;
+        if (isSuccess && isEditableFileTask) {
+          const { primaryUrl, zipUrl } = getEditableFileResult(record);
+          if (primaryUrl || zipUrl) {
+            return (
+              <Space wrap>
+                {renderDownloadButton(primaryUrl, t('主文件'))}
+                {renderDownloadButton(zipUrl, t('素材包'))}
+              </Space>
+            );
+          }
+        }
+
+        const isImageTask =
+          record.action === TASK_ACTION_IMAGE_GENERATION ||
+          record.action === TASK_ACTION_IMAGE_EDIT;
+        if (isSuccess && isImageTask) {
+          const imageCount = getImageResultCount(record);
+          return (
+            <Typography.Text
+              link
+              onClick={() => {
+                openImageModal(record);
+              }}
+            >
+              {imageCount > 1
+                ? `${t('查看图片结果')} (${imageCount})`
+                : t('查看图片结果')}
+            </Typography.Text>
+          );
+        }
+
+        const isBatchTask = record.action === TASK_ACTION_BATCH_INFERENCE;
+        if (isSuccess && isBatchTask) {
+          const resultUrls = getBatchResultUrls(record);
+          if (resultUrls.length > 0) {
+            return (
+              <Space wrap>
+                {resultUrls.map((url, resultIndex) => (
+                  <React.Fragment key={url}>
+                    {renderDownloadButton(
+                      url,
+                      resultUrls.length > 1
+                        ? t('结果 {{index}}', { index: resultIndex + 1 })
+                        : t('下载结果'),
+                    )}
+                  </React.Fragment>
+                ))}
+              </Space>
+            );
+          }
+        }
+
+        if (isSuccess && isVideoTask && hasResultUrl) {
+          return (
+            <a
+              href='#'
+              onClick={(e) => {
+                e.preventDefault();
+                openVideoModal(resultUrl);
+              }}
+            >
+              {t('点击预览视频')}
+            </a>
+          );
+        }
+        if (!text) {
+          return t('无');
+        }
+        return (
+          <Typography.Text
+            ellipsis={{ showTooltip: true }}
+            style={{ width: 100 }}
+            onClick={() => {
+              openContentModal(text);
+            }}
+          >
+            {text}
+          </Typography.Text>
+        );
+      },
+    },
+  ];
+};
