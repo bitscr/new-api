@@ -182,6 +182,11 @@ type RelayInfo struct {
 	*ResponsesUsageInfo
 	*ChannelMeta
 	*TaskRelayInfo
+
+	// answer 记录"写给客户端的回答内容"的观察，用于识别 200 但没有有效回答
+	// （空正文或上游网关的告警横幅）。由 genBaseRelayInfo 初始化；
+	// 为 nil 时不观察，ClientAnswerUnusable 恒为 false。
+	answer *answerObservation
 }
 
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
@@ -516,6 +521,7 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 			//promptTokens: common.GetContextKeyInt(c, constant.ContextKeyPromptTokens),
 			estimatePromptTokens: common.GetContextKeyInt(c, constant.ContextKeyEstimatedTokens),
 		},
+		answer: &answerObservation{},
 	}
 
 	if info.RelayMode == relayconstant.RelayModeUnknown {

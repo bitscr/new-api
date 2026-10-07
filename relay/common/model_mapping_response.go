@@ -78,6 +78,7 @@ func (w *relayResponseWriter) Flush() {
 }
 
 func (w *relayResponseWriter) Write(data []byte) (int, error) {
+	observeClientAnswer(w.context, data)
 	rewritten := rewriteClientResponseBytes(w.context, data, &w.sseEventError)
 	n, err := w.ResponseWriter.Write(rewritten)
 	if err == nil && n == len(rewritten) {
@@ -87,12 +88,24 @@ func (w *relayResponseWriter) Write(data []byte) (int, error) {
 }
 
 func (w *relayResponseWriter) WriteString(data string) (int, error) {
+	observeClientAnswer(w.context, []byte(data))
 	rewritten := string(rewriteClientResponseBytes(w.context, []byte(data), &w.sseEventError))
 	n, err := w.ResponseWriter.WriteString(rewritten)
 	if err == nil && n == len(rewritten) {
 		return len(data), nil
 	}
 	return n, err
+}
+
+// observeClientAnswer 在响应写给客户端的必经之路记录正文观察，
+// 供 auto 判定"200 但没有有效回答"（见 answer_observation.go）。
+func observeClientAnswer(c *gin.Context, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	if info := GetRelayInfo(c); info != nil {
+		info.ObserveClientAnswer(data)
+	}
 }
 
 func RewriteClientResponseBytes(c *gin.Context, data []byte) []byte {

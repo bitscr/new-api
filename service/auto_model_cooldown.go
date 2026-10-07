@@ -14,11 +14,12 @@ import (
 // auto 候选冷却：把"这个 (分组, 模型, 渠道) 刚才慢或者挂了"记住一段明确的时间，
 // 并且落库，重启后依然生效。
 //
-// 分两层：
-//   - 模型级：键是 (分组, 模型, 渠道)，只挡这一个组合。
-//   - 渠道级：模型名为空的那条记录 (分组, "", 渠道)，挡该渠道上的所有模型。
-//     上游是"排队"型时，同一渠道上的其它模型也会同样卡住，所以一次慢事件
-//     要连带整个渠道一起避让，否则 auto 会顺着模型列表一个个踩过去。
+// 只有一层，粒度是 (分组, 模型, 渠道)：只挡这一个组合。
+// 早先还有一层"渠道级"（键里的模型名为空，一并挡掉该渠道上的所有模型），已废弃：
+// 一个渠道下 5 个模型，试挂了 2 个不代表剩下 3 个也不行——它们可能又快又稳，
+// 整条避让就把它们错过了。代价是某条渠道整体排队时，auto 会把它挂着的模型各试一次
+// （每个模型各付一次慢请求）才全部进冷却；换来的是不再"一竿子打翻一船模型"。
+// 历史上的 model='' 记录会在载入时清库。
 //
 // 为什么需要它：内存里的健康分只做短期反应（约 10 分钟线性衰减归零），重启或者
 // 空闲一会儿就全没了，于是 auto 又会去挑那个排在最前面、但上游正在排队几十秒的
@@ -26,10 +27,9 @@ import (
 // 重复犯错时窗口逐级翻倍（15m → 30m → 1h → 2h → 4h → 6h 封顶）。
 //
 // 判定规则（elapsedMs 是本次请求的总耗时）：
-//   - 正常速度的成功 → 清除该组合的模型级冷却；渠道级只按自己的到期时间失效，
-//     别的模型偶然成功不代表这个渠道已经好了。
-//   - 慢（超过 autoModelSlowLatencyMs）的成功或失败 → 模型级 + 渠道级一起进冷却。
-//   - 快速失败（例如 401、余额不足）→ 只记模型级，不连累整个渠道。
+//   - 正常速度的成功 → 清除该组合的冷却（别的模型偶然成功不代表这个组合已经好了）。
+//   - 慢（超过 autoModelSlowLatencyMs）的成功或失败 → 该组合进冷却。
+//   - 快速失败（例如 401、余额不足）→ 同样只记该组合。
 //   - 没有耗时数据 → 不动冷却，避免用猜测覆盖已知状态。
 
 const (
@@ -67,6 +67,14 @@ func LoadAutoModelCooldowns() {
 	now := time.Now()
 	loaded := make(map[string]autoModelCooldownState, len(rows))
 	for _, row := range rows {
+		if row.Model == "" {
+			// 渠道级冷却已废弃（见 applyAutoModelCooldown）：顺手清掉历史残留，
+			// 否则旧记录还会继续让 auto 整条渠道避让，把该渠道里健康的模型一起错过。
+			if err := model.DeleteAutoModelCooldown(row.Group, row.Model, row.ChannelId); err != nil {
+				common.SysError("failed to purge legacy channel-level auto model cooldown: " + err.Error())
+			}
+			continue
+		}
 		until := time.Unix(row.Until, 0)
 		if !until.After(now) {
 			if err := model.DeleteAutoModelCooldown(row.Group, row.Model, row.ChannelId); err != nil {
@@ -110,7 +118,7 @@ func nextAutoModelCooldown(prev autoModelCooldownState, reason string, now time.
 	}
 }
 
-// applyAutoModelCooldown 依据一次 auto 请求的结果维护冷却（模型级 + 渠道级）。
+// applyAutoModelCooldown 依据一次 auto 请求的结果维护冷却（粒度：模型 + 渠道）。
 func applyAutoModelCooldown(group, name string, channelID int, success bool, elapsedMs int64) {
 	group = strings.TrimSpace(group)
 	name = strings.TrimSpace(name)
@@ -136,11 +144,10 @@ func applyAutoModelCooldown(group, name string, channelID int, success bool, ela
 	}
 	tripAutoModelCooldown(group, name, channelID, reason, now)
 
-	// 慢事件会连累整个渠道：同一上游上的其它模型大概率也在排队。
-	// 快速失败（鉴权、余额之类）只算这个模型自己的问题。
-	if success || elapsedMs > autoModelSlowLatencyMs {
-		tripAutoModelCooldown(group, "", channelID, reason, now)
-	}
+	// 只冷却"这个渠道上的这个模型"。
+	// 早期版本在这里额外冷却了整条渠道（同上游的其它模型一并避让），但他的判断更准确：
+	// 一个渠道下 5 个模型，试挂了 2 个不代表剩下 3 个也不行——它们可能又快又稳，
+	// 整条避让就把它们错过了。所以渠道级冷却已移除（历史上的 model='' 记录在载入时清理）。
 }
 
 // tripAutoModelCooldown 让一个 (分组, 模型, 渠道) 组合进入（或加重）冷却。
@@ -203,14 +210,8 @@ func deleteAutoModelCooldownCache(key string) {
 	autoModelCooldowns.AddAll(all)
 }
 
-// autoModelChannelCooling 报告某个渠道是否处于渠道级冷却中（name 传空）。
-func autoModelChannelCooling(group string, channelID int, now time.Time) bool {
-	state, ok := autoModelCooldowns.Get(autoModelHealthKey(group, "", channelID))
-	return ok && state.Until.After(now)
-}
-
-// autoModelCooldownActive 报告该模型的渠道是否全部不可用：
-// 只要还有一个渠道既没有模型级冷却、也没有渠道级冷却，就算还能试。
+// autoModelCooldownActive 报告该模型是不是在所有已知渠道上都处于冷却：
+// 只要还有一个渠道没在冷却，就算这个模型还能试。
 func autoModelCooldownActive(group, name string, channelIDs []int) bool {
 	if len(channelIDs) == 0 {
 		return false
@@ -218,9 +219,6 @@ func autoModelCooldownActive(group, name string, channelIDs []int) bool {
 	ensureAutoModelCooldownsLoaded()
 	now := time.Now()
 	for _, id := range channelIDs {
-		if autoModelChannelCooling(group, id, now) {
-			continue
-		}
 		state, ok := autoModelCooldowns.Get(autoModelHealthKey(group, name, id))
 		if !ok || !state.Until.After(now) {
 			return false

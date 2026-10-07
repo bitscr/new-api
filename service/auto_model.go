@@ -46,6 +46,20 @@ func autoModelHealthPrefix(group, name string) string {
 // 记分粒度为 分组 + 模型 + 渠道，latencyMs <= 0 表示未采集到延迟。
 // elapsedMs 是本次请求的总耗时，用于判断这次是否算"慢"（失败请求的 latencyMs 为 0，但耗时可能很长）。
 func RecordAutoModelOutcome(group, name string, channelID int, success bool, latencyMs int64, elapsedMs int64) {
+	recordAutoModelOutcome(group, name, channelID, success, latencyMs, elapsedMs, false, "")
+}
+
+// RecordAutoModelUnusableAnswer 记录一次"HTTP 200 但没有有效回答"：
+// 正文为空，或正文只是上游网关塞进来的告警横幅（实测样本见 relay/common/answer_observation.go）。
+//
+// 与普通失败的区别在冷却范围：只让"该渠道下的该模型"进冷却，不连累该上游的其它模型。
+// 理由是证据只覆盖这一个组合——上游对这个模型给了横幅，并不能说明它别的模型也不行。
+// 冷却整体上就是 (模型, 渠道) 粒度的，不存在"整条渠道避让"这一层。
+func RecordAutoModelUnusableAnswer(group, name string, channelID int, reason string) {
+	recordAutoModelOutcome(group, name, channelID, false, 0, 0, true, reason)
+}
+
+func recordAutoModelOutcome(group, name string, channelID int, success bool, latencyMs int64, elapsedMs int64, modelOnlyCooldown bool, cooldownReason string) {
 	group = strings.TrimSpace(group)
 	name = strings.TrimSpace(name)
 	if group == "" || name == "" || channelID <= 0 || operation_setting.IsAutoModelName(name) {
@@ -72,6 +86,15 @@ func RecordAutoModelOutcome(group, name string, channelID int, success bool, lat
 	}
 	current.UpdatedAt = time.Now()
 	autoModelHealth.Set(key, current)
+	if modelOnlyCooldown {
+		reason := strings.TrimSpace(cooldownReason)
+		if reason == "" {
+			reason = "响应无有效内容"
+		}
+		ensureAutoModelCooldownsLoaded()
+		tripAutoModelCooldown(group, name, channelID, reason, time.Now())
+		return
+	}
 	// 慢或者失败进入冷却（落库，跨重启生效），正常速度的成功清除冷却。
 	applyAutoModelCooldown(group, name, channelID, success, elapsedMs)
 }

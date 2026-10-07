@@ -282,7 +282,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		if newAPIError == nil {
-			recordAutoModelFeedback(c, relayInfo, true)
+			// 200 但没有有效回答（正文为空，或正文只是上游网关的告警横幅）不算成功：
+			// 旧逻辑把它当"快速成功"，auto 于是越选越多这个渠道的这个模型，
+			// 而调用方每次都拿到假答案（实测渠道 #5 近 7 天 10 次全部如此）。
+			if unusable, reason := relayInfo.ClientAnswerUnusable(); unusable {
+				logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 没有给出有效回答（%s），不计成功", relayInfo.OriginModelName, reason))
+				recordAutoModelUnusableAnswer(c, relayInfo, reason)
+			} else {
+				recordAutoModelFeedback(c, relayInfo, true)
+			}
 			relayInfo.LastError = nil
 			return
 		}
@@ -573,6 +581,22 @@ func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, succes
 		return
 	}
 	service.RecordAutoModelOutcome(info.UsingGroup, info.OriginModelName, channelID, success, observedAutoLatency(info, success), observedAutoModelElapsed(info))
+}
+
+// recordAutoModelUnusableAnswer 与 recordAutoModelFeedback 用同一套去重规则，
+// 但语义是"上游给了 200 却没有有效回答"：不计成功，只冷却"该渠道下的该模型"。
+func recordAutoModelUnusableAnswer(c *gin.Context, info *relaycommon.RelayInfo, reason string) {
+	if !isAutoModelRequest(c) || info == nil {
+		return
+	}
+	channelID := 0
+	if info.ChannelMeta != nil {
+		channelID = info.ChannelMeta.ChannelId
+	}
+	if !markAutoModelFeedbackRecorded(c, info.OriginModelName, channelID) {
+		return
+	}
+	service.RecordAutoModelUnusableAnswer(info.UsingGroup, info.OriginModelName, channelID, reason)
 }
 
 // maxAutoModelHardSwitches auto 因为"候选服务不了"而换模型的上限（每次请求）。

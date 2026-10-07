@@ -38,41 +38,56 @@ func cooldownRows(t *testing.T) []model.AutoModelCooldown {
 	return rows
 }
 
-// TestAutoModelCooldownTripsOnFailureAndSlowSuccess 锁定核心行为：
-// 慢事件同时冷却"这个模型"和"整个渠道"；快速失败只算模型自己的问题；
-// 正常速度的成功能把模型级冷却清掉。
-func TestAutoModelCooldownTripsOnFailureAndSlowSuccess(t *testing.T) {
+// TestAutoModelCooldownIsPerModel 锁定当前语义：冷却是"该渠道上的该模型"的事。
+// 一个渠道下试挂了 2 个模型，不代表剩下 3 个也不行，所以不再冷却整条渠道
+// （早期版本会额外写一条 model='' 的渠道级记录，让同上游的其它模型一起避让）。
+func TestAutoModelCooldownIsPerModel(t *testing.T) {
 	setupAutoModelCooldownTestDB(t)
 	group := "default"
 
-	// 慢成功（总耗时 110 秒）→ 模型级 + 渠道级
+	// 慢成功（总耗时 110 秒）→ 只冷却这个模型
 	applyAutoModelCooldown(group, "slow-model", 1, true, 110000)
-	require.Len(t, cooldownRows(t), 2, "慢事件应写入模型级和渠道级两条冷却")
-	require.True(t, autoModelCooldownActive(group, "slow-model", []int{1}), "慢模型应进入冷却")
-	require.True(t, autoModelCooldownActive(group, "other-model", []int{1}), "同渠道的其它模型也应被连带冷却")
-	require.False(t, autoModelCooldownActive(group, "other-model", []int{1, 2}), "还有别的渠道就不该整体剔除")
+	rows := cooldownRows(t)
+	require.Len(t, rows, 1, "只该有一条模型级冷却")
+	require.Equal(t, "slow-model", rows[0].Model)
+	require.True(t, autoModelCooldownActive(group, "slow-model", []int{1}))
+	require.False(t, autoModelCooldownActive(group, "other-model", []int{1}),
+		"同渠道的其它模型不该被连累——它可能又快又稳")
 
-	// 快速失败（鉴权/余额这类）→ 只记模型级，不连累渠道
+	// 同渠道的第二个模型也慢 → 各记一条，渠道级依旧不出现
+	applyAutoModelCooldown(group, "second-slow-model", 1, true, 110000)
+	rows = cooldownRows(t)
+	require.Len(t, rows, 2)
+	for _, row := range rows {
+		require.NotEmpty(t, row.Model, "不该再出现渠道级（model 为空）记录")
+	}
+
+	// 快速失败（鉴权/余额这类）→ 同样只记模型级
 	applyAutoModelCooldown(group, "dead-model", 2, false, 0)
 	require.Len(t, cooldownRows(t), 3)
-	require.True(t, autoModelCooldownActive(group, "dead-model", []int{2}))
-	require.False(t, autoModelCooldownActive(group, "other-model", []int{2}), "快速失败不该冷却整个渠道")
 
-	// 正常速度的成功 → 清掉该组合的模型级冷却（渠道级只按到期时间失效）
+	// 正常速度的成功 → 清掉该组合的模型级冷却，其它模型不受影响
 	applyAutoModelCooldown(group, "slow-model", 1, true, 1200)
 	_, ok := autoModelCooldowns.Get(autoModelHealthKey(group, "slow-model", 1))
 	require.False(t, ok, "模型级冷却应被清除")
-	require.True(t, autoModelCooldownActive(group, "slow-model", []int{1}), "渠道级冷却未到期前，该渠道仍整体避让")
-	rows := cooldownRows(t)
-	require.Len(t, rows, 2, "渠道级冷却按自己的到期时间失效，不由别的模型成功清除")
-	channelLevel := 0
-	for _, row := range rows {
-		if row.Model == "" {
-			channelLevel++
-			require.Equal(t, 1, row.ChannelId, "渠道级冷却记录的模型名为空")
-		}
-	}
-	require.Equal(t, 1, channelLevel)
+	require.True(t, autoModelCooldownActive(group, "second-slow-model", []int{1}))
+}
+
+// TestLegacyChannelLevelCooldownIsPurged 历史残留的渠道级记录不该继续生效：
+// 载入时清库，也不再参与候选过滤（否则又变成"整条渠道被避让"）。
+func TestLegacyChannelLevelCooldownIsPurged(t *testing.T) {
+	setupAutoModelCooldownTestDB(t)
+	group := "default"
+
+	require.NoError(t, model.UpsertAutoModelCooldown(&model.AutoModelCooldown{
+		Group: group, Model: "", ChannelId: 1,
+		Until: time.Now().Add(time.Hour).Unix(), Level: 5, Reason: "超时/失败（125343ms）",
+		UpdatedAt: time.Now().Unix(),
+	}))
+	LoadAutoModelCooldowns()
+
+	require.Empty(t, cooldownRows(t), "历史渠道级记录应在载入时被清掉")
+	require.False(t, autoModelCooldownActive(group, "any-model", []int{1}), "渠道本身不再被整体避让")
 }
 
 // 连续犯错时冷却窗口逐级翻倍，最长 6 小时。
