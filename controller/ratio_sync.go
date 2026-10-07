@@ -286,6 +286,33 @@ func FetchUpstreamRatios(c *gin.Context) {
 				return
 			}
 
+			// 尝试解析新格式：billing_expr + billing_mode
+			var billingExprData struct {
+				BillingExpr map[string]string `json:"billing_expr"`
+				BillingMode map[string]string `json:"billing_mode"`
+			}
+			if err := common.Unmarshal(body.Data, &billingExprData); err == nil && len(billingExprData.BillingExpr) > 0 {
+				// 检测到 billing_expr 格式，转换为 system 可用的 ratio_config
+				converted := make(map[string]any)
+			
+				// 如果有 billing_mode，也一起转换（用于计费模式配置）
+				if len(billingExprData.BillingMode) > 0 {
+					converted["billing_mode"] = billingExprData.BillingMode
+				}
+			
+				// 将 billing_expr 转换为 model_ratio 字段
+				// 注意：这里是 expression 字符串，不是简单的数值比值
+				ratioAny := make(map[string]any, len(billingExprData.BillingExpr))
+				for k, v := range billingExprData.BillingExpr {
+					ratioAny[k] = v
+				}
+				converted["model_ratio"] = ratioAny
+			
+				logger.LogInfo(c.Request.Context(), "parsed new billing_expr format from "+chItem.Name+", models: "+fmt.Sprintf("%d", len(ratioAny)))
+				ch <- upstreamResult{Name: uniqueName, Data: converted}
+				return
+			}
+
 			// 若 Data 为空，将继续按 type1 尝试解析（与多数静态 ratio_config 兼容）
 
 			// 尝试按 type1 解析

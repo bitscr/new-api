@@ -539,15 +539,20 @@ func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam 
 
 // recordAutoModelFeedback 记录一次 auto 路由请求的被动结果（成功/失败）。
 // 仅记录真实请求的观察结果，不发送任何主动测活。
+// 记分粒度为 (分组，模型，渠道)，用于同优先级层内的最快最稳选择。
 func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, success bool) {
 	if !isAutoModelRequest(c) {
 		return
+	}
+	channelID := 0
+	if info != nil && info.ChannelMeta != nil {
+		channelID = info.ChannelMeta.ChannelId
 	}
 	latencyMs := int64(0)
 	if success && info != nil && info.HasSendResponse() {
 		latencyMs = info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
 	}
-	service.RecordAutoModelOutcome(info.UsingGroup, info.OriginModelName, success, latencyMs)
+	service.RecordAutoModelOutcome(info.UsingGroup, info.OriginModelName, channelID, success, latencyMs)
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
