@@ -52,11 +52,52 @@ Docker 镜像、源码编译、配置与部署教程见下文。
 
 ---
 
-## 方式一：二进制部署（Linux）
+## 方式一：二进制部署（Linux，推荐）
 
-### 1. 下载二进制
+### 一键安装（二进制 + systemd）
 
-到 [Releases 页面](https://github.com/bitscr/new-api/releases) 下载对应架构的压缩包：
+```bash
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/install.sh | sudo bash
+```
+
+一条命令做完：识别架构（amd64 / arm64）→ 下载最新 Release 资产并校验 sha256 → 建 `newapi` 用户与 `/opt/new-api` 目录 → 写 systemd unit（默认 `--port 3000`）→ 启动服务并等 `/api/status` 探活通过，最后打印当前版本和回滚命令。
+
+```bash
+# 指定版本安装
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/install.sh | sudo bash -s -- --version v0.0.1
+
+# 换端口（会一起写进 unit；已装过的机器也可以单独调）
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/install.sh | sudo NEW_API_PORT=8080 bash
+```
+
+可调环境变量（写在 `sudo` 后面）：`NEW_API_VERSION`、`NEW_API_PORT`、`NEW_API_DIR`、`NEW_API_BIN`、`NEW_API_USER`、`NEW_API_SERVICE`、`NEW_API_REPO`、`NEW_API_ARCH`。
+
+> 脚本只在**缺失时**创建 `/opt/new-api/env` 和 systemd unit。若 unit 已存在且与脚本模板不同，它不会覆盖，而是另存为 `newapi.service.new` 并提示你 `diff` —— 你手工改过 unit 的机器是安全的。
+
+### 验证与初始化
+
+```bash
+curl http://localhost:3000/api/status   # 返回 {"success":true,...} 即服务正常
+systemctl status new-api
+```
+
+浏览器打开 <http://服务器IP:3000> 完成管理员初始化。
+
+### 常用运维命令
+
+```bash
+sudo systemctl restart new-api     # 重启
+sudo systemctl stop new-api        # 停止
+journalctl -u new-api -f           # 查看实时日志
+ls /opt/new-api/logs               # 落盘日志目录
+```
+
+<details>
+<summary>手动分步安装（等同于上面脚本做的事）</summary>
+
+#### 1. 下载二进制
+
+到 [Releases 页面](https://github.com/bitscr/new-api/releases) 下载对应架构的压缩包，或直接：
 
 ```bash
 # 查看机器架构
@@ -64,14 +105,19 @@ uname -m   # x86_64 → amd64；aarch64 → arm64
 
 # 下载并解压（以 amd64 为例，文件名以实际 Release 为准）
 wget https://github.com/bitscr/new-api/releases/latest/download/new-api-linux-amd64.tar.gz
+wget https://github.com/bitscr/new-api/releases/latest/download/new-api-linux-amd64.tar.gz.sha256
+
+# Release 里的 .sha256 记录的是构建目录内的相对路径（release/xxx.tar.gz），
+# 直接 sha256sum -c 会报找不到文件，这里取哈希值重拼本地文件名再校验
+echo "$(awk '{print $1}' new-api-linux-amd64.tar.gz.sha256)  new-api-linux-amd64.tar.gz" | sha256sum -c -
+
 tar -xzf new-api-linux-amd64.tar.gz
-sudo mv new-api-linux-amd64 /usr/local/bin/new-api
-sudo chmod +x /usr/local/bin/new-api
+sudo install -m 0755 new-api-linux-amd64 /usr/local/bin/new-api
 ```
 
-> ⚠️ **目前 Releases 页面还没有任何已发布版本。** 二进制由 CI 自动构建发布：当仓库打了 `v*` tag 或手动触发「Build release binaries」workflow 后，会产生 `new-api-linux-amd64.tar.gz` / `new-api-linux-arm64.tar.gz` 资产。在第一个 Release 出现之前，请先用「方式三：源码编译」得到二进制。
+> 二进制由 CI 发布：仓库打 `v*` tag（或手动触发「Build release binaries」workflow）后，产出 `new-api-linux-amd64.tar.gz` / `new-api-linux-arm64.tar.gz` 及其 `.sha256` 校验文件。
 
-### 2. 准备目录与配置
+#### 2. 准备目录与配置
 
 ```bash
 sudo useradd -r -s /usr/sbin/nologin newapi 2>/dev/null || true
@@ -87,7 +133,7 @@ EOF
 
 > 二进制内置前端资源（`go:embed`），**不需要**单独的 `web/dist` 目录。
 
-### 3. systemd 服务
+#### 3. systemd 服务
 
 ```bash
 sudo tee /etc/systemd/system/new-api.service > /dev/null <<'EOF'
@@ -112,21 +158,7 @@ sudo systemctl enable --now new-api
 sudo systemctl status new-api
 ```
 
-### 4. 验证与初始化
-
-```bash
-curl http://localhost:3000/api/status
-```
-
-浏览器打开 <http://服务器IP:3000> 完成管理员初始化。
-
-### 常用运维命令
-
-```bash
-sudo systemctl restart new-api     # 重启
-journalctl -u new-api -f           # 查看实时日志
-ls /opt/new-api/logs               # 落盘日志目录
-```
+</details>
 
 ---
 
@@ -308,18 +340,44 @@ server {
 
 ## 升级与备份
 
-**二进制方式升级：**
+### 一键升级（二进制 + systemd）
 
 ```bash
-# 1. 下载新版二进制（见 Releases）
-wget https://github.com/bitscr/new-api/releases/latest/download/new-api-linux-amd64.tar.gz
-tar -xzf new-api-linux-amd64.tar.gz
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/install.sh | sudo bash -s -- --update
+```
 
-# 2. 替换二进制并重启
-sudo mv new-api-linux-amd64 /usr/local/bin/new-api
-sudo chmod +x /usr/local/bin/new-api
+脚本会：下载最新 Release → 校验 sha256 → 把旧二进制备份成 `/usr/local/bin/new-api.bak-<时间戳>` → 重启服务并探活，最后打印当前版本和回滚命令。端口、用户、数据目录、env、systemd unit 全部沿用现状，不会重建。
+
+```bash
+# 升级到指定版本
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/install.sh | sudo bash -s -- --update --version v0.0.2
+```
+
+回滚（脚本探活失败时也会把这条命令打出来）：
+
+```bash
+sudo systemctl stop new-api
+sudo mv /usr/local/bin/new-api.bak-20261007132415 /usr/local/bin/new-api
+sudo systemctl start new-api
+```
+
+<details>
+<summary>手动升级（等同于上面脚本做的事）</summary>
+
+```bash
+# 1. 下载新版二进制并校验（版本见 Releases）
+wget https://github.com/bitscr/new-api/releases/latest/download/new-api-linux-amd64.tar.gz
+wget https://github.com/bitscr/new-api/releases/latest/download/new-api-linux-amd64.tar.gz.sha256
+echo "$(awk '{print $1}' new-api-linux-amd64.tar.gz.sha256)  new-api-linux-amd64.tar.gz" | sha256sum -c -
+
+# 2. 备份旧二进制、替换、重启
+tar -xzf new-api-linux-amd64.tar.gz
+sudo cp -a /usr/local/bin/new-api /usr/local/bin/new-api.bak-$(date +%Y%m%d)
+sudo install -m 0755 new-api-linux-amd64 /usr/local/bin/new-api
 sudo systemctl restart new-api
 ```
+
+</details>
 
 **Docker Compose 升级：**
 
@@ -330,9 +388,11 @@ docker compose up -d
 
 **备份：**
 
-- SQLite：备份数据目录（默认 `/data` 或 `./new-api-data`）中的数据库文件
+- SQLite（二进制部署）：备份工作目录下的数据库文件 `/opt/new-api/one-api.db`
+- SQLite（Docker）：备份挂载出来的数据目录（默认 `/data` 或 `./new-api-data`）
 - PostgreSQL / MySQL：使用对应 `pg_dump` / `mysqldump` 备份
-- 日志：备份 `/app/logs` 目录
+- 配置：二进制部署的 `/opt/new-api/env`、Docker 的 `.env` 与 compose 文件
+- 日志：备份 `/opt/new-api/logs` 或 `/app/logs` 目录
 
 ---
 
