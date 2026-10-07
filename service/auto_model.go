@@ -44,7 +44,8 @@ func autoModelHealthPrefix(group, name string) string {
 
 // RecordAutoModelOutcome 记录一次已观察到的请求结果（被动反馈）。
 // 记分粒度为 分组 + 模型 + 渠道，latencyMs <= 0 表示未采集到延迟。
-func RecordAutoModelOutcome(group, name string, channelID int, success bool, latencyMs int64) {
+// elapsedMs 是本次请求的总耗时，用于判断这次是否算"慢"（失败请求的 latencyMs 为 0，但耗时可能很长）。
+func RecordAutoModelOutcome(group, name string, channelID int, success bool, latencyMs int64, elapsedMs int64) {
 	group = strings.TrimSpace(group)
 	name = strings.TrimSpace(name)
 	if group == "" || name == "" || channelID <= 0 || operation_setting.IsAutoModelName(name) {
@@ -71,6 +72,8 @@ func RecordAutoModelOutcome(group, name string, channelID int, success bool, lat
 	}
 	current.UpdatedAt = time.Now()
 	autoModelHealth.Set(key, current)
+	// 慢或者失败进入冷却（落库，跨重启生效），正常速度的成功清除冷却。
+	applyAutoModelCooldown(group, name, channelID, success, elapsedMs)
 }
 
 // effectiveScore 将观测折算为可用分数：
@@ -162,6 +165,8 @@ func GetAutoModelCandidates(group string) []string {
 		}
 		result = append(result, name)
 	}
+	// 所有渠道都在冷却中的模型先剔除（见 auto_model_cooldown.go）。
+	result = excludeCoolingAutoModelCandidates(group, result)
 	return rankAutoModelCandidates(group, result)
 }
 
@@ -225,7 +230,10 @@ func rankAutoModelCandidates(group string, candidates []string) []string {
 // used: 本次请求已使用过的渠道 ID 集合。
 //
 // 返回所选的模型名和层级索引。如果该层级无可用组合，返回 nil。
-func SelectBestModelInTier(retry int, candidates []string, getTierChannels func(model string, tierIndex int) []int, used map[int]bool) (*struct{ Model string; TierIndex int }, error) {
+func SelectBestModelInTier(retry int, candidates []string, getTierChannels func(model string, tierIndex int) []int, used map[int]bool) (*struct {
+	Model     string
+	TierIndex int
+}, error) {
 	if len(candidates) == 0 {
 		return nil, nil
 	}
@@ -279,5 +287,8 @@ func SelectBestModelInTier(retry int, candidates []string, getTierChannels func(
 		return entries[a].pos < entries[b].pos
 	})
 
-	return &struct{ Model string; TierIndex int }{Model: entries[0].name, TierIndex: tierIndex}, nil
+	return &struct {
+		Model     string
+		TierIndex int
+	}{Model: entries[0].name, TierIndex: tierIndex}, nil
 }

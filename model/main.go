@@ -295,6 +295,7 @@ func migrateDB() error {
 		&IPBan{},
 		&IPBanUserBan{},
 		&ProbeIPAbuseState{},
+		&AutoModelCooldown{},
 	)
 	if err != nil {
 		return err

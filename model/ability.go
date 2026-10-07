@@ -46,6 +46,28 @@ func GetGroupEnabledModels(group string) []string {
 	return models
 }
 
+// GetGroupModelChannelIDs 返回某分组下每个模型当前可用的渠道 ID 列表。
+// 供 auto 候选的冷却判断使用：只有当一个模型的所有渠道都在冷却，才把它剔除。
+func GetGroupModelChannelIDs(group string) (map[string][]int, error) {
+	type row struct {
+		Model     string
+		ChannelId int
+	}
+	var rows []row
+	err := DB.Table("abilities").
+		Select("model, channel_id").
+		Where(commonGroupCol+" = ? and enabled = ?", group, true).
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string][]int, len(rows))
+	for _, item := range rows {
+		result[item.Model] = append(result[item.Model], item.ChannelId)
+	}
+	return result, nil
+}
+
 func GetEnabledModels() []string {
 	var models []string
 	// Find distinct models

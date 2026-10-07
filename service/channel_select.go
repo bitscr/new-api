@@ -69,6 +69,11 @@ func GetChannelRPMLimitSkippedIDs(c *gin.Context) map[int]bool {
 	return getChannelSkippedIDs(c, channelRPMLimitSkippedIDsKey)
 }
 
+// maxChannelAttemptsPerRequest 同一个渠道在一次请求里最多尝试的次数。
+// 排队型/免费上游（例如上游返回"排队中，请 30 秒后重试"）重试同一个渠道不会有任何
+// 收益：实测有一次请求对同一个渠道重试了 51 次、白等两分钟，最后客户端超时断开。
+const maxChannelAttemptsPerRequest = 2
+
 func GetChannelSelectionExcludedIDs(c *gin.Context) map[int]bool {
 	excluded := GetChannelDailySuccessLimitSkippedIDs(c)
 	for id, skipped := range GetChannelRPMLimitSkippedIDs(c) {
@@ -76,7 +81,30 @@ func GetChannelSelectionExcludedIDs(c *gin.Context) map[int]bool {
 			excluded[id] = true
 		}
 	}
+	// 试满上限的渠道不再参与选择；如果该模型只剩这些渠道，选择会返回空，
+	// 由上层决定是换候选模型（auto）还是把真实的上游报错返回。
+	for id, count := range countChannelAttempts(c) {
+		if count >= maxChannelAttemptsPerRequest {
+			excluded[id] = true
+		}
+	}
 	return excluded
+}
+
+// countChannelAttempts 统计本次请求里每个渠道已经被尝试的次数（数据来自 use_channel）。
+func countChannelAttempts(c *gin.Context) map[int]int {
+	counts := map[int]int{}
+	if c == nil {
+		return counts
+	}
+	for _, raw := range c.GetStringSlice("use_channel") {
+		id, err := strconv.Atoi(raw)
+		if err != nil {
+			continue
+		}
+		counts[id]++
+	}
+	return counts
 }
 
 // GetUsedChannelIDs 返回"本次请求已经打过（并失败）的渠道"。

@@ -231,8 +231,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			// auto 路由：当前模型渠道耗尽时，切换到下一个候选模型再尝试
+			exhaustedModel := relayInfo.OriginModelName
 			if trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
+				logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 的渠道已耗尽，切换候选 %s", exhaustedModel, relayInfo.OriginModelName))
 				continue
+			}
+			// 已经失败过至少一次才走到这里，说明不是"没有渠道"，而是候选渠道都被排除了
+			// （例如同一渠道试满上限）。把真实的上游报错返回，别用"可用渠道不存在"误导排查。
+			if retryParam.GetRetry() > 0 && relayInfo.LastError != nil {
+				newAPIError = relayInfo.LastError
+				break
 			}
 			newAPIError = channelErr
 			break
@@ -294,6 +302,19 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		recordAutoModelFeedback(c, relayInfo, false)
 
 		if !shouldRetry(c, newAPIError, retryParam.GetRemainingRetryTimes()) {
+			// auto 路由：上游明确表示服务不了当前候选（404 模型不支持、400 参数不支持等）时，
+			// 换下一个候选模型再试。否则客户端只会收到 404/400 并直接停止
+			// （实测：上游 404 被原样返回，客户端报 model_not_found）。
+			if autoModelSwitchableError(newAPIError) &&
+				c.GetInt("auto_model_hard_switches") < maxAutoModelHardSwitches {
+				oldModel := relayInfo.OriginModelName
+				if trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
+					c.Set("auto_model_hard_switches", c.GetInt("auto_model_hard_switches")+1)
+					logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 被上游拒绝（status %d），切换候选 %s",
+						oldModel, newAPIError.StatusCode, relayInfo.OriginModelName))
+					continue
+				}
+			}
 			break
 		}
 		retryParam.IncreaseRetry()
@@ -533,7 +554,7 @@ func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam 
 	// 换模型后渠道池重新开始（同模型已试渠道不阻塞新模型）
 	c.Set("use_channel", make([]string, 0))
 	common.SetContextKey(c, constant.ContextKeyAutoModelIndex, next)
-	logger.LogInfo(c, fmt.Sprintf("auto model: 模型渠道耗尽，切换候选 %s -> %s", oldModel, newModel))
+	logger.LogInfo(c, fmt.Sprintf("auto model: 切换候选 %s -> %s", oldModel, newModel))
 	return true
 }
 
@@ -548,11 +569,49 @@ func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, succes
 	if info != nil && info.ChannelMeta != nil {
 		channelID = info.ChannelMeta.ChannelId
 	}
-	latencyMs := int64(0)
-	if success && info != nil && info.HasSendResponse() {
-		latencyMs = info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
+	if !markAutoModelFeedbackRecorded(c, info.OriginModelName, channelID) {
+		return
 	}
-	service.RecordAutoModelOutcome(info.UsingGroup, info.OriginModelName, channelID, success, latencyMs)
+	service.RecordAutoModelOutcome(info.UsingGroup, info.OriginModelName, channelID, success, observedAutoLatency(info, success), observedAutoModelElapsed(info))
+}
+
+// maxAutoModelHardSwitches auto 因为"候选服务不了"而换模型的上限（每次请求）。
+// 有上限才不会把一个请求放大成几十次上游调用。
+const maxAutoModelHardSwitches = 2
+
+// autoModelSwitchableError 判断错误是否属于"换一个候选模型很可能就行"的情况：
+// 上游不认这个模型（404）或不认这次请求的某个参数（400/422 等）。
+func autoModelSwitchableError(err *types.NewAPIError) bool {
+	if err == nil {
+		return false
+	}
+	switch err.StatusCode {
+	case http.StatusNotFound, http.StatusBadRequest, http.StatusUnprocessableEntity,
+		http.StatusNotImplemented, http.StatusMethodNotAllowed:
+		return true
+	}
+	return false
+}
+
+// markAutoModelFeedbackRecorded 同一次请求里同一个 (模型, 渠道) 只记一次结果。
+// 一次请求可能对同一个渠道重试很多次（上游排队时实测 51 次），逐次记分会让成绩表
+// 的观测数虚高，也会让冷却等级被一次请求顶到上限（实测出现过等级 53、直接冷静 6 小时）。
+func markAutoModelFeedbackRecorded(c *gin.Context, modelName string, channelID int) bool {
+	if c == nil {
+		return true
+	}
+	key := fmt.Sprintf("%s|%d", modelName, channelID)
+	seen, ok := c.Get("auto_model_feedback_seen")
+	recorded, _ := seen.(map[string]bool)
+	if !ok || recorded == nil {
+		recorded = map[string]bool{}
+	}
+	if recorded[key] {
+		return false
+	}
+	recorded[key] = true
+	c.Set("auto_model_feedback_seen", recorded)
+	return true
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
@@ -977,4 +1036,31 @@ func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError,
 		return false
 	}
 	return true
+}
+
+// observedAutoLatency 返回一次 auto 请求可用于评分的延迟信号。
+//
+// 流式请求由 stream_scanner 写入首字节时间（TTFB），直接用 TTFB；
+// 非流式路径不会写 FirstResponseTime（消费日志里的 frt 固定在 -1000 就是这种情况），
+// 若此时仍返回 0，一次耗时几十秒但成功的请求会被当成"零延迟的完美候选"，
+// 使得排在第一位的慢渠道（例如排队几十秒才服务的上游）永远压着没观测过的候选，
+// auto 每次都会再选它。因此非流式退化成用总耗时兜底。
+// observedAutoModelElapsed 返回一次 auto 请求的总耗时，用于判断这次是不是"慢"。
+// 与 observedAutoLatency 不同：失败的请求也返回耗时（客户端等到超时才断开的那种，
+// 耗时很长但用时为 0 的延迟信号看不出问题）。
+func observedAutoModelElapsed(info *relaycommon.RelayInfo) int64 {
+	if info == nil || info.StartTime.IsZero() {
+		return 0
+	}
+	return time.Since(info.StartTime).Milliseconds()
+}
+
+func observedAutoLatency(info *relaycommon.RelayInfo, success bool) int64 {
+	if info == nil || !success || info.StartTime.IsZero() {
+		return 0
+	}
+	if info.HasSendResponse() {
+		return info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
+	}
+	return time.Since(info.StartTime).Milliseconds()
 }
