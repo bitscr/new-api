@@ -224,8 +224,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
+	// Commit only the final outcome of each (group, model, channel) in this request.
+	// A failed attempt must not consume the feedback slot of a later success.
+	defer flushAutoModelFeedback(c)
 
 	for retryParam.GetRetry() <= retryParam.GetEffectiveRetryTimes() {
+		if canceledErr := autoModelCanceledRequestError(c, newAPIError); canceledErr != nil {
+			newAPIError = canceledErr
+			break
+		}
 		relayInfo.RetryIndex = retryParam.GetRetry()
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
@@ -270,6 +277,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
+		relayInfo.BeginAttempt()
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
 			newAPIError = relay.WssHelper(c, relayInfo)
@@ -280,8 +288,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		default:
 			newAPIError = relayHandler(c, relayInfo)
 		}
+		relayInfo.EndAttempt()
 
 		if newAPIError == nil {
+			if autoModelRequestContextError(c) != nil {
+				// Some stream adaptors return nil on client disconnect. Do not
+				// classify a partial answer as healthy or as an upstream failure.
+				relayInfo.LastError = nil
+				return
+			}
 			// 200 但没有有效回答（正文为空，或正文只是上游网关的告警横幅）不算成功：
 			// 旧逻辑把它当"快速成功"，auto 于是越选越多这个渠道的这个模型，
 			// 而调用方每次都拿到假答案（实测渠道 #5 近 7 天 10 次全部如此）。
@@ -295,6 +310,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			return
 		}
 		model.ReleaseChannelDailySuccess(reservation)
+		if canceledErr := autoModelCanceledRequestError(c, newAPIError); canceledErr != nil {
+			// The client disappearing is not evidence against this upstream. Keep
+			// earlier real failures queued, but do not penalize or retry this attempt.
+			newAPIError = canceledErr
+			break
+		}
 		if service.IsChannelRPMLimitError(newAPIError) {
 			relayInfo.LastError = newAPIError
 			if shouldSkipRPMLimitedChannel(c, channel) {
@@ -480,6 +501,9 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 }
 
 func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
+	if autoModelRequestContextError(c) != nil {
+		return false
+	}
 	if openaiErr == nil {
 		return false
 	}
@@ -513,8 +537,33 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 
 // isAutoModelRequest 判断当前请求是否是分组内虚拟 auto 模型路由的请求。
 func isAutoModelRequest(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
 	_, ok := common.GetContextKey(c, constant.ContextKeyAutoModelClientName)
 	return ok
+}
+
+// autoModelRequestContextError deliberately leaves non-auto behavior unchanged.
+func autoModelRequestContextError(c *gin.Context) error {
+	if !isAutoModelRequest(c) || c.Request == nil {
+		return nil
+	}
+	return c.Request.Context().Err()
+}
+
+// autoModelCanceledRequestError preserves an already observed upstream error.
+// The synthetic error is only needed when cancellation precedes any attempt.
+func autoModelCanceledRequestError(c *gin.Context, current *types.NewAPIError) *types.NewAPIError {
+	err := autoModelRequestContextError(c)
+	if err == nil {
+		return nil
+	}
+	if current != nil {
+		return current
+	}
+	return types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, http.StatusRequestTimeout,
+		types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 }
 
 // trySwitchAutoModel 在“当前模型渠道耗尽”时把路由切换到下一个候选模型。
@@ -522,7 +571,7 @@ func isAutoModelRequest(c *gin.Context) bool {
 // 切换会更新 OriginModelName/ClientModelName/PriceData 并重置渠道已用列表，
 // 使新模型拥有完整渠道池。
 func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam, tokens int, meta *types.TokenCountMeta) bool {
-	if !operation_setting.AutoModelEnabled || !isAutoModelRequest(c) {
+	if !operation_setting.AutoModelEnabled || !isAutoModelRequest(c) || autoModelRequestContextError(c) != nil {
 		return false
 	}
 	candidatesAny, ok := common.GetContextKey(c, constant.ContextKeyAutoModelCandidates)
@@ -534,12 +583,20 @@ func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam 
 		return false
 	}
 	index := common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex)
-	next := index + 1
-	if next >= len(candidates) {
-		logger.LogInfo(c, fmt.Sprintf("auto model: 候选模型已全部尝试（%s）", strings.Join(candidates, " -> ")))
+	if index < 0 || index >= len(candidates) {
 		return false
 	}
-	oldModel := candidates[index]
+	next := index + 1
+	// Treat the candidate snapshot as untrusted at the final model-switch boundary.
+	// Middleware filtering must not be the only guard against token scope bypass.
+	for next < len(candidates) && !service.IsAutoModelCandidateAuthorized(c, candidates[next]) {
+		next++
+	}
+	if next >= len(candidates) {
+		logger.LogInfo(c, fmt.Sprintf("auto model: 授权候选模型已全部尝试（%s）", strings.Join(candidates, " -> ")))
+		return false
+	}
+	oldModel := info.OriginModelName
 	newModel := candidates[next]
 
 	info.OriginModelName = newModel
@@ -566,37 +623,78 @@ func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam 
 	return true
 }
 
-// recordAutoModelFeedback 记录一次 auto 路由请求的被动结果（成功/失败）。
-// 仅记录真实请求的观察结果，不发送任何主动测活。
-// 记分粒度为 (分组，模型，渠道)，用于同优先级层内的最快最稳选择。
+// recordAutoModelFeedback captures this attempt now; flushing later must not read
+// mutable RelayInfo fields belonging to another model/channel or a later attempt.
 func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, success bool) {
-	if !isAutoModelRequest(c) {
+	if !isAutoModelRequest(c) || info == nil || autoModelRequestContextError(c) != nil {
 		return
 	}
-	channelID := 0
-	if info != nil && info.ChannelMeta != nil {
-		channelID = info.ChannelMeta.ChannelId
-	}
-	if !markAutoModelFeedbackRecorded(c, info.OriginModelName, channelID) {
-		return
-	}
-	service.RecordAutoModelOutcome(info.UsingGroup, info.OriginModelName, channelID, success, observedAutoLatency(info, success), observedAutoModelElapsed(info))
+	queueAutoModelFeedback(c, info, autoModelFeedback{
+		success:   success,
+		latencyMS: observedAutoLatency(info, success),
+		elapsedMS: observedAutoModelCooldownLatency(info, success),
+	})
 }
 
-// recordAutoModelUnusableAnswer 与 recordAutoModelFeedback 用同一套去重规则，
-// 但语义是"上游给了 200 却没有有效回答"：不计成功，只冷却"该渠道下的该模型"。
+// An unusable HTTP 200 is the final failure of this combination, not a success.
 func recordAutoModelUnusableAnswer(c *gin.Context, info *relaycommon.RelayInfo, reason string) {
-	if !isAutoModelRequest(c) || info == nil {
+	if !isAutoModelRequest(c) || info == nil || autoModelRequestContextError(c) != nil {
 		return
 	}
+	queueAutoModelFeedback(c, info, autoModelFeedback{unusable: true, reason: reason})
+}
+
+type autoModelFeedbackKey struct {
+	group     string
+	modelName string
+	channelID int
+}
+
+type autoModelFeedback struct {
+	success   bool
+	latencyMS int64
+	elapsedMS int64 // cooldown signal: successful TTFB (or non-stream elapsed), failed elapsed
+	unusable  bool
+	reason    string
+}
+
+const autoModelFeedbackContextKey = "auto_model_feedback_pending"
+
+func queueAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, feedback autoModelFeedback) {
 	channelID := 0
 	if info.ChannelMeta != nil {
 		channelID = info.ChannelMeta.ChannelId
 	}
-	if !markAutoModelFeedbackRecorded(c, info.OriginModelName, channelID) {
-		return
+	key := autoModelFeedbackKey{group: info.UsingGroup, modelName: info.OriginModelName, channelID: channelID}
+	value, _ := c.Get(autoModelFeedbackContextKey)
+	pending, _ := value.(map[autoModelFeedbackKey]autoModelFeedback)
+	if pending == nil {
+		pending = make(map[autoModelFeedbackKey]autoModelFeedback)
 	}
-	service.RecordAutoModelUnusableAnswer(info.UsingGroup, info.OriginModelName, channelID, reason)
+	// Last attempt wins: many failed retries count once, and a later success is
+	// allowed to replace an earlier failure (including its stale latency).
+	pending[key] = feedback
+	c.Set(autoModelFeedbackContextKey, pending)
+}
+
+func takeAutoModelFeedback(c *gin.Context) map[autoModelFeedbackKey]autoModelFeedback {
+	if c == nil {
+		return nil
+	}
+	value, _ := c.Get(autoModelFeedbackContextKey)
+	pending, _ := value.(map[autoModelFeedbackKey]autoModelFeedback)
+	c.Set(autoModelFeedbackContextKey, nil)
+	return pending
+}
+
+func flushAutoModelFeedback(c *gin.Context) {
+	for key, feedback := range takeAutoModelFeedback(c) {
+		if feedback.unusable {
+			service.RecordAutoModelUnusableAnswer(key.group, key.modelName, key.channelID, feedback.reason)
+		} else {
+			service.RecordAutoModelOutcome(key.group, key.modelName, key.channelID, feedback.success, feedback.latencyMS, feedback.elapsedMS)
+		}
+	}
 }
 
 // maxAutoModelHardSwitches auto 因为"候选服务不了"而换模型的上限（每次请求）。
@@ -615,27 +713,6 @@ func autoModelSwitchableError(err *types.NewAPIError) bool {
 		return true
 	}
 	return false
-}
-
-// markAutoModelFeedbackRecorded 同一次请求里同一个 (模型, 渠道) 只记一次结果。
-// 一次请求可能对同一个渠道重试很多次（上游排队时实测 51 次），逐次记分会让成绩表
-// 的观测数虚高，也会让冷却等级被一次请求顶到上限（实测出现过等级 53、直接冷静 6 小时）。
-func markAutoModelFeedbackRecorded(c *gin.Context, modelName string, channelID int) bool {
-	if c == nil {
-		return true
-	}
-	key := fmt.Sprintf("%s|%d", modelName, channelID)
-	seen, ok := c.Get("auto_model_feedback_seen")
-	recorded, _ := seen.(map[string]bool)
-	if !ok || recorded == nil {
-		recorded = map[string]bool{}
-	}
-	if recorded[key] {
-		return false
-	}
-	recorded[key] = true
-	c.Set("auto_model_feedback_seen", recorded)
-	return true
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
@@ -1062,29 +1139,35 @@ func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError,
 	return true
 }
 
-// observedAutoLatency 返回一次 auto 请求可用于评分的延迟信号。
-//
-// 流式请求由 stream_scanner 写入首字节时间（TTFB），直接用 TTFB；
-// 非流式路径不会写 FirstResponseTime（消费日志里的 frt 固定在 -1000 就是这种情况），
-// 若此时仍返回 0，一次耗时几十秒但成功的请求会被当成"零延迟的完美候选"，
-// 使得排在第一位的慢渠道（例如排队几十秒才服务的上游）永远压着没观测过的候选，
-// auto 每次都会再选它。因此非流式退化成用总耗时兜底。
-// observedAutoModelElapsed 返回一次 auto 请求的总耗时，用于判断这次是不是"慢"。
-// 与 observedAutoLatency 不同：失败的请求也返回耗时（客户端等到超时才断开的那种，
-// 耗时很长但用时为 0 的延迟信号看不出问题）。
+// observedAutoModelElapsed measures only this upstream attempt, including failed
+// attempts. Request-level StartTime remains reserved for existing logs/billing.
 func observedAutoModelElapsed(info *relaycommon.RelayInfo) int64 {
-	if info == nil || info.StartTime.IsZero() {
-		return 0
-	}
-	return time.Since(info.StartTime).Milliseconds()
+	return info.AttemptElapsed().Milliseconds()
 }
 
 func observedAutoLatency(info *relaycommon.RelayInfo, success bool) int64 {
-	if info == nil || !success || info.StartTime.IsZero() {
+	if info == nil || !success {
 		return 0
 	}
-	if info.HasSendResponse() {
-		return info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
+	if latency, ok := info.AttemptFirstResponseLatency(); ok {
+		// Zero is reserved for missing timing. A real sub-millisecond response
+		// must still clear an earlier cooldown on a successful attempt.
+		return max(int64(1), latency.Milliseconds())
 	}
-	return time.Since(info.StartTime).Milliseconds()
+	if info.IsStream {
+		// Without a valid first response, generation duration is not a TTFB
+		// estimate. Do not turn a fast-starting long stream into a slow outcome.
+		return 0
+	}
+	if info.AttemptStartTime.IsZero() || (!info.AttemptEndTime.IsZero() && info.AttemptEndTime.Before(info.AttemptStartTime)) {
+		return 0
+	}
+	return max(int64(1), observedAutoModelElapsed(info))
+}
+
+func observedAutoModelCooldownLatency(info *relaycommon.RelayInfo, success bool) int64 {
+	if success {
+		return observedAutoLatency(info, true)
+	}
+	return observedAutoModelElapsed(info)
 }

@@ -6,6 +6,12 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -30,17 +36,58 @@ func TestAutoModelSwitchableError(t *testing.T) {
 		errors.New("unauthorized"), types.ErrorCodeGetChannelFailed, http.StatusUnauthorized)))
 }
 
-// 一次请求里同一个 (模型, 渠道) 只记一次反馈：
-// 上游排队时实测同一请求重试 51 次，逐次记分会让观测数虚高、冷却等级被一次请求顶满。
-func TestMarkAutoModelFeedbackRecordedDedupes(t *testing.T) {
+func TestTrySwitchAutoModelSkipsUnauthorizedCandidates(t *testing.T) {
+	oldEnabled := operation_setting.AutoModelEnabled
+	operation_setting.AutoModelEnabled = true
+	t.Cleanup(func() { operation_setting.AutoModelEnabled = oldEnabled })
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(c, constant.ContextKeyAutoModelClientName, "auto")
+	common.SetContextKey(c, constant.ContextKeyAutoModelCandidates, []string{"old", "denied", "allowed"})
+	common.SetContextKey(c, constant.ContextKeyAutoModelIndex, 0)
+	common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
+	common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"old": true, "allowed": true})
+	c.Set("original_model", "old")
+	c.Set("use_channel", []string{"9"})
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "old",
+		ClientModelName: "old",
+		UsingGroup:     "default",
+		UserGroup:      "default",
+		UserSetting:    dto.UserSetting{AcceptUnsetRatioModel: true},
+	}
+	retry := &service.RetryParam{Ctx: c, ModelName: "old", Retry: common.GetPointer(1)}
+	require.True(t, trySwitchAutoModel(c, info, retry, 0, &types.TokenCountMeta{}))
+	require.Equal(t, "allowed", info.OriginModelName)
+	require.Equal(t, "allowed", info.ClientModelName)
+	require.Equal(t, "allowed", retry.ModelName)
+	require.Equal(t, "allowed", c.GetString("original_model"))
+	require.Equal(t, 2, common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex))
+	require.Empty(t, c.GetStringSlice("use_channel"))
+}
 
-	require.True(t, markAutoModelFeedbackRecorded(c, "DeepSeek-Flash", 1), "第一次要记账")
-	require.False(t, markAutoModelFeedbackRecorded(c, "DeepSeek-Flash", 1), "同一组合重复尝试不再记账")
-
-	require.True(t, markAutoModelFeedbackRecorded(c, "DeepSeek-Flash", 10), "换渠道是新的组合")
-	require.True(t, markAutoModelFeedbackRecorded(c, "GLM-5.3-Flash", 1), "换模型是新的组合")
-
-	require.True(t, markAutoModelFeedbackRecorded(nil, "x", 1), "没有上下文时保持原有记账行为")
+func TestTrySwitchAutoModelRejectsUnauthorizedOrInvalidSnapshotWithoutMutation(t *testing.T) {
+	oldEnabled := operation_setting.AutoModelEnabled
+	operation_setting.AutoModelEnabled = true
+	t.Cleanup(func() { operation_setting.AutoModelEnabled = oldEnabled })
+	for _, index := range []int{0, -1, 2} {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		common.SetContextKey(c, constant.ContextKeyAutoModelClientName, "auto")
+		common.SetContextKey(c, constant.ContextKeyAutoModelCandidates, []string{"old", "denied"})
+		common.SetContextKey(c, constant.ContextKeyAutoModelIndex, index)
+		common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
+		common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"old": true, "auto": true})
+		c.Set("original_model", "old")
+		c.Set("use_channel", []string{"9"})
+		info := &relaycommon.RelayInfo{OriginModelName: "old", ClientModelName: "old"}
+		retry := &service.RetryParam{Ctx: c, ModelName: "old", Retry: common.GetPointer(1)}
+		// nil meta would fail if the denied candidate reached model pricing.
+		require.False(t, trySwitchAutoModel(c, info, retry, 0, nil))
+		require.Equal(t, "old", info.OriginModelName)
+		require.Equal(t, "old", info.ClientModelName)
+		require.Equal(t, "old", retry.ModelName)
+		require.Equal(t, "old", c.GetString("original_model"))
+		require.Equal(t, index, common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex))
+		require.Equal(t, []string{"9"}, c.GetStringSlice("use_channel"))
+	}
 }

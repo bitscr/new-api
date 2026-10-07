@@ -2,6 +2,7 @@ package service
 
 import (
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/stretchr/testify/require"
@@ -50,7 +51,7 @@ func TestAutoModelHealthRanking(t *testing.T) {
 	input := []string{"model-b", "model-a", "model-c"}
 	firstSeen := map[string]bool{}
 	for i := 0; i < 40; i++ {
-		ranked := rankAutoModelCandidates(group, input)
+		ranked := rankAutoModelTestCandidates(group, input)
 		require.ElementsMatch(t, input, ranked)
 		firstSeen[ranked[0]] = true
 	}
@@ -64,7 +65,7 @@ func TestAutoModelHealthRanking(t *testing.T) {
 	RecordAutoModelOutcome(group, "model-b", 1, false, 100, 100)
 	RecordAutoModelOutcome(group, "model-b", 1, false, 100, 100)
 	RecordAutoModelOutcome(group, "model-b", 1, false, 100, 100)
-	ranked := rankAutoModelCandidates(group, []string{"model-a", "model-b"})
+	ranked := rankAutoModelTestCandidates(group, []string{"model-a", "model-b"})
 	require.Equal(t, "model-a", ranked[0])
 	require.Equal(t, "model-b", ranked[1])
 
@@ -72,7 +73,7 @@ func TestAutoModelHealthRanking(t *testing.T) {
 	RecordAutoModelOutcome(group, "model-c", 1, true, 20000, 20000)
 	RecordAutoModelOutcome(group, "model-c", 1, true, 20000, 20000)
 	RecordAutoModelOutcome(group, "model-c", 1, true, 20000, 20000)
-	ranked = rankAutoModelCandidates(group, []string{"model-a", "model-c"})
+	ranked = rankAutoModelTestCandidates(group, []string{"model-a", "model-c"})
 	require.Equal(t, "model-a", ranked[0])
 	require.Equal(t, "model-c", ranked[1])
 }
@@ -88,12 +89,12 @@ func TestAutoModelSlowSuccessWithoutLatencyOutranksColdCandidate(t *testing.T) {
 	group := "default"
 
 	RecordAutoModelOutcome(group, "slow-model", 1, true, 0, 0) // 无延迟数据的成功观测
-	ranked := rankAutoModelCandidates(group, []string{"slow-model", "fresh-model"})
+	ranked := rankAutoModelTestCandidates(group, []string{"slow-model", "fresh-model"})
 	require.Equal(t, "slow-model", ranked[0], "无延迟的成功观测会压过冷启动候选（这就是故障成因）")
 
 	autoModelTestReset()
 	RecordAutoModelOutcome(group, "slow-model", 1, true, 75000, 75000) // 记到了 75 秒
-	ranked = rankAutoModelCandidates(group, []string{"slow-model", "fresh-model"})
+	ranked = rankAutoModelTestCandidates(group, []string{"slow-model", "fresh-model"})
 	require.Equal(t, "fresh-model", ranked[0], "记录到真实延迟后应让位给未观测候选")
 }
 
@@ -103,9 +104,9 @@ func TestAutoModelHealthIsGroupScoped(t *testing.T) {
 	RecordAutoModelOutcome("vip", "model-a", 1, false, 100, 100)
 	RecordAutoModelOutcome("vip", "model-a", 1, false, 100, 100)
 	// default 组 model-a 高分行列前；vip 组 model-a 低分行列后
-	rankedDefault := rankAutoModelCandidates("default", []string{"model-a", "model-b"})
+	rankedDefault := rankAutoModelTestCandidates("default", []string{"model-a", "model-b"})
 	require.Equal(t, "model-a", rankedDefault[0])
-	rankedVip := rankAutoModelCandidates("vip", []string{"model-a", "model-b"})
+	rankedVip := rankAutoModelTestCandidates("vip", []string{"model-a", "model-b"})
 	require.Equal(t, "model-b", rankedVip[0])
 }
 
@@ -133,25 +134,26 @@ func TestAutoModelChannelGranularity(t *testing.T) {
 	outcome2, ok2 := autoModelHealth.Get(autoModelHealthKey(group, "test-model", 2))
 	require.True(t, ok2)
 	require.Less(t, outcome2.Score, 0.3) // 全失败应该显著低于 0.5
+}
 
-	// 延迟同样是 EWMA（0.8/0.2）：100 -> 100*0.8+150*0.2=110 -> 110*0.8+120*0.2=112
-	require.InDelta(t, 112, outcome1.LatencyMS, 0.0001)
+func TestAutoModelLatencyEWMA(t *testing.T) {
+	// 固定时间只验证 EWMA，避免真实调度及冷却持久化耗时触发证据衰减。
+	now := time.Unix(1700000000, 0)
+	outcome := updateAutoModelOutcome(autoModelOutcome{}, false, true, 100, now)
+	outcome = updateAutoModelOutcome(outcome, true, true, 150, now)
+	outcome = updateAutoModelOutcome(outcome, true, true, 120, now)
+	// 100 -> 100*0.8+150*0.2=110 -> 110*0.8+120*0.2=112
+	require.InDelta(t, 112, outcome.LatencyMS, 0.0001)
 }
 
 func TestAutoModelScoreAlphaEWMA(t *testing.T) {
-	autoModelTestReset()
-	group := "default"
-
-	// 初始 0.5
-	RecordAutoModelOutcome(group, "m", 1, true, 500, 500) // alpha=0.3 => 0.5 + 0.3*(1-0.5) = 0.65
-	outcome, ok := autoModelHealth.Get(autoModelHealthKey(group, "m", 1))
-	require.True(t, ok)
+	now := time.Unix(1700000000, 0)
+	// alpha=0.3 => 0.5 + 0.3*(1-0.5) = 0.65
+	outcome := updateAutoModelOutcome(autoModelOutcome{}, false, true, 500, now)
 	require.InDelta(t, 0.65, outcome.Score, 0.0001)
 
 	// 再来一次失败 => 0.65 + 0.3*(0-0.65) = 0.455
-	RecordAutoModelOutcome(group, "m", 1, false, 0, 0)
-	outcome, ok = autoModelHealth.Get(autoModelHealthKey(group, "m", 1))
-	require.True(t, ok)
+	outcome = updateAutoModelOutcome(outcome, true, false, 0, now)
 	require.InDelta(t, 0.455, outcome.Score, 0.0001)
 }
 

@@ -70,11 +70,23 @@ func Distribute() func(c *gin.Context) {
 						}
 					}
 				}
-				autoCandidates := service.GetAutoModelCandidates(autoGroup)
+				autoCandidates := service.GetAutoModelCandidatesForRequest(c, autoGroup)
 				if len(autoCandidates) == 0 {
+					// Distinguish missing routes from an otherwise available model
+					// set that the token cannot access. Only the rejection path
+					// needs this unrestricted lookup.
+					if common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled) && len(service.GetAutoModelCandidates(autoGroup)) > 0 {
+						abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenNoModelAccess))
+						return
+					}
 					abortWithOpenAiMessage(c, http.StatusServiceUnavailable,
 						i18n.T(c, i18n.MsgDistributorAutoModelNoCandidates, map[string]any{"Group": autoGroup}),
 						types.ErrorCodeModelNotFound)
+					return
+				}
+				autoCandidates = service.FilterAuthorizedAutoModelCandidates(c, autoCandidates)
+				if len(autoCandidates) == 0 {
+					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenNoModelAccess))
 					return
 				}
 				common.SetContextKey(c, constant.ContextKeyAutoModelClientName, modelRequest.Model)
@@ -130,60 +142,70 @@ func Distribute() func(c *gin.Context) {
 					}
 				}
 
-				if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelRequest.Model, usingGroup); found {
-					preferred, err := model.CacheGetChannel(preferredChannelID)
-					if err == nil && preferred != nil {
-						if preferred.Status != common.ChannelStatusEnabled {
-							if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
-								abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorChannelDisabled))
-								return
-							}
-						} else if usingGroup == "auto" {
-							userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-							candidateGroups := service.GetRequestGroupCandidates(c, userGroup, usingGroup)
-							for i, g := range candidateGroups {
-								if model.IsChannelEnabledForGroupModel(g, modelRequest.Model, preferred.Id) {
-									selectGroup = g
-									common.SetContextKey(c, constant.ContextKeyAutoGroup, g)
-									common.SetContextKey(c, constant.ContextKeyAutoGroupIndex, i)
-									channel = preferred
-									service.MarkChannelAffinityUsed(c, g, preferred.Id)
-									break
+				channel, selectGroup, err = selectInitialAuthorizedAutoChannel(c, modelRequest, func() (*model.Channel, string, error) {
+					var channel *model.Channel
+					var selectGroup string
+					if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelRequest.Model, usingGroup); found {
+						preferred, err := model.CacheGetChannel(preferredChannelID)
+						if err == nil && preferred != nil {
+							if preferred.Status != common.ChannelStatusEnabled {
+								if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
+									abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorChannelDisabled))
+									return nil, "", nil
 								}
+							} else if usingGroup == "auto" {
+								userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
+								candidateGroups := service.GetRequestGroupCandidates(c, userGroup, usingGroup)
+								for i, g := range candidateGroups {
+									if model.IsChannelEnabledForGroupModel(g, modelRequest.Model, preferred.Id) &&
+									!service.ShouldAvoidAutoModelAffinity(c, g, modelRequest.Model, preferred.Id) {
+										selectGroup = g
+										common.SetContextKey(c, constant.ContextKeyAutoGroup, g)
+										common.SetContextKey(c, constant.ContextKeyAutoGroupIndex, i)
+										channel = preferred
+										service.MarkChannelAffinityUsed(c, g, preferred.Id)
+										break
+									}
+								}
+							} else if model.IsChannelEnabledForGroupModel(usingGroup, modelRequest.Model, preferred.Id) &&
+							!service.ShouldAvoidAutoModelAffinity(c, usingGroup, modelRequest.Model, preferred.Id) {
+								channel = preferred
+								selectGroup = usingGroup
+								service.MarkChannelAffinityUsed(c, usingGroup, preferred.Id)
 							}
-						} else if model.IsChannelEnabledForGroupModel(usingGroup, modelRequest.Model, preferred.Id) {
-							channel = preferred
-							selectGroup = usingGroup
-							service.MarkChannelAffinityUsed(c, usingGroup, preferred.Id)
 						}
 					}
-				}
 
-				if channel == nil {
-					channel, selectGroup, err = service.CacheGetRandomSatisfiedChannel(&service.RetryParam{
-						Ctx:        c,
-						ModelName:  modelRequest.Model,
-						TokenGroup: usingGroup,
-						Retry:      common.GetPointer(0),
-					})
-					if err != nil {
-						showGroup := usingGroup
-						if usingGroup == "auto" {
-							showGroup = fmt.Sprintf("auto(%s)", selectGroup)
-						}
-						message := i18n.T(c, i18n.MsgDistributorGetChannelFailed, map[string]any{"Group": showGroup, "Model": modelRequest.Model, "Error": err.Error()})
-						// 如果错误，但是渠道不为空，说明是数据库一致性问题
-						//if channel != nil {
-						//	common.SysError(fmt.Sprintf("渠道不存在：%d", channel.Id))
-						//	message = "数据库一致性已被破坏，请联系管理员"
-						//}
-						abortWithOpenAiMessage(c, http.StatusServiceUnavailable, message, types.ErrorCodeModelNotFound)
-						return
-					}
 					if channel == nil {
-						abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": usingGroup, "Model": modelRequest.Model}), types.ErrorCodeModelNotFound)
-						return
+						return service.CacheGetRandomSatisfiedChannel(&service.RetryParam{
+							Ctx:        c,
+							ModelName:  modelRequest.Model,
+							TokenGroup: usingGroup,
+							Retry:      common.GetPointer(0),
+						})
 					}
+					return channel, selectGroup, nil
+				})
+				if c.IsAborted() {
+					return
+				}
+				if err != nil {
+					showGroup := usingGroup
+					if usingGroup == "auto" {
+						showGroup = fmt.Sprintf("auto(%s)", selectGroup)
+					}
+					message := i18n.T(c, i18n.MsgDistributorGetChannelFailed, map[string]any{"Group": showGroup, "Model": modelRequest.Model, "Error": err.Error()})
+					// 如果错误，但是渠道不为空，说明是数据库一致性问题
+					//if channel != nil {
+					//	common.SysError(fmt.Sprintf("渠道不存在：%d", channel.Id))
+					//	message = "数据库一致性已被破坏，请联系管理员"
+					//}
+					abortWithOpenAiMessage(c, http.StatusServiceUnavailable, message, types.ErrorCodeModelNotFound)
+					return
+				}
+				if channel == nil {
+					abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": usingGroup, "Model": modelRequest.Model}), types.ErrorCodeModelNotFound)
+					return
 				}
 				if usingGroup == "auto" && selectGroup != "" {
 					common.SetContextKey(c, constant.ContextKeyAutoGroup, selectGroup)
@@ -199,6 +221,35 @@ func Distribute() func(c *gin.Context) {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
+}
+
+// selectInitialAuthorizedAutoChannel retries initial channel selection only for
+// hidden auto requests. Each candidate starts with the original selection state:
+// exhausted auto-group indexes and model-specific affinity metadata must not leak
+// into the next candidate. No upstream request has been made at this point.
+func selectInitialAuthorizedAutoChannel(c *gin.Context, request *ModelRequest, selectCandidate func() (*model.Channel, string, error)) (*model.Channel, string, error) {
+	if common.GetContextKeyString(c, constant.ContextKeyAutoModelClientName) == "" {
+		return selectCandidate()
+	}
+	value, _ := common.GetContextKey(c, constant.ContextKeyAutoModelCandidates)
+	candidates, _ := value.([]string)
+	baseline := c.Copy()
+	channel, group, err := selectCandidate()
+	for index := common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex) + 1; index < len(candidates); index++ {
+		if c.IsAborted() || (err == nil && channel != nil) || service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
+			break
+		}
+		if !service.IsAutoModelCandidateAuthorized(c, candidates[index]) {
+			continue
+		}
+		// Selection is synchronous. Restore a fresh copy so later writes cannot
+		// mutate the baseline used by subsequent candidates.
+		c.Keys = baseline.Copy().Keys
+		common.SetContextKey(c, constant.ContextKeyAutoModelIndex, index)
+		request.Model = candidates[index]
+		channel, group, err = selectCandidate()
+	}
+	return channel, group, err
 }
 
 // getModelFromRequest 从请求中读取模型信息

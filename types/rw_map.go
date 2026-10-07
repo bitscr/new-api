@@ -43,6 +43,29 @@ func (m *RWMap[K, V]) Set(key K, value V) {
 	m.data[key] = value
 }
 
+// Update atomically reads and replaces one value. The callback runs under the
+// write lock and must not call methods on this map.
+func (m *RWMap[K, V]) Update(key K, update func(current V, exists bool) V) V {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	current, exists := m.data[key]
+	value := update(current, exists)
+	if m.data == nil {
+		m.data = make(map[K]V)
+	}
+	m.data[key] = value
+	return value
+}
+
+// Delete atomically removes one key and reports whether it existed.
+func (m *RWMap[K, V]) Delete(key K) bool {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	_, exists := m.data[key]
+	delete(m.data, key)
+	return exists
+}
+
 func (m *RWMap[K, V]) AddAll(other map[K]V) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()

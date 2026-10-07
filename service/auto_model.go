@@ -1,17 +1,20 @@
 package service
 
 import (
+	"math"
 	"math/rand"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 )
 
 // autoModelOutcome 是一个 (分组，模型，渠道) 的被动健康摘要。
@@ -45,7 +48,7 @@ func autoModelHealthPrefix(group, name string) string {
 
 // RecordAutoModelOutcome 记录一次已观察到的请求结果（被动反馈）。
 // 记分粒度为 分组 + 模型 + 渠道，latencyMs <= 0 表示未采集到延迟。
-// elapsedMs 是本次请求的总耗时，用于判断这次是否算"慢"（失败请求的 latencyMs 为 0，但耗时可能很长）。
+// elapsedMs 是本次尝试的冷却信号：成功流式请求用首包延迟，非流式或失败用本次尝试耗时。
 func RecordAutoModelOutcome(group, name string, channelID int, success bool, latencyMs int64, elapsedMs int64) {
 	recordAutoModelOutcome(group, name, channelID, success, latencyMs, elapsedMs, false, "")
 }
@@ -67,32 +70,16 @@ func recordAutoModelOutcome(group, name string, channelID int, success bool, lat
 		return
 	}
 	key := autoModelHealthKey(group, name, channelID)
-	current, ok := autoModelHealth.Get(key)
-	if !ok {
-		current = autoModelOutcome{Score: 0.5, Observations: 0, LatencyMS: 0, UpdatedAt: time.Now()}
-	}
-	value := 0.0
-	if success {
-		value = 1
-	}
-	// EWMA：成功率向本次结果移动固定比例，近期表现占主导。
-	current.Score += autoModelScoreAlpha * (value - current.Score)
-	current.Observations = current.Observations + 1
-	if latencyMs > 0 {
-		if current.LatencyMS == 0 {
-			current.LatencyMS = float64(latencyMs)
-		} else {
-			current.LatencyMS = current.LatencyMS*(1-autoModelLatencyAlpha) + float64(latencyMs)*autoModelLatencyAlpha
-		}
-	}
-	current.UpdatedAt = time.Now()
-	autoModelHealth.Set(key, current)
+	autoModelHealth.Update(key, func(current autoModelOutcome, exists bool) autoModelOutcome {
+		// Read the clock under the map lock, so a delayed writer cannot roll the
+		// timestamp back or overwrite another request's observation.
+		return updateAutoModelOutcome(current, exists, success, latencyMs, time.Now())
+	})
 	if modelOnlyCooldown {
 		reason := strings.TrimSpace(cooldownReason)
 		if reason == "" {
 			reason = "响应无有效内容"
 		}
-		ensureAutoModelCooldownsLoaded()
 		tripAutoModelCooldown(group, name, channelID, reason, time.Now())
 		return
 	}
@@ -100,24 +87,53 @@ func recordAutoModelOutcome(group, name string, channelID int, success bool, lat
 	applyAutoModelCooldown(group, name, channelID, success, elapsedMs)
 }
 
-// effectiveScore 将观测折算为可用分数：
-// 时间衰减 -> 置信度压缩 -> 延迟惩罚。无观测时返回中性 0.5。
-func effectiveScore(outcome autoModelOutcome, now time.Time) float64 {
-	ageMs := now.Sub(outcome.UpdatedAt).Milliseconds()
-	ageFactor := 1.0
-	if ageMs > 0 {
-		ageFactor = 1.0 - float64(ageMs)/float64(autoModelHalfLifeMs)
-		if ageFactor < 0 {
-			ageFactor = 0
+const autoModelMaxObservations = 20.0
+
+// decayAutoModelOutcome folds all stale evidence toward a neutral cold start.
+// Applying this before both reads and writes prevents fresh feedback from
+// reviving an expired latency or an unbounded historical confidence count.
+func decayAutoModelOutcome(outcome autoModelOutcome, now time.Time) autoModelOutcome {
+	ageFactor := 1.0 - math.Max(0, float64(now.Sub(outcome.UpdatedAt).Milliseconds()))/float64(autoModelHalfLifeMs)
+	ageFactor = math.Max(0, ageFactor)
+	outcome.Observations = math.Min(autoModelMaxObservations, math.Max(0, outcome.Observations)) * ageFactor
+	outcome.Score = 0.5 + (outcome.Score-0.5)*ageFactor
+	outcome.LatencyMS *= ageFactor
+	if outcome.Observations == 0 {
+		outcome.Score = 0.5
+		outcome.LatencyMS = 0
+	}
+	outcome.UpdatedAt = now
+	return outcome
+}
+
+func updateAutoModelOutcome(current autoModelOutcome, exists, success bool, latencyMs int64, now time.Time) autoModelOutcome {
+	if !exists {
+		current = autoModelOutcome{Score: 0.5, UpdatedAt: now}
+	}
+	current = decayAutoModelOutcome(current, now)
+	value := 0.0
+	if success {
+		value = 1
+	}
+	current.Score += autoModelScoreAlpha * (value - current.Score)
+	current.Observations = math.Min(autoModelMaxObservations, current.Observations+1)
+	if latencyMs > 0 {
+		if current.LatencyMS == 0 {
+			current.LatencyMS = float64(latencyMs)
+		} else {
+			current.LatencyMS = current.LatencyMS*(1-autoModelLatencyAlpha) + float64(latencyMs)*autoModelLatencyAlpha
 		}
 	}
-	effectiveObs := outcome.Observations * ageFactor
-	confidence := effectiveObs / (effectiveObs + 3.0)
+	return current
+}
+
+// effectiveScore applies synchronous evidence decay, confidence and latency.
+// Fully expired or unobserved outcomes are exactly neutral, including latency.
+func effectiveScore(outcome autoModelOutcome, now time.Time) float64 {
+	outcome = decayAutoModelOutcome(outcome, now)
+	confidence := outcome.Observations / (outcome.Observations + 3.0)
 	score := 0.5*(1-confidence) + outcome.Score*confidence
-	if outcome.LatencyMS > 0 {
-		score = score / (1.0 + outcome.LatencyMS/15000.0)
-	}
-	return score
+	return score / (1.0 + outcome.LatencyMS/15000.0)
 }
 
 // GetAutoModelCandidates 返回某分组可参与 auto 路由的候选模型，按健康度降序。
@@ -125,6 +141,19 @@ func effectiveScore(outcome autoModelOutcome, now time.Time) float64 {
 // 分数一致（含全部未观测的冷启动）的候选在同一档内随机排列，不再按列表顺序——
 // 列表顺序与质量无关，谁排前面纯看数据库返回顺序。
 func GetAutoModelCandidates(group string) []string {
+	return getAutoModelCandidates(group, nil)
+}
+
+// GetAutoModelCandidatesForRequest applies authorization before cooldown filtering,
+// so an unauthorized healthy model cannot suppress an authorized cooling model's
+// existing all-cooling fallback.
+func GetAutoModelCandidatesForRequest(c *gin.Context, group string) []string {
+	return getAutoModelCandidates(group, func(name string) bool {
+		return IsAutoModelCandidateAuthorized(c, name)
+	})
+}
+
+func getAutoModelCandidates(group string, authorized func(string) bool) []string {
 	available := model.GetGroupEnabledModels(group)
 	availableSet := make(map[string]bool, len(available))
 	for _, name := range available {
@@ -143,7 +172,7 @@ func GetAutoModelCandidates(group string) []string {
 			continue
 		}
 		seen[name] = true
-		if !availableSet[name] {
+		if !availableSet[name] || (authorized != nil && !authorized(name)) {
 			continue
 		}
 		if !helper.HasModelBillingConfig(name) {
@@ -164,8 +193,6 @@ func GetAutoModelCandidates(group string) []string {
 		}
 		result = append(result, name)
 	}
-	// 所有渠道都在冷却中的模型先剔除（见 auto_model_cooldown.go）。
-	result = excludeCoolingAutoModelCandidates(group, result)
 	return rankAutoModelCandidates(group, result)
 }
 
@@ -177,35 +204,43 @@ type candidateMeta struct {
 	Observations float64
 }
 
-// autoScoreTieEpsilon 视为"分数并列"的容差。EMA 分数一次观测至少移动 0.1
-// （alpha 0.2，冷启动 0.5），所以 0.02 只吃掉"真实质量相当"的抖动，
-// 不会把明显更好的候选拉平。他的口径：分数一致就加权随机，不一致才按分数优先。
+// autoScoreTieEpsilon 是最高分档容差：档内按权重随机，档外严格按分数优先。
 const autoScoreTieEpsilon = 0.02
 
 func rankAutoModelCandidates(group string, candidates []string) []string {
-	health := autoModelHealth.ReadAll()
-	now := time.Now()
+	if len(candidates) == 0 {
+		return candidates
+	}
+	targets, err := model.GetAutoModelRoutingTargets(group)
+	if err != nil {
+		// Keep availability fail-open, but never promote unavailable historical
+		// channels when the current routing snapshot cannot be obtained.
+		common.SysError("failed to load auto model routing targets: " + err.Error())
+		return rankAutoModelCandidatesFromSnapshot(group, candidates, nil, nil, nil, time.Now())
+	}
+	return rankAutoModelCandidatesFromSnapshot(group, candidates, targets, autoModelHealth.ReadAll(), autoModelCooldownSnapshot(), time.Now())
+}
+
+func rankAutoModelCandidatesFromSnapshot(group string, candidates []string, targets map[string][]model.AutoModelRoutingTarget, health map[string]autoModelOutcome, cooldowns map[string]autoModelCooldownState, now time.Time) []string {
+	allCooling := make(map[string]bool, len(candidates))
+	for _, name := range candidates {
+		ids := make([]int, 0, len(targets[name]))
+		for _, target := range targets[name] {
+			ids = append(ids, target.ChannelID)
+		}
+		allCooling[name] = autoModelCooldownActiveInSnapshot(group, name, ids, cooldowns, now)
+	}
+	candidates = excludeCoolingCandidates(candidates, allCooling)
 	items := make([]candidateMeta, 0, len(candidates))
 	for _, name := range candidates {
-		meta := candidateMeta{Group: group, Name: name, Score: 0.5}
-		prefix := autoModelHealthPrefix(group, name)
-		bestObs := autoModelOutcome{}
-		found := false
-		for key, outcome := range health {
-			if !strings.HasPrefix(key, prefix) {
-				continue
-			}
-			if !found || outcome.Observations > bestObs.Observations {
-				bestObs = outcome
-				found = true
+		eligible := make([]model.AutoModelRoutingTarget, 0, len(targets[name]))
+		for _, target := range targets[name] {
+			state := cooldowns[autoModelHealthKey(group, name, target.ChannelID)]
+			if allCooling[name] || !state.Until.After(now) {
+				eligible = append(eligible, target)
 			}
 		}
-		if found {
-			meta.Score = effectiveScore(bestObs, now)
-			meta.LatencyMS = bestObs.LatencyMS
-			meta.Observations = bestObs.Observations
-		}
-		items = append(items, meta)
+		items = append(items, candidateMeta{Group: group, Name: name, Score: autoModelRoutingExpectedScore(group, name, eligible, health, now)})
 	}
 	items = orderByScoreTieBands(items)
 	result := make([]string, len(items))
@@ -213,6 +248,46 @@ func rankAutoModelCandidates(group string, candidates []string) []string {
 		result[i] = meta.Name
 	}
 	return result
+}
+
+// autoModelRoutingExpectedScore mirrors initial channel selection: highest
+// available priority, then the highest score band, then its weighted expectation.
+func autoModelRoutingExpectedScore(group, name string, targets []model.AutoModelRoutingTarget, health map[string]autoModelOutcome, now time.Time) float64 {
+	if len(targets) == 0 {
+		return 0.5
+	}
+	priority := targets[0].Priority
+	for _, target := range targets {
+		if target.Priority > priority {
+			priority = target.Priority
+		}
+	}
+	best := math.Inf(-1)
+	scores := make(map[int]float64, len(targets))
+	for _, target := range targets {
+		if target.Priority != priority {
+			continue
+		}
+		score := effectiveScore(health[autoModelHealthKey(group, name, target.ChannelID)], now)
+		scores[target.ChannelID] = score
+		best = math.Max(best, score)
+	}
+	weighted, totalWeight, unweighted, count := 0.0, 0.0, 0.0, 0.0
+	for _, target := range targets {
+		score := scores[target.ChannelID]
+		if target.Priority != priority || score < best-autoScoreTieEpsilon {
+			continue
+		}
+		weight := math.Max(0, target.Weight)
+		weighted += score * weight
+		totalWeight += weight
+		unweighted += score
+		count++
+	}
+	if totalWeight == 0 {
+		return unweighted / count // memory selector's all-zero band smoothing
+	}
+	return weighted / totalWeight
 }
 
 // orderByScoreTieBands 把候选排成"分数档从高到低、档内随机"的顺序。

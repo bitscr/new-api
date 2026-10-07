@@ -95,6 +95,11 @@ type RelayInfo struct {
 	StartTime         time.Time
 	FirstResponseTime time.Time
 	isFirstResponse   bool
+	// Attempt timing is independent of request-level StartTime/FirstResponseTime.
+	// Retries must not inherit another upstream attempt's wait or first response.
+	AttemptStartTime         time.Time
+	AttemptFirstResponseTime time.Time
+	AttemptEndTime           time.Time
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool
@@ -723,9 +728,69 @@ func (info *RelayInfo) GetEstimatePromptTokens() int {
 	return info.estimatePromptTokens
 }
 
+// BeginAttempt starts an upstream attempt without resetting request-level log timing.
+func (info *RelayInfo) BeginAttempt() {
+	if info == nil {
+		return
+	}
+	info.AttemptStartTime = time.Now()
+	info.AttemptFirstResponseTime = time.Time{}
+	info.AttemptEndTime = time.Time{}
+	if info.answer != nil {
+		info.answer = &answerObservation{}
+	}
+}
+
+// EndAttempt freezes elapsed time before controller error handling or later retries.
+func (info *RelayInfo) EndAttempt() {
+	if info == nil || info.AttemptStartTime.IsZero() || !info.AttemptEndTime.IsZero() {
+		return
+	}
+	info.AttemptEndTime = time.Now()
+}
+
+func (info *RelayInfo) AttemptElapsed() time.Duration {
+	if info == nil || info.AttemptStartTime.IsZero() {
+		return 0
+	}
+	end := info.AttemptEndTime
+	if end.IsZero() {
+		end = time.Now()
+	}
+	if end.Before(info.AttemptStartTime) {
+		return 0
+	}
+	return end.Sub(info.AttemptStartTime)
+}
+
+// AttemptFirstResponseLatency accepts only a first response inside this attempt.
+// A few legacy adaptors write FirstResponseTime directly; retain their signal only
+// when it belongs to this attempt, never when it is left over from a failed one.
+func (info *RelayInfo) AttemptFirstResponseLatency() (time.Duration, bool) {
+	if info == nil || info.AttemptStartTime.IsZero() {
+		return 0, false
+	}
+	first := info.AttemptFirstResponseTime
+	if first.IsZero() {
+		first = info.FirstResponseTime
+	}
+	end := info.AttemptEndTime
+	if end.IsZero() {
+		end = time.Now()
+	}
+	if first.IsZero() || first.Before(info.AttemptStartTime) || first.After(end) {
+		return 0, false
+	}
+	return first.Sub(info.AttemptStartTime), true
+}
+
 func (info *RelayInfo) SetFirstResponseTime() {
+	now := time.Now()
+	if !info.AttemptStartTime.IsZero() && info.AttemptEndTime.IsZero() && info.AttemptFirstResponseTime.IsZero() {
+		info.AttemptFirstResponseTime = now
+	}
 	if info.isFirstResponse {
-		info.FirstResponseTime = time.Now()
+		info.FirstResponseTime = now
 		info.isFirstResponse = false
 	}
 }
