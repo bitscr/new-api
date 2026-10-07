@@ -125,6 +125,9 @@ export default function UpstreamRatioSync(props) {
   const [differences, setDifferences] = useState({});
   const [resolutions, setResolutions] = useState({});
 
+  // 只提供阶梯计费表达式（billing_expr）的渠道，官方倍率预设现在就是这个格式
+  const [billingChannels, setBillingChannels] = useState([]);
+
   // 是否已经执行过同步
   const [hasSynced, setHasSynced] = useState(false);
 
@@ -245,7 +248,9 @@ export default function UpstreamRatioSync(props) {
         return;
       }
 
-      const { differences = {}, test_results = [] } = res.data.data;
+      const { differences = {}, test_results = [], billing = [] } = res.data.data;
+      const billingList = Array.isArray(billing) ? billing : [];
+      setBillingChannels(billingList);
 
       const errorResults = test_results.filter((r) => r.status === 'error');
       if (errorResults.length > 0) {
@@ -259,7 +264,7 @@ export default function UpstreamRatioSync(props) {
       setResolutions({});
       setHasSynced(true);
 
-      if (Object.keys(differences).length === 0) {
+      if (Object.keys(differences).length === 0 && billingList.length === 0) {
         showSuccess(t('未找到差异化倍率，无需同步'));
       }
     } catch (e) {
@@ -862,6 +867,88 @@ export default function UpstreamRatioSync(props) {
     );
   };
 
+  // 导入阶梯计费表达式：后端逐条 smoke test，失败的跳过并回报
+  const importBilling = async (channel) => {
+    try {
+      const res = await API.post('/api/ratio_sync/billing', {
+        billing_expr: channel.billing_expr || {},
+        billing_mode: channel.billing_mode || {},
+      });
+      const data = res.data?.data || {};
+      if (!res.data?.success) {
+        showError(res.data?.message || t('导入失败'));
+        return;
+      }
+      showSuccess(
+        t('已导入 {{n}} 条表达式计费', { n: data.imported }) +
+          (data.changed ? t('（其中 {{n}} 条有更新）', { n: data.changed }) : ''),
+      );
+      if (Array.isArray(data.skipped) && data.skipped.length > 0) {
+        showWarning(
+          t('{{n}} 条表达式未通过校验已跳过：', { n: data.skipped.length }) +
+            data.skipped
+              .slice(0, 3)
+              .map((item) => `${item.model}: ${item.error}`)
+              .join('; '),
+        );
+      }
+      setBillingChannels((prev) => prev.filter((c) => c.name !== channel.name));
+      if (typeof props.refresh === 'function') {
+        props.refresh();
+      }
+    } catch (e) {
+      showError(t('导入失败：') + e.message);
+    }
+  };
+
+  const renderBillingSection = () => {
+    if (!billingChannels.length) {
+      return null;
+    }
+
+    return (
+      <div className='mb-4'>
+        <div className='flex items-center gap-2 mb-1'>
+          <AlertTriangle size={16} />
+          <span className='font-medium'>
+            {t('阶梯计费表达式（billing_expr）')}
+          </span>
+        </div>
+        <div className='text-sm text-gray-500 mb-2'>
+          {t(
+            '这些渠道只提供表达式计费，无法与数值倍率对比。导入后这些模型改用表达式计费，本机其它模型不受影响。',
+          )}
+        </div>
+        <Table
+          size='middle'
+          pagination={false}
+          dataSource={billingChannels.map((item) => ({
+            name: item.name,
+            count: Object.keys(item.billing_expr || {}).length,
+            channel: item,
+          }))}
+          columns={[
+            { title: t('渠道'), dataIndex: 'name' },
+            { title: t('模型数量'), dataIndex: 'count' },
+            {
+              title: t('操作'),
+              dataIndex: 'op',
+              render: (_, record) => (
+                <Button
+                  theme='solid'
+                  size='small'
+                  onClick={() => importBilling(record.channel)}
+                >
+                  {t('导入表达式计费')}
+                </Button>
+              ),
+            },
+          ]}
+        />
+      </div>
+    );
+  };
+
   const updateChannelEndpoint = useCallback((channelId, endpoint) => {
     setChannelEndpoints((prev) => ({ ...prev, [channelId]: endpoint }));
   }, []);
@@ -876,6 +963,7 @@ export default function UpstreamRatioSync(props) {
   return (
     <>
       <Form.Section text={renderHeader()}>
+        {renderBillingSection()}
         {renderDifferenceTable()}
       </Form.Section>
 

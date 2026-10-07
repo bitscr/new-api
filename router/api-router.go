@@ -241,6 +241,7 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			ratioSyncRoute.GET("/channels", controller.GetSyncableChannels)
 			ratioSyncRoute.POST("/fetch", controller.FetchUpstreamRatios)
+			ratioSyncRoute.POST("/billing", controller.ImportBillingSettings)
 		}
 		siteRoute := apiRouter.Group("/site")
 		siteRoute.Use(middleware.RootAuth())

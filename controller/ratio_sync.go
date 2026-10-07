@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
@@ -62,9 +64,176 @@ func valuesEqual(a, b interface{}) bool {
 var ratioTypes = []string{"model_ratio", "completion_ratio", "cache_ratio", "model_price"}
 
 type upstreamResult struct {
-	Name string         `json:"name"`
-	Data map[string]any `json:"data,omitempty"`
-	Err  string         `json:"err,omitempty"`
+	Name        string            `json:"name"`
+	Data        map[string]any    `json:"data,omitempty"`
+	BillingExpr map[string]string `json:"billing_expr,omitempty"`
+	BillingMode map[string]string `json:"billing_mode,omitempty"`
+	Err         string            `json:"err,omitempty"`
+}
+
+// ratioPayload 是一次上游响应的解析结果：数值倍率与阶梯计费表达式分开存放。
+// 表达式绝不会被当成倍率，否则前端会把它写进 ModelRatio 并触发有限数字校验错误。
+type ratioPayload struct {
+	Ratios      map[string]any    // ratioTypes 下的有限数字
+	BillingExpr map[string]string // 阶梯计费表达式（billing_expr）
+	BillingMode map[string]string // 对应的 billing_mode
+}
+
+func (p ratioPayload) hasBilling() bool { return len(p.BillingExpr) > 0 }
+
+// parseRatioPayload 解析上游返回的 data 字段，支持三种格式：
+//   - type1:   数值倍率对象，含 model_ratio / completion_ratio / cache_ratio / model_price 中至少一个
+//   - billing: {"billing_expr": {...}, "billing_mode": {...}}，官方倍率预设就是这种格式
+//   - type2:   /api/pricing 列表，逐项按 billing_mode 分流到数值倍率或表达式
+//
+// 返回 (payload, dropped, errMsg)：errMsg 非空表示格式无法识别；
+// Ratios 里 ratioTypes 下的值保证都是有限数字。
+func parseRatioPayload(data json.RawMessage) (ratioPayload, int, string) {
+	// type1：数值倍率（优先，兼容同时带 billing_expr 的混合响应）
+	var type1Data map[string]any
+	if err := common.Unmarshal(data, &type1Data); err == nil {
+		for _, ratioType := range ratioTypes {
+			if _, ok := type1Data[ratioType]; ok {
+				cleaned, dropped := sanitizeRatioData(type1Data)
+				return ratioPayload{Ratios: cleaned}, dropped, ""
+			}
+		}
+	}
+
+	// billing：只提供表达式计费的上游（官方倍率预设 ratio_config-v1-base.json）
+	var billingData struct {
+		BillingExpr map[string]string `json:"billing_expr"`
+		BillingMode map[string]string `json:"billing_mode"`
+	}
+	if err := common.Unmarshal(data, &billingData); err == nil && len(billingData.BillingExpr) > 0 {
+		expr, mode := normalizeBillingMaps(billingData.BillingExpr, billingData.BillingMode)
+		return ratioPayload{BillingExpr: expr, BillingMode: mode}, 0, ""
+	}
+
+	// type2：/api/pricing 列表
+	var pricingItems []struct {
+		ModelName       string   `json:"model_name"`
+		QuotaType       int      `json:"quota_type"`
+		ModelRatio      *float64 `json:"model_ratio"`
+		ModelPrice      *float64 `json:"model_price"`
+		CompletionRatio *float64 `json:"completion_ratio"`
+		BillingMode     string   `json:"billing_mode"`
+		BillingExpr     string   `json:"billing_expr"`
+	}
+	if err := common.Unmarshal(data, &pricingItems); err != nil {
+		return ratioPayload{}, 0, "无法解析上游返回数据"
+	}
+
+	modelRatioMap := make(map[string]float64)
+	completionRatioMap := make(map[string]float64)
+	modelPriceMap := make(map[string]float64)
+	billingExprMap := make(map[string]string)
+	billingModeMap := make(map[string]string)
+
+	for _, item := range pricingItems {
+		name := strings.TrimSpace(item.ModelName)
+		if name == "" {
+			continue
+		}
+		if item.BillingMode == billing_setting.BillingModeTieredExpr && strings.TrimSpace(item.BillingExpr) != "" {
+			billingExprMap[name] = item.BillingExpr
+			billingModeMap[name] = billing_setting.BillingModeTieredExpr
+			continue
+		}
+		if item.QuotaType == 1 {
+			if item.ModelPrice != nil {
+				modelPriceMap[name] = *item.ModelPrice
+			}
+			continue
+		}
+		if item.ModelRatio != nil {
+			modelRatioMap[name] = *item.ModelRatio
+		}
+		if item.CompletionRatio != nil {
+			completionRatioMap[name] = *item.CompletionRatio
+		}
+	}
+
+	converted := make(map[string]any)
+	if len(modelRatioMap) > 0 {
+		ratioAny := make(map[string]any, len(modelRatioMap))
+		for k, v := range modelRatioMap {
+			ratioAny[k] = v
+		}
+		converted["model_ratio"] = ratioAny
+	}
+	if len(completionRatioMap) > 0 {
+		compAny := make(map[string]any, len(completionRatioMap))
+		for k, v := range completionRatioMap {
+			compAny[k] = v
+		}
+		converted["completion_ratio"] = compAny
+	}
+	if len(modelPriceMap) > 0 {
+		priceAny := make(map[string]any, len(modelPriceMap))
+		for k, v := range modelPriceMap {
+			priceAny[k] = v
+		}
+		converted["model_price"] = priceAny
+	}
+
+	return ratioPayload{Ratios: converted, BillingExpr: billingExprMap, BillingMode: billingModeMap}, 0, ""
+}
+
+// normalizeBillingMaps 丢掉空表达式，并给缺 billing_mode 的条目补 tiered_expr
+// （有表达式即代表该模型按表达式计费）。
+func normalizeBillingMaps(exprMap, modeMap map[string]string) (map[string]string, map[string]string) {
+	expr := make(map[string]string, len(exprMap))
+	mode := make(map[string]string, len(exprMap))
+	for rawModel, rawExpr := range exprMap {
+		model := strings.TrimSpace(rawModel)
+		value := strings.TrimSpace(rawExpr)
+		if model == "" || value == "" {
+			continue
+		}
+		expr[model] = value
+		if m := strings.TrimSpace(modeMap[rawModel]); m != "" {
+			mode[model] = m
+		} else {
+			mode[model] = billing_setting.BillingModeTieredExpr
+		}
+	}
+	return expr, mode
+}
+
+// sanitizeRatioData 过滤 ratioTypes 之外的字段与其中的非数字条目
+// （例如上游把计费表达式写进了 model_ratio），只把数值倍率交给前端做 diff。
+// 返回过滤后的 map 与被丢弃的非数字条目数；某个倍率类型被清空时连同该 key 一起删除。
+func sanitizeRatioData(data map[string]any) (map[string]any, int) {
+	dropped := 0
+	for key := range data {
+		if !slices.Contains(ratioTypes, key) {
+			delete(data, key)
+		}
+	}
+	for _, ratioType := range ratioTypes {
+		raw, ok := data[ratioType]
+		if !ok {
+			continue
+		}
+		items, ok := raw.(map[string]any)
+		if !ok {
+			delete(data, ratioType)
+			dropped++
+			continue
+		}
+		for name, value := range items {
+			number, isNumber := value.(float64)
+			if !isNumber || math.IsNaN(number) || math.IsInf(number, 0) {
+				delete(items, name)
+				dropped++
+			}
+		}
+		if len(items) == 0 {
+			delete(data, ratioType)
+		}
+	}
+	return data, dropped
 }
 
 func FetchUpstreamRatios(c *gin.Context) {
@@ -286,107 +455,26 @@ func FetchUpstreamRatios(c *gin.Context) {
 				return
 			}
 
-			// 尝试解析新格式：billing_expr + billing_mode
-			var billingExprData struct {
-				BillingExpr map[string]string `json:"billing_expr"`
-				BillingMode map[string]string `json:"billing_mode"`
-			}
-			if err := common.Unmarshal(body.Data, &billingExprData); err == nil && len(billingExprData.BillingExpr) > 0 {
-				// 检测到 billing_expr 格式，转换为 system 可用的 ratio_config
-				converted := make(map[string]any)
-			
-				// 如果有 billing_mode，也一起转换（用于计费模式配置）
-				if len(billingExprData.BillingMode) > 0 {
-					converted["billing_mode"] = billingExprData.BillingMode
-				}
-			
-				// 将 billing_expr 转换为 model_ratio 字段
-				// 注意：这里是 expression 字符串，不是简单的数值比值
-				ratioAny := make(map[string]any, len(billingExprData.BillingExpr))
-				for k, v := range billingExprData.BillingExpr {
-					ratioAny[k] = v
-				}
-				converted["model_ratio"] = ratioAny
-			
-				logger.LogInfo(c.Request.Context(), "parsed new billing_expr format from "+chItem.Name+", models: "+fmt.Sprintf("%d", len(ratioAny)))
-				ch <- upstreamResult{Name: uniqueName, Data: converted}
+			// 解析上游 data：数值倍率与阶梯计费表达式分开处理，表达式不会被当倍率用。
+			payload, dropped, parseErrMsg := parseRatioPayload(body.Data)
+			if parseErrMsg != "" {
+				logger.LogWarn(c.Request.Context(), "ratio sync unsupported payload from "+chItem.Name+": "+parseErrMsg)
+				ch <- upstreamResult{Name: uniqueName, Err: parseErrMsg}
 				return
 			}
-
-			// 若 Data 为空，将继续按 type1 尝试解析（与多数静态 ratio_config 兼容）
-
-			// 尝试按 type1 解析
-			var type1Data map[string]any
-			if err := common.Unmarshal(body.Data, &type1Data); err == nil {
-				// 如果包含至少一个 ratioTypes 字段，则认为是 type1
-				isType1 := false
-				for _, rt := range ratioTypes {
-					if _, ok := type1Data[rt]; ok {
-						isType1 = true
-						break
-					}
-				}
-				if isType1 {
-					ch <- upstreamResult{Name: uniqueName, Data: type1Data}
-					return
-				}
+			if dropped > 0 {
+				logger.LogWarn(c.Request.Context(), fmt.Sprintf("ratio sync dropped %d non-numeric entries from %s", dropped, chItem.Name))
 			}
-
-			// 如果不是 type1，则尝试按 type2 (/api/pricing) 解析
-			var pricingItems []struct {
-				ModelName       string  `json:"model_name"`
-				QuotaType       int     `json:"quota_type"`
-				ModelRatio      float64 `json:"model_ratio"`
-				ModelPrice      float64 `json:"model_price"`
-				CompletionRatio float64 `json:"completion_ratio"`
+			if payload.hasBilling() {
+				logger.LogInfo(c.Request.Context(), fmt.Sprintf("ratio sync got %d billing expressions from %s", len(payload.BillingExpr), chItem.Name))
 			}
-			if err := common.Unmarshal(body.Data, &pricingItems); err != nil {
-				logger.LogWarn(c.Request.Context(), "unrecognized data format from "+chItem.Name+": "+err.Error())
-				ch <- upstreamResult{Name: uniqueName, Err: "无法解析上游返回数据"}
-				return
+			ch <- upstreamResult{
+				Name:        uniqueName,
+				Data:        payload.Ratios,
+				BillingExpr: payload.BillingExpr,
+				BillingMode: payload.BillingMode,
 			}
-
-			modelRatioMap := make(map[string]float64)
-			completionRatioMap := make(map[string]float64)
-			modelPriceMap := make(map[string]float64)
-
-			for _, item := range pricingItems {
-				if item.QuotaType == 1 {
-					modelPriceMap[item.ModelName] = item.ModelPrice
-				} else {
-					modelRatioMap[item.ModelName] = item.ModelRatio
-					// completionRatio 可能为 0，此时也直接赋值，保持与上游一致
-					completionRatioMap[item.ModelName] = item.CompletionRatio
-				}
-			}
-
-			converted := make(map[string]any)
-
-			if len(modelRatioMap) > 0 {
-				ratioAny := make(map[string]any, len(modelRatioMap))
-				for k, v := range modelRatioMap {
-					ratioAny[k] = v
-				}
-				converted["model_ratio"] = ratioAny
-			}
-
-			if len(completionRatioMap) > 0 {
-				compAny := make(map[string]any, len(completionRatioMap))
-				for k, v := range completionRatioMap {
-					compAny[k] = v
-				}
-				converted["completion_ratio"] = compAny
-			}
-
-			if len(modelPriceMap) > 0 {
-				priceAny := make(map[string]any, len(modelPriceMap))
-				for k, v := range modelPriceMap {
-					priceAny[k] = v
-				}
-				converted["model_price"] = priceAny
-			}
-
-			ch <- upstreamResult{Name: uniqueName, Data: converted}
+			return
 		}(chn)
 	}
 
@@ -401,6 +489,12 @@ func FetchUpstreamRatios(c *gin.Context) {
 		data map[string]any
 	}
 
+	billingChannels := make([]struct {
+		Name        string            `json:"name"`
+		BillingExpr map[string]string `json:"billing_expr"`
+		BillingMode map[string]string `json:"billing_mode"`
+	}, 0)
+
 	for r := range ch {
 		if r.Err != "" {
 			testResults = append(testResults, dto.TestResult{
@@ -408,15 +502,24 @@ func FetchUpstreamRatios(c *gin.Context) {
 				Status: "error",
 				Error:  r.Err,
 			})
-		} else {
-			testResults = append(testResults, dto.TestResult{
-				Name:   r.Name,
-				Status: "success",
-			})
+			continue
+		}
+		testResults = append(testResults, dto.TestResult{
+			Name:   r.Name,
+			Status: "success",
+		})
+		if len(r.Data) > 0 {
 			successfulChannels = append(successfulChannels, struct {
 				name string
 				data map[string]any
 			}{name: r.Name, data: r.Data})
+		}
+		if len(r.BillingExpr) > 0 {
+			billingChannels = append(billingChannels, struct {
+				Name        string            `json:"name"`
+				BillingExpr map[string]string `json:"billing_expr"`
+				BillingMode map[string]string `json:"billing_mode"`
+			}{Name: r.Name, BillingExpr: r.BillingExpr, BillingMode: r.BillingMode})
 		}
 	}
 
@@ -427,6 +530,7 @@ func FetchUpstreamRatios(c *gin.Context) {
 		"data": gin.H{
 			"differences":  differences,
 			"test_results": testResults,
+			"billing":      billingChannels,
 		},
 	})
 }
@@ -938,4 +1042,136 @@ func GetSyncableChannels(c *gin.Context) {
 		"message": "",
 		"data":    syncableChannels,
 	})
+}
+
+// ImportBillingSettings 把上游的阶梯计费表达式合并进本机的 billing_setting。
+// 每条表达式先跑 smoke test，不通过的跳过并回报，绝不写进配置。
+func ImportBillingSettings(c *gin.Context) {
+	var req struct {
+		BillingExpr map[string]string `json:"billing_expr"`
+		BillingMode map[string]string `json:"billing_mode"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "请求参数格式错误"})
+		return
+	}
+	if len(req.BillingExpr) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "没有可导入的计费表达式"})
+		return
+	}
+
+	currentExpr := map[string]string{}
+	currentMode := map[string]string{}
+	if raw, ok := common.OptionMap["billing_setting.billing_expr"]; ok {
+		if err := common.UnmarshalJsonStr(raw, &currentExpr); err != nil {
+			logger.LogWarn(c.Request.Context(), "failed to parse current billing_expr option: "+err.Error())
+			currentExpr = map[string]string{}
+		}
+	}
+	if raw, ok := common.OptionMap["billing_setting.billing_mode"]; ok {
+		if err := common.UnmarshalJsonStr(raw, &currentMode); err != nil {
+			logger.LogWarn(c.Request.Context(), "failed to parse current billing_mode option: "+err.Error())
+			currentMode = map[string]string{}
+		}
+	}
+
+	mergedExpr, mergedMode, imported, changed, skipped := mergeBillingSettings(currentExpr, currentMode, req.BillingExpr, req.BillingMode)
+	currentExpr, currentMode = mergedExpr, mergedMode
+
+	if imported == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "所有表达式都未通过校验，没有写入任何配置",
+			"data":    gin.H{"imported": 0, "changed": 0, "total": len(currentExpr), "skipped": skipped},
+		})
+		return
+	}
+
+	exprJSON, err := common.Marshal(currentExpr)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "序列化 billing_expr 失败"})
+		return
+	}
+	modeJSON, err := common.Marshal(currentMode)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "序列化 billing_mode 失败"})
+		return
+	}
+	if err := model.UpdateOption("billing_setting.billing_expr", string(exprJSON)); err != nil {
+		logger.LogError(c.Request.Context(), "failed to save billing_expr: "+err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "保存 billing_expr 失败"})
+		return
+	}
+	if err := model.UpdateOption("billing_setting.billing_mode", string(modeJSON)); err != nil {
+		logger.LogError(c.Request.Context(), "failed to save billing_mode: "+err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "保存 billing_mode 失败"})
+		return
+	}
+
+	logger.LogInfo(c.Request.Context(), fmt.Sprintf("imported %d billing expressions (%d changed), skipped %d", imported, changed, len(skipped)))
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data": gin.H{
+			"imported": imported,
+			"changed":  changed,
+			"total":    len(currentExpr),
+			"skipped":  skipped,
+		},
+	})
+}
+
+// billingSkippedItem 是一条没通过校验、没有写入配置的表达式。
+type billingSkippedItem struct {
+	Model string `json:"model"`
+	Error string `json:"error"`
+}
+
+// mergeBillingSettings 把待导入的表达式合并进本机配置：
+// 逐条先跑 billing_setting.SmokeTestExpr，失败的跳过并回报，成功的覆盖同名模型。
+// 返回合并后的 expr/mode、导入条数、与现值不同的条数、被跳过的条目。
+func mergeBillingSettings(currentExpr, currentMode, newExpr, newMode map[string]string) (
+	map[string]string, map[string]string, int, int, []billingSkippedItem,
+) {
+	if currentExpr == nil {
+		currentExpr = map[string]string{}
+	}
+	if currentMode == nil {
+		currentMode = map[string]string{}
+	}
+	// 先复制一份再合并，调用方传进来的 map 保持不被就地改写。
+	mergedExpr := make(map[string]string, len(currentExpr)+len(newExpr))
+	for k, v := range currentExpr {
+		mergedExpr[k] = v
+	}
+	mergedMode := make(map[string]string, len(currentMode)+len(newMode))
+	for k, v := range currentMode {
+		mergedMode[k] = v
+	}
+	skipped := make([]billingSkippedItem, 0)
+	imported := 0
+	changed := 0
+
+	for rawModel, rawExpr := range newExpr {
+		model := strings.TrimSpace(rawModel)
+		expr := strings.TrimSpace(rawExpr)
+		if model == "" || expr == "" {
+			continue
+		}
+		if err := billing_setting.SmokeTestExpr(expr); err != nil {
+			skipped = append(skipped, billingSkippedItem{Model: model, Error: err.Error()})
+			continue
+		}
+		mode := strings.TrimSpace(newMode[rawModel])
+		if mode == "" {
+			mode = billing_setting.BillingModeTieredExpr
+		}
+		if mergedExpr[model] != expr || mergedMode[model] != mode {
+			changed++
+		}
+		mergedExpr[model] = expr
+		mergedMode[model] = mode
+		imported++
+	}
+	return mergedExpr, mergedMode, imported, changed, skipped
 }

@@ -1,5 +1,13 @@
 {
   "translation": {
+    "阶梯计费表达式（billing_expr）": "Tiered billing expressions (billing_expr)",
+    "这些渠道只提供表达式计费，无法与数值倍率对比。导入后这些模型改用表达式计费，本机其它模型不受影响。": "These channels only provide expression-based pricing, which cannot be compared with numeric ratios. After importing, these models switch to expression billing; your other models are unaffected.",
+    "导入表达式计费": "Import expression billing",
+    "已导入 {{n}} 条表达式计费": "Imported {{n}} expression-billing entries",
+    "（其中 {{n}} 条有更新）": "({{n}} of them updated)",
+    "{{n}} 条表达式未通过校验已跳过：": "{{n}} expressions failed validation and were skipped:",
+    "导入失败": "Import failed",
+    "导入失败：": "Import failed: ",
     "讯飞星辰 MaaS：填写 APIKEY，可在同一渠道添加该密钥已启用的多个模型 ID；支持模型映射。模型预设不代表授权列表，请手动选择。支持 Chat、Responses、Anthropic、视觉、向量和重排序；生图仅支持单张 Base64，Kolors 请另建渠道使用 xingchen-api 域名。测试时请选择对应接口，价格需自行配置。": "Xunfei MaaS: enter an APIKEY and select the model IDs enabled for it; one channel can contain multiple models and model aliases. Presets are examples, not an authorization list. Supports Chat, Responses, Anthropic, vision, embeddings and reranking. Images return one Base64 image only; use a separate channel with the xingchen-api domain for Kolors. Select the matching endpoint when testing and configure model prices.",
     "自动更新 Cline 免费模型列表": "Automatically update Cline free models",
     "默认开启，自动增删 Cline 官方免费专区模型，保留其他手动模型和映射；站内计费使用现有定价。": "Enabled by default. Adds and removes models from Cline's official free catalog while preserving other manual models and mappings. Existing site pricing still applies.",
