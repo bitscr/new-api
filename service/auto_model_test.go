@@ -44,11 +44,17 @@ func TestAutoModelSetCandidatesParsing(t *testing.T) {
 func TestAutoModelHealthRanking(t *testing.T) {
 	autoModelTestReset()
 	group := "default"
-	// 无观测：冷启动保持输入顺序，评分相等
-	ranked := rankAutoModelCandidates(group, []string{"model-b", "model-a", "model-c"})
-	require.Equal(t, "model-b", ranked[0])
-	require.Equal(t, "model-a", ranked[1])
-	require.Equal(t, "model-c", ranked[2])
+	// 无观测：分数全部相等（中性 0.5），档内随机，而不是按输入/数据库顺序。
+	// 输入顺序与质量无关，谁排前面纯看数据库返回顺序——这正是"第一次总是渠道 1
+	// 那个排队上游"的来源。
+	input := []string{"model-b", "model-a", "model-c"}
+	firstSeen := map[string]bool{}
+	for i := 0; i < 40; i++ {
+		ranked := rankAutoModelCandidates(group, input)
+		require.ElementsMatch(t, input, ranked)
+		firstSeen[ranked[0]] = true
+	}
+	require.Greater(t, len(firstSeen), 1, "并列分数应随机挑，不能固定输入顺序的第一个")
 
 	// model-a 成功 3 次；model-b 失败 3 次 → model-a 应排前
 	// 使用同一渠道 ID（1）来模拟单渠道场景
@@ -58,7 +64,7 @@ func TestAutoModelHealthRanking(t *testing.T) {
 	RecordAutoModelOutcome(group, "model-b", 1, false, 100, 100)
 	RecordAutoModelOutcome(group, "model-b", 1, false, 100, 100)
 	RecordAutoModelOutcome(group, "model-b", 1, false, 100, 100)
-	ranked = rankAutoModelCandidates(group, []string{"model-a", "model-b"})
+	ranked := rankAutoModelCandidates(group, []string{"model-a", "model-b"})
 	require.Equal(t, "model-a", ranked[0])
 	require.Equal(t, "model-b", ranked[1])
 
@@ -153,4 +159,26 @@ func TestAutoModelRecordIgnoresVirtualName(t *testing.T) {
 	autoModelTestReset()
 	RecordAutoModelOutcome("default", "auto", 1, true, 5, 5)
 	require.Zero(t, autoModelHealth.Len())
+}
+
+// TestAutoModelTieBandsOrdering 锁定挑选规则：分数差超过容差就严格分先后，
+// 容差以内视为"分数一致"，档内随机。
+func TestAutoModelTieBandsOrdering(t *testing.T) {
+	items := []candidateMeta{
+		{Name: "low", Score: 0.30},
+		{Name: "high-a", Score: 0.62},
+		{Name: "high-b", Score: 0.60}, // 与 high-a 差 0.02，属于同一档
+		{Name: "mid", Score: 0.50},
+	}
+	heads := map[string]bool{}
+	for i := 0; i < 40; i++ {
+		ordered := orderByScoreTieBands(append([]candidateMeta(nil), items...))
+		require.Len(t, ordered, 4)
+		require.Contains(t, []string{"high-a", "high-b"}, ordered[0].Name, "最高档只能是 high-a/high-b")
+		require.Contains(t, []string{"high-a", "high-b"}, ordered[1].Name)
+		require.Equal(t, "mid", ordered[2].Name, "0.50 比最高档低一档以上，稳定排在后面")
+		require.Equal(t, "low", ordered[3].Name)
+		heads[ordered[0].Name] = true
+	}
+	require.Greater(t, len(heads), 1, "并列档内应随机，不能固定顺序")
 }

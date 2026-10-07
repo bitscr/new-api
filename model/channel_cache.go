@@ -93,11 +93,47 @@ func SyncChannelCache(frequency int) {
 	}
 }
 
+// GetRandomSatisfiedChannelWithUsedFallback 在完整优先级列表上定层，层内按权重加权随机。
+// 层内挑选策略的定制（例如 auto 路由按健康分优先）走 ChooseSatisfiedChannelByScore。
 func GetRandomSatisfiedChannelWithUsedFallback(group string, modelName string, retry int, hardExcluded, usedChannelIDs map[int]bool) (*Channel, error) {
 	if !common.MemoryCacheEnabled {
 		return GetChannelWithUsedFallback(group, modelName, retry, hardExcluded, usedChannelIDs)
 	}
+	targets, err := tierChannelTargets(group, modelName, retry, hardExcluded, usedChannelIDs)
+	if err != nil || len(targets) == 0 {
+		return nil, err
+	}
+	return chooseWeightedChannel(targets)
+}
 
+// ChooseSatisfiedChannelByScore 在同一优先级层里按健康分挑渠道：分数最高的一档优先，
+// 档内才按权重加权随机。两条实现路径都照顾到：
+//   - 内存渠道缓存（MEMORY_CACHE_ENABLED=true）：层内候选取自缓存，权重用渠道权重；
+//   - 直连数据库（默认路径，线上就是这条）：层内候选取自 abilities，权重用 ability 权重。
+//
+// 各自的权重语义保持原样，只是把"层内直接随机"换成"层内先看分数"。
+// score 返回该 (模型, 渠道) 的健康分；未观测应回中性 0.5。score 为 nil 时退化为原逻辑。
+func ChooseSatisfiedChannelByScore(group string, modelName string, retry int, hardExcluded, usedChannelIDs map[int]bool, score func(channelID int) float64, tieEpsilon float64) (*Channel, error) {
+	if score == nil {
+		return GetRandomSatisfiedChannelWithUsedFallback(group, modelName, retry, hardExcluded, usedChannelIDs)
+	}
+	if !common.MemoryCacheEnabled {
+		return chooseAbilityByScore(group, modelName, retry, hardExcluded, usedChannelIDs, score, tieEpsilon)
+	}
+	targets, err := tierChannelTargets(group, modelName, retry, hardExcluded, usedChannelIDs)
+	if err != nil || len(targets) == 0 {
+		return nil, err
+	}
+	return ChooseChannelByScore(targets, score, tieEpsilon)
+}
+
+// tierChannelTargets 返回该 (分组, 模型) 在 retry 指定的优先级层里可用的渠道（内存缓存路径）。
+//
+// 层级语义（与原 GetRandomSatisfiedChannelWithUsedFallback 完全一致）：
+//   - retry 从 0 开始，对应优先级从高到低；越界钳到最后一层。
+//   - 先排除 usedChannelIDs；若该层渠道都被用过，且不是最后一层，返回空让外层继续下一层；
+//     只有最后一层才允许重用已试渠道。
+func tierChannelTargets(group string, modelName string, retry int, hardExcluded, usedChannelIDs map[int]bool) ([]*Channel, error) {
 	channelSyncLock.RLock()
 	defer channelSyncLock.RUnlock()
 
@@ -148,7 +184,7 @@ func GetRandomSatisfiedChannelWithUsedFallback(group string, modelName string, r
 			}
 		}
 	}
-	return chooseWeightedChannel(target)
+	return target, nil
 }
 
 func chooseWeightedChannel(targetChannels []*Channel) (*Channel, error) {
@@ -174,6 +210,37 @@ func chooseWeightedChannel(targetChannels []*Channel) (*Channel, error) {
 		}
 	}
 	return nil, errors.New("channel not found")
+}
+
+// ChooseChannelByScore 在候选渠道里按健康分挑，规则与 auto 挑模型一致：
+// 分数最高的一档优先，档内（分数差在 tieEpsilon 以内）按渠道权重加权随机。
+// score 返回该 (模型, 渠道) 的当前分数；未观测的应返回中性 0.5。
+// score 为 nil 时退化为原来的纯权重加权随机。
+func ChooseChannelByScore(targets []*Channel, score func(channelID int) float64, tieEpsilon float64) (*Channel, error) {
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	if score == nil {
+		return chooseWeightedChannel(targets)
+	}
+	best := 0.0
+	haveBest := false
+	for _, channel := range targets {
+		s := score(channel.Id)
+		if !haveBest || s > best {
+			best, haveBest = s, true
+		}
+	}
+	eligible := make([]*Channel, 0, len(targets))
+	for _, channel := range targets {
+		if !haveBest || score(channel.Id) >= best-tieEpsilon {
+			eligible = append(eligible, channel)
+		}
+	}
+	if len(eligible) == 0 {
+		eligible = targets
+	}
+	return chooseWeightedChannel(eligible)
 }
 
 func GetRandomSatisfiedChannel(group string, model string, retry int) (*Channel, error) {

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"math/rand"
 	"sort"
 	"strconv"
 	"strings"
@@ -119,35 +120,10 @@ func effectiveScore(outcome autoModelOutcome, now time.Time) float64 {
 	return score
 }
 
-// bestChannelScoreForTier 返回某模型在某优先级层级内的最好候选分数；
-// 没有任何观测时返回 0.5（冷启动中性），usedOnly 标记其渠道是否全部已被本请求使用。
-func bestChannelScoreForTier(health map[string]autoModelOutcome, group, name string, tierPriority int64, channelIDs []int, used map[int]bool, now time.Time) (float64, bool) {
-	best := 0.5
-	allUsed := len(channelIDs) > 0
-	for _, id := range channelIDs {
-		if !used[id] {
-			allUsed = false
-		}
-		outcome, ok := health[autoModelHealthKey(group, name, id)]
-		if !ok {
-			// 该组合无观测：按中性 0.5 参与比较（保持冷启动不惩罚新渠道）
-			continue
-		}
-		// 确保只统计该优先级的渠道（由调用方保证 tierPriority 正确性）
-		if tierPriority >= 0 && outcome.LatencyMS > 0 {
-			// 实际检查：这里假设 channelIDs 已经由上层筛选为该优先级的
-			// 不需要在这里再查 DB，性能损耗更小
-		}
-		if s := effectiveScore(outcome, now); s > best {
-			best = s
-		}
-	}
-	return best, allUsed
-}
-
 // GetAutoModelCandidates 返回某分组可参与 auto 路由的候选模型，按健康度降序。
 // 候选 = 分组白名单 ∩ 分组启用模型 ∩ 已配置计费 ∩ chat 端点（未知端点不拦截）。
-// 冷启动（无观测）时按白名单顺序和模型可见顺序排序。
+// 分数一致（含全部未观测的冷启动）的候选在同一档内随机排列，不再按列表顺序——
+// 列表顺序与质量无关，谁排前面纯看数据库返回顺序。
 func GetAutoModelCandidates(group string) []string {
 	available := model.GetGroupEnabledModels(group)
 	availableSet := make(map[string]bool, len(available))
@@ -199,15 +175,19 @@ type candidateMeta struct {
 	Score        float64
 	LatencyMS    float64
 	Observations float64
-	Order        int
 }
+
+// autoScoreTieEpsilon 视为"分数并列"的容差。EMA 分数一次观测至少移动 0.1
+// （alpha 0.2，冷启动 0.5），所以 0.02 只吃掉"真实质量相当"的抖动，
+// 不会把明显更好的候选拉平。他的口径：分数一致就加权随机，不一致才按分数优先。
+const autoScoreTieEpsilon = 0.02
 
 func rankAutoModelCandidates(group string, candidates []string) []string {
 	health := autoModelHealth.ReadAll()
 	now := time.Now()
 	items := make([]candidateMeta, 0, len(candidates))
-	for i, name := range candidates {
-		meta := candidateMeta{Group: group, Name: name, Score: 0.5, Order: i}
+	for _, name := range candidates {
+		meta := candidateMeta{Group: group, Name: name, Score: 0.5}
 		prefix := autoModelHealthPrefix(group, name)
 		bestObs := autoModelOutcome{}
 		found := false
@@ -227,18 +207,7 @@ func rankAutoModelCandidates(group string, candidates []string) []string {
 		}
 		items = append(items, meta)
 	}
-	sort.SliceStable(items, func(i, j int) bool {
-		if items[i].Score > items[j].Score+0.00001 {
-			return true
-		}
-		if items[i].Score < items[j].Score-0.00001 {
-			return false
-		}
-		if items[i].LatencyMS > 0 && items[j].LatencyMS > 0 && items[i].LatencyMS != items[j].LatencyMS {
-			return items[i].LatencyMS < items[j].LatencyMS
-		}
-		return items[i].Order < items[j].Order
-	})
+	items = orderByScoreTieBands(items)
 	result := make([]string, len(items))
 	for i, meta := range items {
 		result[i] = meta.Name
@@ -246,72 +215,31 @@ func rankAutoModelCandidates(group string, candidates []string) []string {
 	return result
 }
 
-// SelectBestModelInTier 在当前重试次数对应的优先级层级内，选择最快最稳的组合。
-// retry: 当前重试索引（从 0 开始），对应优先级层的索引。
-// candidates: 候选模型列表。
-// getTierChannels: 回调函数，返回某个模型在指定优先级层的所有渠道 ID。
-// used: 本次请求已使用过的渠道 ID 集合。
+// orderByScoreTieBands 把候选排成"分数档从高到低、档内随机"的顺序。
 //
-// 返回所选的模型名和层级索引。如果该层级无可用组合，返回 nil。
-func SelectBestModelInTier(retry int, candidates []string, getTierChannels func(model string, tierIndex int) []int, used map[int]bool) (*struct {
-	Model     string
-	TierIndex int
-}, error) {
-	if len(candidates) == 0 {
-		return nil, nil
+// 档内随机取代了原来的列表顺序兜底：那份顺序来自数据库/白名单，与实际质量无关，
+// 冷启动（所有候选都还是中性 0.5）时等于每次挑数据库里排第一的那个——实测就是
+// 排队几十秒的渠道 1。模型本身没有权重字段，所以档内等权随机；渠道权重在挑渠道时生效。
+func orderByScoreTieBands(items []candidateMeta) []candidateMeta {
+	if len(items) <= 1 {
+		return items
 	}
-	// 找到当前层级（越界钳到最后一层）
-	tierIndex := retry
-	if tierIndex >= len(candidates) { // 保守上限：候选数，防止极端情况
-		tierIndex = len(candidates) - 1
-	}
-	if tierIndex < 0 {
-		tierIndex = 0
-	}
-
-	health := autoModelHealth.ReadAll()
-	now := time.Now()
-
-	// 对所有候选模型，计算它们在当前层级中的最好分数
-	type entry struct {
-		name   string
-		score  float64
-		allUse bool
-		pos    int
-	}
-	entries := make([]entry, 0, len(candidates))
-	order := make(map[string]int, len(candidates))
-	for i, name := range candidates {
-		order[name] = i
-		channelIDs := getTierChannels(name, tierIndex)
-		if len(channelIDs) == 0 {
-			// 该模型在该层级无渠道，跳过
+	sort.SliceStable(items, func(i, j int) bool { return items[i].Score > items[j].Score })
+	bands := make([][]candidateMeta, 0, len(items))
+	for _, item := range items {
+		if n := len(bands); n > 0 && item.Score >= bands[n-1][0].Score-autoScoreTieEpsilon {
+			bands[n-1] = append(bands[n-1], item)
 			continue
 		}
-		score, allUsed := bestChannelScoreForTier(health, "default", name, 0, channelIDs, used, now) // TODO: group from context
-		entries = append(entries, entry{name: name, score: score, allUse: allUsed, pos: order[name]})
+		bands = append(bands, []candidateMeta{item})
 	}
-
-	if len(entries) == 0 {
-		return nil, nil
+	result := make([]candidateMeta, 0, len(items))
+	for _, band := range bands {
+		if len(band) > 1 {
+			rand.Shuffle(len(band), func(i, j int) { band[i], band[j] = band[j], band[i] })
+		}
+		result = append(result, band...)
 	}
-
-	// 未被本请求使用的组合优先；同组内按分数降序，再按候选白名单顺序
-	sort.SliceStable(entries, func(a, b int) bool {
-		if entries[a].allUse != entries[b].allUse {
-			return !entries[a].allUse
-		}
-		if entries[a].score > entries[b].score+0.00001 {
-			return true
-		}
-		if entries[a].score < entries[b].score-0.00001 {
-			return false
-		}
-		return entries[a].pos < entries[b].pos
-	})
-
-	return &struct {
-		Model     string
-		TierIndex int
-	}{Model: entries[0].name, TierIndex: tierIndex}, nil
+	return result
 }
+

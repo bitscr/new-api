@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"strconv"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -129,10 +130,44 @@ func GetUsedChannelIDs(c *gin.Context) map[int]bool {
 // 只有目标层是最后一层且未用渠道耗尽时，才允许重用已试渠道。
 func selectChannelWithUsedFallback(param *RetryParam, group string, modelName string, retry int, hardExcluded map[int]bool) (*model.Channel, error) {
 	used := GetUsedChannelIDs(param.Ctx)
+	var usedIDs map[int]bool
+	if len(used) > 0 {
+		usedIDs = used
+	}
+	// auto 路由：同一优先级层内按健康分优先挑渠道（分数并列的档内按权重加权随机），
+	// 而不是纯权重随机——纯权重会一直给已知很慢的渠道派流量。
+	if scoreFn := autoModelChannelScoreFn(param.Ctx, modelName); scoreFn != nil {
+		return model.ChooseSatisfiedChannelByScore(group, modelName, retry, hardExcluded, usedIDs, scoreFn, autoScoreTieEpsilon)
+	}
 	if len(used) == 0 {
 		return model.GetRandomSatisfiedChannelWithExclusions(group, modelName, retry, hardExcluded)
 	}
 	return model.GetRandomSatisfiedChannelWithUsedFallback(group, modelName, retry, hardExcluded, used)
+}
+
+// autoModelChannelScoreFn 给 auto 路由的渠道打分：返回该 (模型, 渠道) 的当前健康分，
+// 未观测回中性 0.5。非 auto 请求返回 nil，保持原来的纯权重加权随机。
+// 分数在请求开始时快照一次，请求内不再变化（渠道挑选是同步短操作，不必每层重读）。
+func autoModelChannelScoreFn(c *gin.Context, modelName string) func(int) float64 {
+	if c == nil || modelName == "" {
+		return nil
+	}
+	if common.GetContextKeyString(c, constant.ContextKeyAutoModelClientName) == "" {
+		return nil
+	}
+	group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+	if group == "" {
+		return nil
+	}
+	health := autoModelHealth.ReadAll()
+	now := time.Now()
+	return func(channelID int) float64 {
+		outcome, ok := health[autoModelHealthKey(group, modelName, channelID)]
+		if !ok {
+			return 0.5
+		}
+		return effectiveScore(outcome, now)
+	}
 }
 
 func getChannelSkippedIDs(c *gin.Context, key string) map[int]bool {

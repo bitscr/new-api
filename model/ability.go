@@ -134,6 +134,25 @@ func GetChannel(group string, model string, retry int) (*Channel, error) {
 // prefers unused channels inside the selected tier, and reuses channels only on the
 // final tier when that tier has no unused channel left.
 func GetChannelWithUsedFallback(group string, model string, retry int, hardExcluded, usedChannelIDs map[int]bool) (*Channel, error) {
+	abilities, err := tierAbilities(group, model, retry, hardExcluded, usedChannelIDs)
+	if err != nil || len(abilities) == 0 {
+		return nil, err
+	}
+	channelID := chooseAbilityByWeight(abilities)
+	if channelID <= 0 {
+		return nil, nil
+	}
+	channel := Channel{}
+	if err := DB.First(&channel, "id = ?", channelID).Error; err != nil {
+		return nil, err
+	}
+	return &channel, nil
+}
+
+// tierAbilities 返回该 (分组, 模型) 在 retry 指定的优先级层里的可用 ability。
+// 层级语义与原 GetChannelWithUsedFallback 完全一致：越界钳到最后一层；
+// 先排除 hardExcluded，再优先未用过的渠道，只有最后一层才允许重用。
+func tierAbilities(group string, model string, retry int, hardExcluded, usedChannelIDs map[int]bool) ([]Ability, error) {
 	var abilities []Ability
 	if err := DB.Where(clause.Eq{Column: clause.Column{Name: "group"}, Value: group}).
 		Where("model = ? and enabled = ?", model, true).
@@ -171,23 +190,58 @@ func GetChannelWithUsedFallback(group string, model string, retry int, hardExclu
 		}
 	}
 	if len(unused) > 0 {
-		abilities = unused
-	} else if !finalTier {
+		return unused, nil
+	}
+	if !finalTier {
 		return nil, nil
 	}
+	return abilities, nil
+}
 
+// chooseAbilityByWeight 在给定 abilities 里按 ability.Weight + 10 加权随机（沿用原逻辑）。
+func chooseAbilityByWeight(abilities []Ability) int {
 	weightSum := uint(0)
 	for _, ability := range abilities {
 		weightSum += ability.Weight + 10
 	}
+	if weightSum == 0 {
+		return 0
+	}
 	weight := common.GetRandomInt(int(weightSum))
-	channelID := 0
 	for _, ability := range abilities {
 		weight -= int(ability.Weight) + 10
 		if weight <= 0 {
-			channelID = ability.ChannelId
-			break
+			return ability.ChannelId
 		}
+	}
+	return 0
+}
+
+// chooseAbilityByScore 与 GetChannelWithUsedFallback 相同，但同一层内先看健康分：
+// 分数最高的一档优先，档内才按 ability 权重加权随机。给 auto 路由用（直连数据库路径）。
+func chooseAbilityByScore(group string, model string, retry int, hardExcluded, usedChannelIDs map[int]bool, score func(channelID int) float64, tieEpsilon float64) (*Channel, error) {
+	abilities, err := tierAbilities(group, model, retry, hardExcluded, usedChannelIDs)
+	if err != nil || len(abilities) == 0 {
+		return nil, err
+	}
+	best, haveBest := 0.0, false
+	for _, ability := range abilities {
+		if s := score(ability.ChannelId); !haveBest || s > best {
+			best, haveBest = s, true
+		}
+	}
+	eligible := make([]Ability, 0, len(abilities))
+	for _, ability := range abilities {
+		if !haveBest || score(ability.ChannelId) >= best-tieEpsilon {
+			eligible = append(eligible, ability)
+		}
+	}
+	if len(eligible) == 0 {
+		eligible = abilities
+	}
+	channelID := chooseAbilityByWeight(eligible)
+	if channelID <= 0 {
+		return nil, nil
 	}
 	channel := Channel{}
 	if err := DB.First(&channel, "id = ?", channelID).Error; err != nil {
