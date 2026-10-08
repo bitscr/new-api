@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	basecommon "github.com/QuantumNous/new-api/common"
 )
 
 // 背景（实测 2026-10-07）：
@@ -48,6 +50,7 @@ type answerChoiceBody struct {
 type answerObservation struct {
 	mu             sync.Mutex
 	parsed         bool // 见过结构可识别的完成体（带 choices）
+	protocolError  bool // 显式上游协议错误，即使已有部分正文也不能算成功
 	textSeen       bool // 横幅之外还有正文
 	bannerSeen     bool // 见过告警横幅
 	reasoningSeen  bool // 见过思考内容
@@ -94,8 +97,55 @@ func (info *RelayInfo) ObserveClientAnswer(data []byte) {
 		return // 非 genBaseRelayInfo 构造的 RelayInfo：不观察，也就永远不下判断
 	}
 	for _, payload := range clientAnswerPayloads(data) {
+		info.ObserveUpstreamError(payload)
 		observation.observe(payload)
 	}
+}
+
+// ObserveUpstreamError only records explicit top-level protocol errors in raw JSON.
+// Call before lossy response conversions; raw choices must never count as a
+// delivered answer. Repeated upstream/client observations are idempotent.
+func (info *RelayInfo) ObserveUpstreamError(payload []byte) {
+	if info == nil || info.answer == nil || !hasExplicitProtocolError(payload) {
+		return
+	}
+	observation := info.answer
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	observation.protocolError = true
+}
+
+func hasExplicitProtocolError(payload []byte) bool {
+	// JSON Unicode escapes may hide the literal error key.
+	if !bytes.Contains(payload, []byte(`"error"`)) && !bytes.ContainsRune(payload, '\\') {
+		return false
+	}
+	var envelope map[string]any
+	if err := basecommon.Unmarshal(payload, &envelope); err != nil {
+		return false
+	}
+	switch value := envelope["error"].(type) {
+	case string:
+		return strings.TrimSpace(value) != ""
+	case map[string]any:
+		for _, key := range []string{"message", "type"} {
+			if text, ok := value[key].(string); ok && strings.TrimSpace(text) != "" {
+				return true
+			}
+		}
+		switch code := value["code"].(type) {
+		case string:
+			switch strings.ToLower(strings.TrimSpace(code)) {
+			case "", "0", "200", "success", "ok":
+				return false
+			default:
+				return true
+			}
+		case float64:
+			return code != 0 && code != 200
+		}
+	}
+	return false
 }
 
 // ClientAnswerUnusable 判断这次请求是否"HTTP 200 但没有可用回答"。
@@ -107,6 +157,9 @@ func (info *RelayInfo) ClientAnswerUnusable() (bool, string) {
 	observation := info.answer
 	observation.mu.Lock()
 	defer observation.mu.Unlock()
+	if observation.protocolError {
+		return true, "200 但上游返回了显式协议错误"
+	}
 	if !observation.parsed || observation.undecidable {
 		return false, ""
 	}
@@ -130,7 +183,7 @@ func (observation *answerObservation) observe(payload []byte) {
 			FinishReason string            `json:"finish_reason"`
 		} `json:"choices"`
 	}
-	if err := json.Unmarshal(payload, &probe); err != nil || len(probe.Choices) == 0 {
+	if err := basecommon.Unmarshal(payload, &probe); err != nil || len(probe.Choices) == 0 {
 		return
 	}
 
@@ -219,13 +272,13 @@ func flattenAnswerContent(raw json.RawMessage) string {
 		return ""
 	}
 	var text string
-	if err := json.Unmarshal(raw, &text); err == nil {
+	if err := basecommon.Unmarshal(raw, &text); err == nil {
 		return text
 	}
 	var parts []struct {
 		Text string `json:"text"`
 	}
-	if err := json.Unmarshal(raw, &parts); err == nil {
+	if err := basecommon.Unmarshal(raw, &parts); err == nil {
 		var builder strings.Builder
 		for _, part := range parts {
 			builder.WriteString(part.Text)

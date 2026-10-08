@@ -162,6 +162,8 @@ func OaiStreamHandlerWithDataTransformer(c *gin.Context, info *relaycommon.Relay
 	isAudioModel := strings.Contains(strings.ToLower(model), "audio")
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		// Conversions and usage-only suppression can discard protocol errors.
+		info.ObserveUpstreamError(common.StringToByteSlice(data))
 		if transform != nil && data != "" {
 			transformedData, err := transform(data)
 			if err != nil {
@@ -169,6 +171,7 @@ func OaiStreamHandlerWithDataTransformer(c *gin.Context, info *relaycommon.Relay
 				sr.Error(err)
 			} else {
 				data = transformedData
+				info.ObserveUpstreamError(common.StringToByteSlice(data))
 			}
 		}
 		if lastStreamData != "" {
@@ -260,6 +263,7 @@ func OpenaiHandlerWithBodyTransformer(c *gin.Context, info *relaycommon.RelayInf
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
+	info.ObserveUpstreamError(responseBody)
 	if transform != nil {
 		responseBody, err = transform(responseBody)
 		if err != nil {
@@ -285,6 +289,8 @@ func OpenaiHandlerWithBodyTransformer(c *gin.Context, info *relaycommon.RelayInf
 		}
 	}
 
+	// Also observe errors exposed by a body transformer or enterprise unwrapping.
+	info.ObserveUpstreamError(responseBody)
 	err = common.Unmarshal(responseBody, &simpleResponse)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)

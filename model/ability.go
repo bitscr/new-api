@@ -86,7 +86,8 @@ func getPriority(group string, model string, retry int) (int, error) {
 	var priorities []int
 	err := DB.Model(&Ability{}).
 		Select("DISTINCT(priority)").
-		Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).
+		Where(clause.Eq{Column: clause.Column{Name: "group"}, Value: group}).
+		Where("model = ? and enabled = ?", model, true).
 		Order("priority DESC").              // 按优先级降序排序
 		Pluck("priority", &priorities).Error // Pluck用于将查询的结果直接扫描到一个切片中
 
@@ -112,14 +113,18 @@ func getPriority(group string, model string, retry int) (int, error) {
 }
 
 func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
-	maxPrioritySubQuery := DB.Model(&Ability{}).Select("MAX(priority)").Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
-	channelQuery := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and priority = (?)", group, model, true, maxPrioritySubQuery)
+	maxPrioritySubQuery := DB.Model(&Ability{}).Select("MAX(priority)").
+		Where(clause.Eq{Column: clause.Column{Name: "group"}, Value: group}).
+		Where("model = ? and enabled = ?", model, true)
+	channelQuery := DB.Where(clause.Eq{Column: clause.Column{Name: "group"}, Value: group}).
+		Where("model = ? and enabled = ? and priority = (?)", model, true, maxPrioritySubQuery)
 	if retry != 0 {
 		priority, err := getPriority(group, model, retry)
 		if err != nil {
 			return nil, err
 		} else {
-			channelQuery = DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and priority = ?", group, model, true, priority)
+			channelQuery = DB.Where(clause.Eq{Column: clause.Column{Name: "group"}, Value: group}).
+				Where("model = ? and enabled = ? and priority = ?", model, true, priority)
 		}
 	}
 
@@ -255,7 +260,8 @@ func GetChannelWithExclusions(group string, model string, retry int, excludedCha
 
 	var err error = nil
 	if len(excludedChannelIDs) > 0 {
-		err = DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).
+		err = DB.Where(clause.Eq{Column: clause.Column{Name: "group"}, Value: group}).
+			Where("model = ? and enabled = ?", model, true).
 			Order("priority DESC, weight DESC").
 			Find(&abilities).Error
 	} else {

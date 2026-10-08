@@ -358,6 +358,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			// 而调用方每次都拿到假答案（实测渠道 #5 近 7 天 10 次全部如此）。
 			if unusable, reason := relayInfo.ClientAnswerUnusable(); unusable {
 				logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 没有给出有效回答（%s），不计成功", relayInfo.OriginModelName, reason))
+				recordRelayErrorLog(c, types.NewErrorWithStatusCode(errors.New(reason), types.ErrorCodeBadResponse, http.StatusOK, types.ErrOptionWithSkipRetry()))
 				recordAutoModelUnusableAnswer(c, relayInfo, reason)
 			} else {
 				recordAutoModelFeedback(c, relayInfo, true)
@@ -1088,7 +1089,11 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			service.DisableChannel(channelError, err.ErrorWithStatusCode())
 		})
 	}
+	recordRelayErrorLog(c, err)
+}
 
+// Record diagnostics without changing client delivery, billing or channel health.
+func recordRelayErrorLog(c *gin.Context, err *types.NewAPIError) {
 	if constant.ErrorLogEnabled && types.IsRecordErrorLog(err) {
 		// 保存错误日志到mysql中
 		userId := c.GetInt("id")
