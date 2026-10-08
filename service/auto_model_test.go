@@ -10,8 +10,10 @@ import (
 
 func autoModelTestReset() {
 	autoModelHealth.Clear()
+	autoModelChannelHealth.Clear()
 	autoModelCooldowns.Clear()
-	require.NoError(nil, operation_setting.SetAutoModelCandidates("{}"))
+	_ = operation_setting.SetAutoModelCandidates("{}")
+	_ = operation_setting.SetAutoModelWeights("{}")
 }
 
 func TestAutoModelIsAutoModelName(t *testing.T) {
@@ -161,26 +163,27 @@ func TestAutoModelRecordIgnoresVirtualName(t *testing.T) {
 	autoModelTestReset()
 	RecordAutoModelOutcome("default", "auto", 1, true, 5, 5)
 	require.Zero(t, autoModelHealth.Len())
+	require.Zero(t, autoModelChannelHealth.Len())
 }
 
-// TestAutoModelTieBandsOrdering 锁定挑选规则：分数差超过容差就严格分先后，
-// 容差以内视为"分数一致"，档内随机。
+// Only floating-point-equivalent scores tie. Actual score differences must
+// retain their order even when the lower-scoring item has a much larger weight.
 func TestAutoModelTieBandsOrdering(t *testing.T) {
-	items := []candidateMeta{
-		{Name: "low", Score: 0.30},
-		{Name: "high-a", Score: 0.62},
-		{Name: "high-b", Score: 0.60}, // 与 high-a 差 0.02，属于同一档
-		{Name: "mid", Score: 0.50},
+	items := []autoModelScoreItem{
+		{Index: 0, Score: 0.30, Weight: 1},
+		{Index: 1, Score: 0.60, Weight: 1},
+		{Index: 2, Score: 0.60 + 5e-10, Weight: 1},
+		{Index: 3, Score: 0.59, Weight: 1e100},
 	}
-	heads := map[string]bool{}
-	for i := 0; i < 40; i++ {
-		ordered := orderByScoreTieBands(append([]candidateMeta(nil), items...))
+	heads := map[int]bool{}
+	for _, draw := range []float64{0, 0.99} {
+		ordered := orderAutoModelScoreBands(items, func() float64 { return draw })
 		require.Len(t, ordered, 4)
-		require.Contains(t, []string{"high-a", "high-b"}, ordered[0].Name, "最高档只能是 high-a/high-b")
-		require.Contains(t, []string{"high-a", "high-b"}, ordered[1].Name)
-		require.Equal(t, "mid", ordered[2].Name, "0.50 比最高档低一档以上，稳定排在后面")
-		require.Equal(t, "low", ordered[3].Name)
-		heads[ordered[0].Name] = true
+		require.Contains(t, []int{1, 2}, ordered[0].Index)
+		require.Contains(t, []int{1, 2}, ordered[1].Index)
+		require.Equal(t, 3, ordered[2].Index, "0.59 is below 0.60, not a random tie")
+		require.Equal(t, 0, ordered[3].Index)
+		heads[ordered[0].Index] = true
 	}
-	require.Greater(t, len(heads), 1, "并列档内应随机，不能固定顺序")
+	require.Len(t, heads, 2, "floating-point-equivalent top scores use weighted randomness")
 }

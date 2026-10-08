@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/bytedance/gopkg/util/gopool"
@@ -122,6 +124,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if (relayFormat == types.RelayFormatMistralNative || relayFormat == types.RelayFormatMistralRealtime) && c.Writer.Written() {
 				return // Native HTTP/SSE/WS errors have already been relayed verbatim.
 			}
+			if isAutoModelRequest(c) && relayFormat != types.RelayFormatOpenAIRealtime && c.Writer != nil && c.Writer.Written() {
+				return // Never append another response after an auto attempt started delivery.
+			}
 			if !isChannelDailySuccessLimitError(newAPIError) && !service.IsChannelRPMLimitError(newAPIError) {
 				newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			}
@@ -156,6 +161,27 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
+	}
+
+	autoRequest := isAutoModelRequest(c)
+	if autoRequest {
+		if newAPIError = autoModelCanceledRequestError(c, nil); newAPIError != nil {
+			return
+		}
+		// Middleware plans the request once. Revalidate that exact plan and bind
+		// its concrete model before token estimation, pricing or pre-consumption.
+		if _, ok := service.GetCurrentAutoModelRoute(c); !ok {
+			newAPIError = newAutoModelRouteError("auto model route plan is missing or invalid")
+			return
+		}
+		_, newAPIError = prepareAutoModelRouteFromIndex(c, relayInfo, nil, 0, nil,
+			common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex), false)
+		if newAPIError != nil {
+			return
+		}
+		if relayInfo.Request != nil {
+			request = relayInfo.Request
+		}
 	}
 
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
@@ -228,7 +254,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	// A failed attempt must not consume the feedback slot of a later success.
 	defer flushAutoModelFeedback(c)
 
-	for retryParam.GetRetry() <= retryParam.GetEffectiveRetryTimes() {
+	var autoBudget autoModelAttemptBudget
+	for {
+		if autoRequest {
+			if !autoBudget.canAttempt() || (autoBudget.attempts > 0 && !canRetryAutoModelRequest(c, relayInfo)) {
+				break
+			}
+			retryParam.SetRetry(autoBudget.attempts)
+		} else if retryParam.GetRetry() > retryParam.GetEffectiveRetryTimes() {
+			break
+		}
 		if canceledErr := autoModelCanceledRequestError(c, newAPIError); canceledErr != nil {
 			newAPIError = canceledErr
 			break
@@ -237,15 +272,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
-			// auto 路由：当前模型渠道耗尽时，切换到下一个候选模型再尝试
-			exhaustedModel := relayInfo.OriginModelName
+			// The plan is channel-block ordered: exhaust this channel's remaining
+			// model routes before trying the next channel, never select at random.
 			if trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
-				logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 的渠道已耗尽，切换候选 %s", exhaustedModel, relayInfo.OriginModelName))
 				continue
 			}
-			// 已经失败过至少一次才走到这里，说明不是"没有渠道"，而是候选渠道都被排除了
-			// （例如同一渠道试满上限）。把真实的上游报错返回，别用"可用渠道不存在"误导排查。
-			if retryParam.GetRetry() > 0 && relayInfo.LastError != nil {
+			// Keep the real last failure instead of hiding it behind an exhausted plan.
+			if (autoRequest || retryParam.GetRetry() > 0) && relayInfo.LastError != nil {
 				newAPIError = relayInfo.LastError
 				break
 			}
@@ -255,15 +288,25 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		reservation, reserveErr := reserveChannelDailySuccess(channel)
 		if reserveErr != nil {
+			newAPIError = reserveErr
 			if isChannelDailySuccessLimitError(reserveErr) && shouldSkipDailyLimitedChannel(c, channel) {
 				continue
 			}
-			newAPIError = reserveErr
 			break
 		}
 
-		retryParam.SetEffectiveRetryTimesFromChannel(channel)
-		addUsedChannel(c, channel.Id)
+		if !autoRequest {
+			retryParam.SetEffectiveRetryTimesFromChannel(channel)
+			addUsedChannel(c, channel.Id)
+		} else if !relayInfo.PriceData.FreeModel && relayInfo.Billing == nil {
+			// A free first model may fall back to a paid model. Establish billing
+			// once, before dispatch; an existing session must never be pre-charged again.
+			if billingErr := service.PreConsumeBilling(c, relayInfo.PriceData.QuotaToPreConsume, relayInfo); billingErr != nil {
+				newAPIError = billingErr
+				model.ReleaseChannelDailySuccess(reservation)
+				break
+			}
+		}
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
 			// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
@@ -277,6 +320,19 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
+		if autoRequest {
+			if canceledErr := autoModelCanceledRequestError(c, newAPIError); canceledErr != nil {
+				newAPIError = canceledErr
+				model.ReleaseChannelDailySuccess(reservation)
+				break
+			}
+			if (autoBudget.attempts > 0 && !canRetryAutoModelRequest(c, relayInfo)) || !autoBudget.beginAttempt(channel, retryParam) {
+				model.ReleaseChannelDailySuccess(reservation)
+				break
+			}
+			markCurrentAutoModelRouteAttempted(c)
+			addUsedChannel(c, channel.Id)
+		}
 		relayInfo.BeginAttempt()
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
@@ -330,20 +386,17 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 		recordAutoModelFeedback(c, relayInfo, false)
 
-		if !shouldRetry(c, newAPIError, retryParam.GetRemainingRetryTimes()) {
-			// auto 路由：上游明确表示服务不了当前候选（404 模型不支持、400 参数不支持等）时，
-			// 换下一个候选模型再试。否则客户端只会收到 404/400 并直接停止
-			// （实测：上游 404 被原样返回，客户端报 model_not_found）。
-			if autoModelSwitchableError(newAPIError) &&
-				c.GetInt("auto_model_hard_switches") < maxAutoModelHardSwitches {
-				oldModel := relayInfo.OriginModelName
-				if trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
-					c.Set("auto_model_hard_switches", c.GetInt("auto_model_hard_switches")+1)
-					logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 被上游拒绝（status %d），切换候选 %s",
-						oldModel, newAPIError.StatusCode, relayInfo.OriginModelName))
-					continue
-				}
+		if autoRequest {
+			// Ordinary errors exclude only this (group, model, channel), not every
+			// other model on the channel. 400/404 switches spend the same budget
+			// as 5xx retries; there is no extra uncounted hard-switch allowance.
+			if shouldRetryAutoModelRoute(c, relayInfo, newAPIError, autoBudget.remainingRetries) &&
+				trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
+				continue
 			}
+			break
+		}
+		if !shouldRetry(c, newAPIError, retryParam.GetRemainingRetryTimes()) {
 			break
 		}
 		retryParam.IncreaseRetry()
@@ -454,6 +507,15 @@ func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
 }
 
 func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam) (*model.Channel, *types.NewAPIError) {
+	if isAutoModelRequest(c) {
+		route, ok := service.GetCurrentAutoModelRoute(c)
+		if !ok {
+			return nil, newAutoModelRouteError("auto model route plan is missing or invalid")
+		}
+		// No model-first random selector, used-channel fallback, or fabricated
+		// Channel is permitted for auto requests, including the first attempt.
+		return getFixedAutoModelChannel(c, info, route)
+	}
 	if info.ChannelMeta == nil {
 		autoBan := c.GetBool("auto_ban")
 		autoBanInt := 1
@@ -566,61 +628,350 @@ func autoModelCanceledRequestError(c *gin.Context, current *types.NewAPIError) *
 		types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 }
 
-// trySwitchAutoModel 在“当前模型渠道耗尽”时把路由切换到下一个候选模型。
-// 返回 true 表示已切换到下一模型，调用方应继续重试循环。
-// 切换会更新 OriginModelName/ClientModelName/PriceData 并重置渠道已用列表，
-// 使新模型拥有完整渠道池。
-func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam, tokens int, meta *types.TokenCountMeta) bool {
-	if !operation_setting.AutoModelEnabled || !isAutoModelRequest(c) || autoModelRequestContextError(c) != nil {
+// autoModelAttemptBudget is frozen by the first actual dispatch. Channel/model
+// switches cannot reset or enlarge it, including channel-specific retry overrides.
+// remainingRetries excludes the first attempt, avoiding an overflowing limit+1.
+type autoModelAttemptBudget struct {
+	started          bool
+	attempts         int
+	remainingRetries int
+}
+
+func (b *autoModelAttemptBudget) canAttempt() bool {
+	return !b.started || b.remainingRetries > 0
+}
+
+func (b *autoModelAttemptBudget) beginAttempt(channel *model.Channel, retryParam *service.RetryParam) bool {
+	if !b.canAttempt() {
 		return false
 	}
-	candidatesAny, ok := common.GetContextKey(c, constant.ContextKeyAutoModelCandidates)
+	if !b.started {
+		retryParam.SetEffectiveRetryTimesFromChannel(channel)
+		retryParam.SetEffectiveRetryTimes(retryParam.GetEffectiveRetryTimes())
+		b.remainingRetries = retryParam.GetEffectiveRetryTimes()
+		b.started = true
+	} else {
+		b.remainingRetries--
+	}
+	retryParam.SetRetry(b.attempts)
+	b.attempts++
+	return true
+}
+
+func canRetryAutoModelRequest(c *gin.Context, info *relaycommon.RelayInfo) bool {
+	return operation_setting.AutoModelEnabled && isAutoModelRequest(c) &&
+		autoModelRequestContextError(c) == nil && !c.IsAborted() && !isSpecificChannelRequest(c) &&
+		(c.Writer == nil || !c.Writer.Written()) && (info == nil || !info.ClientDeliveryBroken())
+}
+
+func shouldRetryAutoModelRoute(c *gin.Context, info *relaycommon.RelayInfo, err *types.NewAPIError, remaining int) bool {
+	if remaining <= 0 || !canRetryAutoModelRequest(c, info) || err == nil ||
+		types.IsSkipRetryError(err) || operation_setting.IsAlwaysSkipRetryCode(err.GetErrorCode()) {
+		return false
+	}
+	return shouldRetry(c, err, remaining) || autoModelSwitchableError(err)
+}
+
+const autoModelAttemptedRoutesKey = "auto_model_attempted_routes"
+
+func markCurrentAutoModelRouteAttempted(c *gin.Context) {
+	route, ok := service.GetCurrentAutoModelRoute(c)
+	if !ok {
+		return
+	}
+	value, _ := c.Get(autoModelAttemptedRoutesKey)
+	attempted, _ := value.(map[service.AutoModelRoute]bool)
+	if attempted == nil {
+		attempted = make(map[service.AutoModelRoute]bool)
+	}
+	attempted[route] = true
+	c.Set(autoModelAttemptedRoutesKey, attempted)
+}
+
+func newAutoModelRouteError(message string) *types.NewAPIError {
+	return types.NewErrorWithStatusCode(errors.New(message), types.ErrorCodeGetChannelFailed,
+		http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+}
+
+func isAutoModelRouteAuthorized(c *gin.Context, info *relaycommon.RelayInfo, route service.AutoModelRoute) bool {
+	if route.ChannelID <= 0 || route.Group == "" || route.ModelName == "" || info == nil ||
+		!service.IsAutoModelCandidateAuthorized(c, route.ModelName) || isSpecificChannelRequest(c) {
+		return false
+	}
+	tokenGroup := info.TokenGroup
+	if tokenGroup == "" {
+		tokenGroup = info.UserGroup
+	}
+	if tokenGroup != "auto" {
+		if route.Group == tokenGroup {
+			return true
+		}
+		// A session-authenticated playground request can have no token group.
+		// Preserve its middleware-authorized group, without accepting another
+		// group's forged route or broadening the user's usable group set.
+		return info.IsPlayground && route.Group == info.UsingGroup &&
+			service.GroupInUserUsableGroups(info.UserGroup, route.Group)
+	}
+	allowed := false
+	for _, group := range service.GetRequestGroupCandidates(c, info.UserGroup, tokenGroup) {
+		if route.Group == group {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return false
+	}
+	return common.GetContextKeyBool(c, constant.ContextKeyTokenCrossGroupRetry) ||
+		info.UsingGroup == "" || info.UsingGroup == "auto" || route.Group == info.UsingGroup
+}
+
+// getFixedAutoModelChannel is a final authorization/availability boundary. Use the
+// enabled-ability snapshot rather than the legacy channel cache, which cannot
+// represent disabled abilities, and never substitute another ChannelID.
+func getFixedAutoModelChannel(c *gin.Context, info *relaycommon.RelayInfo, route service.AutoModelRoute) (*model.Channel, *types.NewAPIError) {
+	if !operation_setting.AutoModelEnabled || !isAutoModelRouteAuthorized(c, info, route) {
+		return nil, types.NewErrorWithStatusCode(errors.New("auto model route is not authorized"),
+			types.ErrorCodeGetChannelFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry())
+	}
+	if canceledErr := autoModelCanceledRequestError(c, nil); canceledErr != nil {
+		return nil, canceledErr
+	}
+	if service.GetAutoModelHardExcludedChannelIDs(c)[route.ChannelID] {
+		if service.IsChannelRPMLimitSkipped(c, route.ChannelID) {
+			return nil, service.NewChannelRPMLimitError(service.ChannelRPMGroupLimitExceededMessage)
+		}
+		return nil, newChannelDailySuccessLimitError()
+	}
+	value, _ := c.Get(autoModelAttemptedRoutesKey)
+	attempted, _ := value.(map[service.AutoModelRoute]bool)
+	if attempted[route] {
+		return nil, newAutoModelRouteError("auto model route was already attempted")
+	}
+	targets, err := model.GetAutoModelRoutingTargets(route.Group)
+	if err != nil {
+		return nil, newAutoModelRouteError(fmt.Sprintf("cannot revalidate auto model route: %s", err))
+	}
+	enabled := false
+	for _, name := range []string{route.ModelName, ratio_setting.FormatMatchingModelName(route.ModelName)} {
+		for _, target := range targets[name] {
+			if target.ChannelID == route.ChannelID {
+				enabled = true
+				break
+			}
+		}
+	}
+	if !enabled {
+		return nil, newAutoModelRouteError("auto model route is no longer enabled")
+	}
+	channel, err := model.GetChannelById(route.ChannelID, true)
+	if err != nil || channel == nil || channel.Id != route.ChannelID || channel.Status != common.ChannelStatusEnabled {
+		return nil, newAutoModelRouteError("auto model route channel is no longer available")
+	}
+	if service.GetAutoModelCoolingChannelIDs(route.Group, route.ModelName)[route.ChannelID] {
+		return nil, newAutoModelRouteError("auto model route is cooling down")
+	}
+	if channel.Type == constant.ChannelTypeTypeSafe && info.RelayFormat != types.RelayFormatTypeSafe {
+		return nil, newAutoModelRouteError("TypeSafe only supports POST /v1/systemone")
+	}
+	return channel, nil
+}
+
+// trySwitchAutoModel advances a route, not a model-only list. Consecutive entries
+// may have the same ChannelID or the same ModelName. Neither is grounds to skip.
+func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam, tokens int, meta *types.TokenCountMeta) bool {
+	if !canRetryAutoModelRequest(c, info) || info == nil || meta == nil {
+		return false
+	}
+	current, ok := service.GetCurrentAutoModelRoute(c)
 	if !ok {
 		return false
 	}
-	candidates, ok := candidatesAny.([]string)
-	if !ok || len(candidates) == 0 {
-		return false
-	}
-	index := common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex)
-	if index < 0 || index >= len(candidates) {
-		return false
-	}
-	next := index + 1
-	// Treat the candidate snapshot as untrusted at the final model-switch boundary.
-	// Middleware filtering must not be the only guard against token scope bypass.
-	for next < len(candidates) && !service.IsAutoModelCandidateAuthorized(c, candidates[next]) {
-		next++
-	}
-	if next >= len(candidates) {
-		logger.LogInfo(c, fmt.Sprintf("auto model: 授权候选模型已全部尝试（%s）", strings.Join(candidates, " -> ")))
-		return false
-	}
-	oldModel := info.OriginModelName
-	newModel := candidates[next]
-
-	info.OriginModelName = newModel
-	info.ClientModelName = newModel
-	c.Set("original_model", newModel)
-	retryParam.ModelName = newModel
-
-	// 重新计算新模型的报价，结算/日志按新模型定价
-	priceData, err := helper.ModelPriceHelper(c, info, tokens, meta)
+	channel, err := prepareAutoModelRouteFromIndex(c, info, retryParam, tokens, meta,
+		common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex)+1, true)
 	if err != nil {
-		logger.LogWarn(c, fmt.Sprintf("auto model switch 到 %s 计算价格失败，保持当前模型: %s", newModel, err.Error()))
-		info.OriginModelName = oldModel
-		info.ClientModelName = oldModel
-		c.Set("original_model", oldModel)
-		retryParam.ModelName = oldModel
 		return false
 	}
-	info.PriceData = priceData
-
-	// 换模型后渠道池重新开始（同模型已试渠道不阻塞新模型）
-	c.Set("use_channel", make([]string, 0))
-	common.SetContextKey(c, constant.ContextKeyAutoModelIndex, next)
-	logger.LogInfo(c, fmt.Sprintf("auto model: 切换候选 %s -> %s", oldModel, newModel))
+	logger.LogInfo(c, fmt.Sprintf("auto model: 路线 %s/%s#%d -> %s/%s#%d",
+		current.Group, current.ModelName, current.ChannelID, info.UsingGroup, info.OriginModelName, channel.Id))
 	return true
+}
+
+func prepareAutoModelRouteFromIndex(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam, tokens int, meta *types.TokenCountMeta, index int, reprice bool) (*model.Channel, *types.NewAPIError) {
+	routes := service.GetAutoModelRoutePlan(c)
+	if index < 0 || index >= len(routes) {
+		return nil, newAutoModelRouteError("auto model route plan is exhausted")
+	}
+	lastErr := newAutoModelRouteError("auto model route plan has no available route")
+	for ; index < len(routes); index++ {
+		if canceledErr := autoModelCanceledRequestError(c, nil); canceledErr != nil {
+			return nil, canceledErr
+		}
+		if reprice && !canRetryAutoModelRequest(c, info) {
+			return nil, lastErr
+		}
+		channel, routeErr := getFixedAutoModelChannel(c, info, routes[index])
+		if routeErr != nil {
+			lastErr = routeErr
+			continue
+		}
+		if routeErr = bindAutoModelRoute(c, info, retryParam, routes[index], index, channel, tokens, meta, reprice); routeErr != nil {
+			lastErr = routeErr
+			continue
+		}
+		return channel, nil
+	}
+	return nil, lastErr
+}
+
+// Stage all route-dependent state before committing it. A bad price, disabled key
+// or malformed body must leave the previous attempt's billing snapshot intact.
+func bindAutoModelRoute(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam, route service.AutoModelRoute, index int, channel *model.Channel, tokens int, meta *types.TokenCountMeta, reprice bool) *types.NewAPIError {
+	// Keep the original storage owned by the live request even if preparation
+	// fails before commit (normally request validation has already cached it).
+	if c.Request != nil && c.Request.Body != nil {
+		if _, err := common.GetBodyStorage(c); err != nil {
+			return types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
+		}
+	}
+	nextCtx := c.Copy()
+	if c.Request != nil {
+		nextCtx.Request = c.Request.Clone(c.Request.Context())
+	}
+	if !service.ActivateAutoModelRoute(nextCtx, index) {
+		return newAutoModelRouteError("cannot activate auto model route")
+	}
+	// SetupContext intentionally omits some empty per-channel fields. Clear
+	// them first so an Azure/multi-key/organization setting cannot leak across.
+	for _, key := range []string{"api_version", "region", "plugin", "bot_id", string(constant.ContextKeyChannelOrganization)} {
+		nextCtx.Set(key, "")
+	}
+	common.SetContextKey(nextCtx, constant.ContextKeyChannelMultiKeyIndex, 0)
+	if err := middleware.SetupContextForSelectedChannel(nextCtx, channel, route.ModelName); err != nil {
+		return err
+	}
+	// HandleGroupRatio must not revive a previous auto-group during pricing.
+	common.SetContextKey(nextCtx, constant.ContextKeyUsingGroup, route.Group)
+	common.SetContextKey(nextCtx, constant.ContextKeyAutoGroup, route.Group)
+
+	nextInfo := *info
+	nextInfo.OriginModelName = route.ModelName
+	nextInfo.ClientModelName = route.ModelName
+	nextInfo.UsingGroup = route.Group
+	nextInfo.ModelMappingTargetName = ""
+	nextInfo.ModelMappingBypassed = false
+	nextInfo.RuntimeHeadersOverride = nil
+	nextInfo.UseRuntimeHeadersOverride = false
+	nextInfo.ParamOverrideAudit = nil
+	nextInfo.ConversationCapture = nil
+	nextCtx.Set("conversation_capture", nil)
+	nextInfo.RequestConversionChain = nil
+	nextInfo.FinalRequestRelayFormat = ""
+	nextInfo.InitRequestConversionChain()
+	nextInfo.PriceData = types.PriceData{}
+	nextInfo.TieredBillingSnapshot = nil
+	nextInfo.BillingRequestInput = nil
+	// InitChannelMeta normally mutates the shared Request DTO. Delay that one
+	// mutation until the staging operation (including pricing) has succeeded.
+	nextInfo.Request = nil
+	nextInfo.InitChannelMeta(nextCtx)
+	nextInfo.Request = info.Request
+
+	oldStorage, newStorage, err := rewriteAutoModelRequestBody(nextCtx, route.ModelName)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
+	}
+	committed := false
+	defer func() {
+		if !committed && newStorage != nil {
+			_ = newStorage.Close()
+		}
+	}()
+	if reprice {
+		priceData, err := helper.ModelPriceHelper(nextCtx, &nextInfo, tokens, meta)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithSkipRetry())
+		}
+		nextInfo.PriceData = priceData
+	}
+	if canceledErr := autoModelCanceledRequestError(c, nil); canceledErr != nil {
+		return canceledErr
+	}
+	if reprice && !canRetryAutoModelRequest(c, info) {
+		return newAutoModelRouteError("auto model response already started")
+	}
+	for key, value := range nextCtx.Keys {
+		c.Set(key, value)
+	}
+	c.Request = nextCtx.Request
+	*info = nextInfo
+	if info.Request != nil {
+		info.Request.SetModelName(route.ModelName)
+	}
+	relaycommon.SetRelayInfo(c, info)
+	if retryParam != nil {
+		retryParam.ModelName = route.ModelName
+	}
+	committed = true
+	if newStorage != nil && oldStorage != nil {
+		_ = oldStorage.Close()
+	}
+	return nil
+}
+
+// Raw pass-through paths read BodyStorage instead of Request. Replace only the
+// JSON model field with RawMessages so unknown fields and explicit zero values
+// survive. The caller owns the new storage until the staged route is committed.
+func rewriteAutoModelRequestBody(c *gin.Context, modelName string) (common.BodyStorage, common.BodyStorage, error) {
+	if c.Request == nil || c.Request.Body == nil {
+		return nil, nil, nil
+	}
+	contentType := strings.TrimSpace(strings.ToLower(strings.SplitN(c.Request.Header.Get("Content-Type"), ";", 2)[0]))
+	if contentType != "" && contentType != "application/json" && !strings.HasSuffix(contentType, "+json") {
+		return nil, nil, nil // Never parse multipart or form bodies as JSON.
+	}
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, err := storage.Bytes()
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(body) == 0 {
+		return storage, nil, nil // Bodyless protocols (e.g. WebSocket upgrade).
+	}
+	var fields map[string]json.RawMessage
+	if err = common.Unmarshal(body, &fields); err != nil {
+		return nil, nil, err
+	}
+	rawModel, ok := fields["model"]
+	if !ok {
+		return storage, nil, nil // e.g. Gemini models are carried in the URL.
+	}
+	var previousModel string
+	if common.Unmarshal(rawModel, &previousModel) == nil && previousModel == modelName {
+		return storage, nil, nil
+	}
+	fields["model"], err = common.Marshal(modelName)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, err = common.Marshal(fields)
+	if err != nil {
+		return nil, nil, err
+	}
+	replacement, err := common.CreateBodyStorage(body)
+	if err != nil {
+		return nil, nil, err
+	}
+	c.Set(common.KeyBodyStorage, replacement)
+	c.Set(common.KeyRequestBody, nil)
+	c.Set(gin.BodyBytesKey, body)
+	c.Request.Body = io.NopCloser(replacement)
+	c.Request.ContentLength = int64(len(body))
+	c.Request.Header.Del("Content-Length")
+	return storage, replacement, nil
 }
 
 // recordAutoModelFeedback captures this attempt now; flushing later must not read
@@ -713,10 +1064,6 @@ func flushAutoModelFeedback(c *gin.Context) {
 		}
 	}
 }
-
-// maxAutoModelHardSwitches auto 因为"候选服务不了"而换模型的上限（每次请求）。
-// 有上限才不会把一个请求放大成几十次上游调用。
-const maxAutoModelHardSwitches = 2
 
 // autoModelSwitchableError 判断错误是否属于"换一个候选模型很可能就行"的情况：
 // 上游不认这个模型（404）或不认这次请求的某个参数（400/422 等）。

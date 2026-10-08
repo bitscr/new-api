@@ -351,6 +351,11 @@ func UpdateOption(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"success": false, "message": "无效的 AutoModelCandidates JSON: " + err.Error()})
 			return
 		}
+	case "AutoModelWeights":
+		if err = operation_setting.ValidateAutoModelWeights(option.Value.(string)); err != nil {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": "无效的 AutoModelWeights JSON: " + err.Error()})
+			return
+		}
 	case "AutoModelEnabled":
 		if option.Value.(string) != "true" && option.Value.(string) != "false" {
 			c.JSON(http.StatusOK, gin.H{"success": false, "message": "AutoModelEnabled 必须是 true 或 false"})

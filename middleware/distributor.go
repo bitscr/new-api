@@ -63,19 +63,21 @@ func Distribute() func(c *gin.Context) {
 				// playground 请求支持 Group 覆盖，提前解析以确定候选分组
 				if strings.HasPrefix(c.Request.URL.Path, "/pg/chat/completions") {
 					playgroundRequest := &dto.PlayGroundRequest{}
-					if err := common.UnmarshalBodyReusable(c, playgroundRequest); err == nil {
-						if playgroundRequest.Group != "" &&
-							(service.GroupInUserUsableGroups(autoGroup, playgroundRequest.Group) || playgroundRequest.Group == autoGroup) {
-							autoGroup = playgroundRequest.Group
+					if err := common.UnmarshalBodyReusable(c, playgroundRequest); err != nil {
+						abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidPlayground, map[string]any{"Error": err.Error()}))
+						return
+					}
+					if playgroundRequest.Group != "" {
+						if !service.GroupInUserUsableGroups(autoGroup, playgroundRequest.Group) && playgroundRequest.Group != autoGroup {
+							abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorGroupAccessDenied))
+							return
 						}
+						autoGroup = playgroundRequest.Group
 					}
 				}
-				autoCandidates := service.GetAutoModelCandidatesForRequest(c, autoGroup)
-				if len(autoCandidates) == 0 {
-					// Distinguish missing routes from an otherwise available model
-					// set that the token cannot access. Only the rejection path
-					// needs this unrestricted lookup.
-					if common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled) && len(service.GetAutoModelCandidates(autoGroup)) > 0 {
+				routes, routeErr := service.BuildAutoModelRoutesForRequest(c, autoGroup)
+				if routeErr != nil {
+					if errors.Is(routeErr, service.ErrAutoModelNoAuthorizedCandidates) {
 						abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenNoModelAccess))
 						return
 					}
@@ -84,15 +86,17 @@ func Distribute() func(c *gin.Context) {
 						types.ErrorCodeModelNotFound)
 					return
 				}
-				autoCandidates = service.FilterAuthorizedAutoModelCandidates(c, autoCandidates)
-				if len(autoCandidates) == 0 {
-					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenNoModelAccess))
+				if len(routes) == 0 {
+					// Never reopen cooling routes, even when the token has no usable
+					// alternative. No route is preferable to dispatching a blocked one.
+					abortWithOpenAiMessage(c, http.StatusServiceUnavailable,
+						i18n.T(c, i18n.MsgDistributorAutoModelNoCandidates, map[string]any{"Group": autoGroup}),
+						types.ErrorCodeModelNotFound)
 					return
 				}
 				common.SetContextKey(c, constant.ContextKeyAutoModelClientName, modelRequest.Model)
-				common.SetContextKey(c, constant.ContextKeyAutoModelCandidates, autoCandidates)
-				common.SetContextKey(c, constant.ContextKeyAutoModelIndex, 0)
-				modelRequest.Model = autoCandidates[0]
+				service.SetAutoModelRoutePlan(c, routes)
+				modelRequest.Model = routes[0].ModelName
 			}
 
 			// Select a channel for the user
@@ -124,8 +128,11 @@ func Distribute() func(c *gin.Context) {
 				}
 				var selectGroup string
 				usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
-				// check path is /pg/chat/completions
-				if strings.HasPrefix(c.Request.URL.Path, "/pg/chat/completions") {
+				// Auto requests already validated the playground group before the
+				// plan activated a concrete group. Never authorize against that
+				// selected group's permissions or overwrite it with "auto" here.
+				if strings.HasPrefix(c.Request.URL.Path, "/pg/chat/completions") &&
+					common.GetContextKeyString(c, constant.ContextKeyAutoModelClientName) == "" {
 					playgroundRequest := &dto.PlayGroundRequest{}
 					err = common.UnmarshalBodyReusable(c, playgroundRequest)
 					if err != nil {
@@ -142,50 +149,54 @@ func Distribute() func(c *gin.Context) {
 					}
 				}
 
-				channel, selectGroup, err = selectInitialAuthorizedAutoChannel(c, modelRequest, func() (*model.Channel, string, error) {
-					var channel *model.Channel
-					var selectGroup string
-					if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelRequest.Model, usingGroup); found {
-						preferred, err := model.CacheGetChannel(preferredChannelID)
-						if err == nil && preferred != nil {
-							if preferred.Status != common.ChannelStatusEnabled {
-								if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
-									abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorChannelDisabled))
-									return nil, "", nil
-								}
-							} else if usingGroup == "auto" {
-								userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-								candidateGroups := service.GetRequestGroupCandidates(c, userGroup, usingGroup)
-								for i, g := range candidateGroups {
-									if model.IsChannelEnabledForGroupModel(g, modelRequest.Model, preferred.Id) &&
-									!service.ShouldAvoidAutoModelAffinity(c, g, modelRequest.Model, preferred.Id) {
-										selectGroup = g
-										common.SetContextKey(c, constant.ContextKeyAutoGroup, g)
-										common.SetContextKey(c, constant.ContextKeyAutoGroupIndex, i)
-										channel = preferred
-										service.MarkChannelAffinityUsed(c, g, preferred.Id)
-										break
+				if common.GetContextKeyString(c, constant.ContextKeyAutoModelClientName) != "" {
+					channel, selectGroup, err = selectInitialAutoRoute(c, modelRequest, func(route service.AutoModelRoute) (*model.Channel, error) {
+						return model.GetChannelById(route.ChannelID, true)
+					})
+				} else {
+					channel, selectGroup, err = func() (*model.Channel, string, error) {
+						var channel *model.Channel
+						var selectGroup string
+						if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelRequest.Model, usingGroup); found {
+							preferred, err := model.CacheGetChannel(preferredChannelID)
+							if err == nil && preferred != nil {
+								if preferred.Status != common.ChannelStatusEnabled {
+									if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
+										abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorChannelDisabled))
+										return nil, "", nil
 									}
+								} else if usingGroup == "auto" {
+									userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
+									candidateGroups := service.GetRequestGroupCandidates(c, userGroup, usingGroup)
+									for i, g := range candidateGroups {
+										if model.IsChannelEnabledForGroupModel(g, modelRequest.Model, preferred.Id) {
+											selectGroup = g
+											common.SetContextKey(c, constant.ContextKeyAutoGroup, g)
+											common.SetContextKey(c, constant.ContextKeyAutoGroupIndex, i)
+											channel = preferred
+											service.MarkChannelAffinityUsed(c, g, preferred.Id)
+											break
+										}
+									}
+								} else if model.IsChannelEnabledForGroupModel(usingGroup, modelRequest.Model, preferred.Id) {
+									channel = preferred
+									selectGroup = usingGroup
+									service.MarkChannelAffinityUsed(c, usingGroup, preferred.Id)
 								}
-							} else if model.IsChannelEnabledForGroupModel(usingGroup, modelRequest.Model, preferred.Id) &&
-							!service.ShouldAvoidAutoModelAffinity(c, usingGroup, modelRequest.Model, preferred.Id) {
-								channel = preferred
-								selectGroup = usingGroup
-								service.MarkChannelAffinityUsed(c, usingGroup, preferred.Id)
 							}
 						}
-					}
 
-					if channel == nil {
-						return service.CacheGetRandomSatisfiedChannel(&service.RetryParam{
-							Ctx:        c,
-							ModelName:  modelRequest.Model,
-							TokenGroup: usingGroup,
-							Retry:      common.GetPointer(0),
-						})
-					}
-					return channel, selectGroup, nil
-				})
+						if channel == nil {
+							return service.CacheGetRandomSatisfiedChannel(&service.RetryParam{
+								Ctx:        c,
+								ModelName:  modelRequest.Model,
+								TokenGroup: usingGroup,
+								Retry:      common.GetPointer(0),
+							})
+						}
+						return channel, selectGroup, nil
+					}()
+				}
 				if c.IsAborted() {
 					return
 				}
@@ -223,33 +234,41 @@ func Distribute() func(c *gin.Context) {
 	}
 }
 
-// selectInitialAuthorizedAutoChannel retries initial channel selection only for
-// hidden auto requests. Each candidate starts with the original selection state:
-// exhausted auto-group indexes and model-specific affinity metadata must not leak
-// into the next candidate. No upstream request has been made at this point.
-func selectInitialAuthorizedAutoChannel(c *gin.Context, request *ModelRequest, selectCandidate func() (*model.Channel, string, error)) (*model.Channel, string, error) {
-	if common.GetContextKeyString(c, constant.ContextKeyAutoModelClientName) == "" {
-		return selectCandidate()
+// selectInitialAutoRoute never reselects a channel for a preselected model.
+// The ordered plan already contains complete channel/model pairs; stale, denied,
+// limited or cooling pairs are skipped without reopening a lower-level selector.
+func selectInitialAutoRoute(c *gin.Context, request *ModelRequest, lookup func(service.AutoModelRoute) (*model.Channel, error)) (*model.Channel, string, error) {
+	routes := service.GetAutoModelRoutePlan(c)
+	start := service.GetAutoModelRouteIndex(c)
+	if start < 0 {
+		start = 0
 	}
-	value, _ := common.GetContextKey(c, constant.ContextKeyAutoModelCandidates)
-	candidates, _ := value.([]string)
-	baseline := c.Copy()
-	channel, group, err := selectCandidate()
-	for index := common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex) + 1; index < len(candidates); index++ {
-		if c.IsAborted() || (err == nil && channel != nil) || service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
-			break
+	var lastErr error
+	for index := start; index < len(routes); index++ {
+		if c.Request != nil && c.Request.Context().Err() != nil {
+			return nil, "", c.Request.Context().Err()
 		}
-		if !service.IsAutoModelCandidateAuthorized(c, candidates[index]) {
+		route := routes[index]
+		if !service.IsAutoModelCandidateAuthorized(c, route.ModelName) ||
+			service.GetAutoModelHardExcludedChannelIDs(c)[route.ChannelID] ||
+			service.GetAutoModelCoolingChannelIDs(route.Group, route.ModelName)[route.ChannelID] {
 			continue
 		}
-		// Selection is synchronous. Restore a fresh copy so later writes cannot
-		// mutate the baseline used by subsequent candidates.
-		c.Keys = baseline.Copy().Keys
-		common.SetContextKey(c, constant.ContextKeyAutoModelIndex, index)
-		request.Model = candidates[index]
-		channel, group, err = selectCandidate()
+		selected, err := lookup(route)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if selected == nil || selected.Id != route.ChannelID || selected.Status != common.ChannelStatusEnabled {
+			continue
+		}
+		if !service.ActivateAutoModelRoute(c, index) {
+			continue
+		}
+		request.Model = route.ModelName
+		return selected, route.Group, nil
 	}
-	return channel, group, err
+	return nil, "", lastErr
 }
 
 // getModelFromRequest 从请求中读取模型信息

@@ -23,12 +23,15 @@ func TestAutoModelChannelExclusions(t *testing.T) {
 	require.NotContains(t, hard, 1, "must not mutate caller exclusions")
 
 	allCooling := autoModelChannelExclusions(hard, map[int]bool{1: true, 2: true}, targets)
-	require.Equal(t, hard, allCooling, "all-cooling fallback retains hard exclusions")
+	require.Equal(t, map[int]bool{1: true, 2: true, 3: true}, allCooling, "all-cooling routes stay excluded")
 	hard[2] = true
-	fallback := autoModelChannelExclusions(hard, cooling, targets)
-	require.True(t, fallback[2], "fallback must never revive a hard-excluded channel")
-	require.False(t, fallback[1])
-	require.Equal(t, hard, autoModelChannelExclusions(hard, cooling, nil))
+	excluded = autoModelChannelExclusions(hard, cooling, targets)
+	require.True(t, excluded[2], "hard exclusions must never be relaxed")
+	require.True(t, excluded[1], "no healthy alternative must not bypass cooldown")
+	require.Equal(t, map[int]bool{1: true, 2: true, 3: true}, autoModelChannelExclusions(hard, cooling, nil),
+		"cooldown filtering must not require a healthy target snapshot")
+	require.Equal(t, map[int]bool{1: true}, autoModelChannelExclusions(nil, cooling, nil))
+	require.Empty(t, autoModelChannelExclusions(nil, nil, nil))
 }
 
 func TestAutoModelCoolingChannelIsSkippedInBothSelectors(t *testing.T) {

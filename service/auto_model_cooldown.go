@@ -310,7 +310,7 @@ func deleteAutoModelCooldownCache(key string) {
 
 // GetAutoModelCoolingChannelIDs 返回该 (分组, 模型) 当前仍在冷却的渠道集合。
 // 返回值是独立快照，可由调用方修改；不包含旧渠道级冷却或已过期记录。
-// 本函数仅提供过滤依据，全部渠道冷却时的兜底策略仍由选择器决定。
+// 选择器必须严格排除此集合；即使全部渠道冷却，也不能兜底重新尝试。
 func GetAutoModelCoolingChannelIDs(group, name string) map[int]bool {
 	cooling := make(map[int]bool)
 	group = strings.TrimSpace(group)
@@ -356,8 +356,8 @@ func autoModelCooldownActiveInSnapshot(group, name string, channelIDs []int, sna
 	return true
 }
 
-// excludeCoolingCandidates 丢掉所有渠道都在冷却中的候选。
-// 如果一个都不剩就原样返回：宁可再试一次，也不要让 auto 直接报"没有可用候选"。
+// excludeCoolingCandidates 严格丢掉所有渠道都在冷却中的候选。
+// 全部候选都在冷却时返回空；冷却到期前不允许兜底重试。
 func excludeCoolingCandidates(candidates []string, allCooling map[string]bool) []string {
 	kept := make([]string, 0, len(candidates))
 	for _, name := range candidates {
@@ -366,42 +366,37 @@ func excludeCoolingCandidates(candidates []string, allCooling map[string]bool) [
 		}
 		kept = append(kept, name)
 	}
-	if len(kept) == 0 {
-		return candidates
-	}
 	return kept
 }
 
-// excludeCoolingAutoModelCandidates 查询各候选的可用渠道，过滤掉整体都在冷却中的模型。
+// excludeCoolingAutoModelCandidates 只保留至少有一条未冷却启用路由的模型。
+// 单候选同样检查；全部冷却或路由快照不可用时不恢复任何候选。
 func excludeCoolingAutoModelCandidates(group string, candidates []string) []string {
-	if len(candidates) <= 1 {
+	if len(candidates) == 0 {
 		return candidates
 	}
-	channelIDs, err := model.GetGroupModelChannelIDs(group)
+	targets, err := model.GetAutoModelRoutingTargets(group)
 	if err != nil {
 		common.SysError("failed to load group model channels for auto cooldown: " + err.Error())
-		return candidates
+		return nil
 	}
 	snapshot := autoModelCooldownSnapshot()
 	now := time.Now()
-	allCooling := make(map[string]bool, len(candidates))
+	unavailable := make(map[string]bool, len(candidates))
 	dropped := make([]string, 0)
 	for _, name := range candidates {
-		ids := channelIDs[name]
-		if len(ids) == 0 {
-			continue
+		ids := make([]int, 0, len(targets[name]))
+		for _, target := range targets[name] {
+			ids = append(ids, target.ChannelID)
 		}
-		if autoModelCooldownActiveInSnapshot(group, name, ids, snapshot, now) {
-			allCooling[name] = true
+		if len(ids) == 0 || autoModelCooldownActiveInSnapshot(group, name, ids, snapshot, now) {
+			unavailable[name] = true
 			dropped = append(dropped, name)
 		}
 	}
 	if len(dropped) == 0 {
 		return candidates
 	}
-	filtered := excludeCoolingCandidates(candidates, allCooling)
-	if len(filtered) < len(candidates) {
-		common.SysLog(fmt.Sprintf("auto model: 冷却中跳过候选 %s", strings.Join(dropped, ", ")))
-	}
-	return filtered
+	common.SysLog(fmt.Sprintf("auto model: 冷却中或无可用路由，跳过候选 %s", strings.Join(dropped, ", ")))
+	return excludeCoolingCandidates(candidates, unavailable)
 }

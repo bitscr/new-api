@@ -142,7 +142,7 @@ func TestAutoModelCooldownExpiry(t *testing.T) {
 	require.Empty(t, cooldownRows(t), "过期记录应被清掉")
 }
 
-// 候选过滤：只剔除"所有渠道都在冷却"的模型；全部都被剔除时 fail-open。
+// 候选过滤：严格剔除"所有渠道都在冷却"的模型；全部被剔除时保持空。
 func TestExcludeCoolingCandidates(t *testing.T) {
 	candidates := []string{"model-a", "slow-model", "model-c"}
 
@@ -152,7 +152,8 @@ func TestExcludeCoolingCandidates(t *testing.T) {
 	require.Equal(t, candidates, excludeCoolingCandidates(candidates, map[string]bool{}), "没有冷却时原样返回")
 
 	allCooling := map[string]bool{"model-a": true, "slow-model": true, "model-c": true}
-	require.Equal(t, candidates, excludeCoolingCandidates(candidates, allCooling), "全部冷却时 fail-open")
+	require.Empty(t, excludeCoolingCandidates(candidates, allCooling), "全部冷却时不允许 fail-open")
+	require.Empty(t, excludeCoolingCandidates([]string{"slow-model"}, allCooling), "单候选也必须严格冷却")
 
 	require.Empty(t, excludeCoolingCandidates([]string{}, map[string]bool{}))
 }

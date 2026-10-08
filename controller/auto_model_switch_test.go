@@ -8,7 +8,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -37,33 +36,24 @@ func TestAutoModelSwitchableError(t *testing.T) {
 }
 
 func TestTrySwitchAutoModelSkipsUnauthorizedCandidates(t *testing.T) {
-	oldEnabled := operation_setting.AutoModelEnabled
-	operation_setting.AutoModelEnabled = true
-	t.Cleanup(func() { operation_setting.AutoModelEnabled = oldEnabled })
-	gin.SetMode(gin.TestMode)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	common.SetContextKey(c, constant.ContextKeyAutoModelClientName, "auto")
-	common.SetContextKey(c, constant.ContextKeyAutoModelCandidates, []string{"old", "denied", "allowed"})
-	common.SetContextKey(c, constant.ContextKeyAutoModelIndex, 0)
+	db := openAutoModelRouteControllerTestDB(t)
+	channel := createAutoModelRouteTestChannel(t, db, "default", "old", "denied", "allowed")
+	c, info, retry := newAutoModelRouteTestContext(t, "default", []service.AutoModelRoute{
+		{Group: "default", ModelName: "old", ChannelID: channel.Id},
+		{Group: "default", ModelName: "denied", ChannelID: channel.Id},
+		{Group: "default", ModelName: "allowed", ChannelID: channel.Id},
+	})
 	common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
 	common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"old": true, "allowed": true})
-	c.Set("original_model", "old")
+	bindInitialAutoModelRouteForTest(t, c, info)
 	c.Set("use_channel", []string{"9"})
-	info := &relaycommon.RelayInfo{
-		OriginModelName: "old",
-		ClientModelName: "old",
-		UsingGroup:     "default",
-		UserGroup:      "default",
-		UserSetting:    dto.UserSetting{AcceptUnsetRatioModel: true},
-	}
-	retry := &service.RetryParam{Ctx: c, ModelName: "old", Retry: common.GetPointer(1)}
 	require.True(t, trySwitchAutoModel(c, info, retry, 0, &types.TokenCountMeta{}))
 	require.Equal(t, "allowed", info.OriginModelName)
 	require.Equal(t, "allowed", info.ClientModelName)
 	require.Equal(t, "allowed", retry.ModelName)
 	require.Equal(t, "allowed", c.GetString("original_model"))
 	require.Equal(t, 2, common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex))
-	require.Empty(t, c.GetStringSlice("use_channel"))
+	require.Equal(t, []string{"9"}, c.GetStringSlice("use_channel"), "route switches must not erase channel history")
 }
 
 func TestTrySwitchAutoModelRejectsUnauthorizedOrInvalidSnapshotWithoutMutation(t *testing.T) {
@@ -73,16 +63,18 @@ func TestTrySwitchAutoModelRejectsUnauthorizedOrInvalidSnapshotWithoutMutation(t
 	for _, index := range []int{0, -1, 2} {
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())
 		common.SetContextKey(c, constant.ContextKeyAutoModelClientName, "auto")
-		common.SetContextKey(c, constant.ContextKeyAutoModelCandidates, []string{"old", "denied"})
+		service.SetAutoModelRoutePlan(c, []service.AutoModelRoute{
+			{Group: "default", ModelName: "old", ChannelID: 9},
+			{Group: "default", ModelName: "denied", ChannelID: 9},
+		})
 		common.SetContextKey(c, constant.ContextKeyAutoModelIndex, index)
 		common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
 		common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"old": true, "auto": true})
 		c.Set("original_model", "old")
 		c.Set("use_channel", []string{"9"})
-		info := &relaycommon.RelayInfo{OriginModelName: "old", ClientModelName: "old"}
+		info := &relaycommon.RelayInfo{OriginModelName: "old", ClientModelName: "old", TokenGroup: "default", UsingGroup: "default"}
 		retry := &service.RetryParam{Ctx: c, ModelName: "old", Retry: common.GetPointer(1)}
-		// nil meta would fail if the denied candidate reached model pricing.
-		require.False(t, trySwitchAutoModel(c, info, retry, 0, nil))
+		require.False(t, trySwitchAutoModel(c, info, retry, 0, &types.TokenCountMeta{}))
 		require.Equal(t, "old", info.OriginModelName)
 		require.Equal(t, "old", info.ClientModelName)
 		require.Equal(t, "old", retry.ModelName)

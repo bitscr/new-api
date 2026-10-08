@@ -4,63 +4,60 @@ import (
 	"errors"
 
 	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm/clause"
 )
 
-// AutoModelRoutingTarget is a scalar snapshot, never a mutable cached channel.
-// Weight is the relative selection weight: channel weight in memory, ability
-// weight + 10 in DB mode. An all-zero memory score band must be sampled uniformly.
-// Memory smoothing only multiplies nonzero weights, so does not change expectation.
+// AutoModelRoutingTarget is a caller-owned scalar snapshot of an enabled ability
+// on an existing, enabled channel, never a mutable cached Channel reference.
+// Priority is Channel.Priority (nil means zero), not Ability.Priority.
+// Weight is a CHANNEL selection weight, never a per-model selection weight:
+// it is Channel.Weight (nil means zero) in memory-cache mode and Channel.Weight
+// + 10 in DB mode to preserve the existing DB sampling smoothing. Ability.Weight
+// is deliberately ignored. An all-zero memory weight band is sampled uniformly;
+// model-selection weights are configured independently of this snapshot.
 type AutoModelRoutingTarget struct {
 	ChannelID int
 	Priority  int64
 	Weight    float64
 }
 
-// GetAutoModelRoutingTargets snapshots all enabled routes in one group without
-// per-channel queries. Memory and DB modes follow their respective selectors.
+// GetAutoModelRoutingTargets snapshots a group's enabled abilities joined to
+// existing, enabled channels in one batch query, with no per-channel queries.
+// Both cache modes query the database: the legacy channel cache is built from
+// Channel.Models/Group and does not preserve Ability.Enabled. Only the channel
+// weight smoothing differs between modes; eligibility and priorities do not.
+// The result has no guaranteed order and can be modified freely by the caller.
 func GetAutoModelRoutingTargets(group string) (map[string][]AutoModelRoutingTarget, error) {
-	result := make(map[string][]AutoModelRoutingTarget)
-	// Column names are initialised by chooseDB(); a caller that wires up its own
-	// DB (tests, embedded use) would otherwise build "WHERE  = ?" and get a SQL
-	// syntax error. Same guard as GetTokenByKey.
-	if commonGroupCol == "" {
-		initCol()
-	}
-	if common.MemoryCacheEnabled {
-		channelSyncLock.RLock()
-		defer channelSyncLock.RUnlock()
-		for name, ids := range group2model2channels[group] {
-			for _, id := range ids {
-				channel := channelsIDM[id]
-				if channel == nil || channel.Status != common.ChannelStatusEnabled {
-					continue
-				}
-				result[name] = append(result[name], AutoModelRoutingTarget{
-					ChannelID: id,
-					Priority:  channel.GetPriority(),
-					Weight:    float64(channel.GetWeight()),
-				})
-			}
-		}
-		return result, nil
-	}
 	if DB == nil {
 		return nil, errors.New("routing database is not initialized")
 	}
-	var abilities []Ability
-	if err := DB.Where(commonGroupCol+" = ? AND enabled = ?", group, true).Find(&abilities).Error; err != nil {
+	var rows []struct {
+		Model     string
+		ChannelID int
+		Priority  *int64
+		Weight    *uint
+	}
+	if err := DB.Table("abilities").
+		Select("abilities.model, channels.id AS channel_id, channels.priority, channels.weight").
+		Joins("INNER JOIN channels ON channels.id = abilities.channel_id").
+		Where(clause.Eq{Column: clause.Column{Table: "abilities", Name: "group"}, Value: group}).
+		Where("abilities.enabled = ? AND channels.status = ?", true, common.ChannelStatusEnabled).
+		Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	for _, ability := range abilities {
-		priority := int64(0)
-		if ability.Priority != nil {
-			priority = *ability.Priority
+	result := make(map[string][]AutoModelRoutingTarget)
+	for _, row := range rows {
+		target := AutoModelRoutingTarget{ChannelID: row.ChannelID}
+		if row.Priority != nil {
+			target.Priority = *row.Priority
 		}
-		result[ability.Model] = append(result[ability.Model], AutoModelRoutingTarget{
-			ChannelID: ability.ChannelId,
-			Priority:  priority,
-			Weight:    float64(ability.Weight) + 10,
-		})
+		if row.Weight != nil {
+			target.Weight = float64(*row.Weight)
+		}
+		if !common.MemoryCacheEnabled {
+			target.Weight += 10
+		}
+		result[row.Model] = append(result[row.Model], target)
 	}
 	return result, nil
 }

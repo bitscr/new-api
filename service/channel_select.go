@@ -9,7 +9,6 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 )
 
@@ -76,15 +75,24 @@ func GetChannelRPMLimitSkippedIDs(c *gin.Context) map[int]bool {
 // 收益：实测有一次请求对同一个渠道重试了 51 次、白等两分钟，最后客户端超时断开。
 const maxChannelAttemptsPerRequest = 2
 
-func GetChannelSelectionExcludedIDs(c *gin.Context) map[int]bool {
+// GetAutoModelHardExcludedChannelIDs returns a caller-owned snapshot of the
+// request's channel-wide daily-success and RPM exclusions only. Auto route plans
+// track attempts and cooldowns per (group, model, channel): use_channel's legacy
+// channel-wide attempt count must not exclude other models on the same channel.
+func GetAutoModelHardExcludedChannelIDs(c *gin.Context) map[int]bool {
 	excluded := GetChannelDailySuccessLimitSkippedIDs(c)
 	for id, skipped := range GetChannelRPMLimitSkippedIDs(c) {
 		if skipped {
 			excluded[id] = true
 		}
 	}
-	// 试满上限的渠道不再参与选择；如果该模型只剩这些渠道，选择会返回空，
-	// 由上层决定是换候选模型（auto）还是把真实的上游报错返回。
+	return excluded
+}
+
+func GetChannelSelectionExcludedIDs(c *gin.Context) map[int]bool {
+	excluded := GetAutoModelHardExcludedChannelIDs(c)
+	// Preserve the legacy channel-wide attempt cap for non-auto selection and
+	// its compatibility helpers. Auto route plans use the hard-only API above.
 	for id, count := range countChannelAttempts(c) {
 		if count >= maxChannelAttemptsPerRequest {
 			excluded[id] = true
@@ -139,17 +147,7 @@ func selectChannelWithUsedFallback(param *RetryParam, group string, modelName st
 	// 而不是纯权重随机——纯权重会一直给已知很慢的渠道派流量。
 	if scoreFn := autoModelChannelScoreFnForGroup(param.Ctx, group, modelName); scoreFn != nil {
 		cooling := GetAutoModelCoolingChannelIDs(group, modelName)
-		if len(cooling) > 0 {
-			targets, err := model.GetAutoModelRoutingTargets(group)
-			if err != nil {
-				return nil, err
-			}
-			modelTargets := targets[modelName]
-			if len(modelTargets) == 0 {
-				modelTargets = targets[ratio_setting.FormatMatchingModelName(modelName)]
-			}
-			hardExcluded = autoModelChannelExclusions(hardExcluded, cooling, modelTargets)
-		}
+		hardExcluded = autoModelChannelExclusions(hardExcluded, cooling, nil)
 		return model.ChooseSatisfiedChannelByScore(group, modelName, retry, hardExcluded, usedIDs, scoreFn, autoScoreTieEpsilon)
 	}
 	if len(used) == 0 {
@@ -158,20 +156,10 @@ func selectChannelWithUsedFallback(param *RetryParam, group string, modelName st
 	return model.GetRandomSatisfiedChannelWithUsedFallback(group, modelName, retry, hardExcluded, used)
 }
 
-// autoModelChannelExclusions excludes cooling routes before priority selection.
-// Preserve the existing availability-first policy only when every otherwise
-// eligible route is cooling; hard exclusions are never relaxed.
-func autoModelChannelExclusions(hardExcluded, cooling map[int]bool, targets []model.AutoModelRoutingTarget) map[int]bool {
-	hasHealthy := false
-	for _, target := range targets {
-		if !hardExcluded[target.ChannelID] && !cooling[target.ChannelID] {
-			hasHealthy = true
-			break
-		}
-	}
-	if !hasHealthy {
-		return hardExcluded
-	}
+// autoModelChannelExclusions always excludes cooling routes before priority
+// selection, including when every route is cooling or no target snapshot exists.
+// The legacy targets argument is retained for callers but cannot relax cooldowns.
+func autoModelChannelExclusions(hardExcluded, cooling map[int]bool, _ []model.AutoModelRoutingTarget) map[int]bool {
 	excluded := make(map[int]bool, len(hardExcluded)+len(cooling))
 	for id, blocked := range hardExcluded {
 		excluded[id] = blocked
@@ -185,7 +173,7 @@ func autoModelChannelExclusions(hardExcluded, cooling map[int]bool, targets []mo
 }
 
 // ShouldAvoidAutoModelAffinity keeps affinity from bypassing model/channel cooldown.
-// The normal selector decides whether all-cooling fallback is necessary.
+// Cooling routes stay excluded even when no healthy alternative exists.
 func ShouldAvoidAutoModelAffinity(c *gin.Context, group, modelName string, channelID int) bool {
 	return c != nil && common.GetContextKeyString(c, constant.ContextKeyAutoModelClientName) != "" &&
 		GetAutoModelCoolingChannelIDs(group, modelName)[channelID]

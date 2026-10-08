@@ -187,6 +187,7 @@ func InitOptionMap() {
 	common.OptionMap["AutomaticRetryStatusCodes"] = operation_setting.AutomaticRetryStatusCodesToString()
 	common.OptionMap["AutoModelEnabled"] = strconv.FormatBool(operation_setting.AutoModelEnabled)
 	common.OptionMap["AutoModelCandidates"] = operation_setting.AutoModelCandidatesToJSONString()
+	common.OptionMap["AutoModelWeights"] = operation_setting.AutoModelWeightsToJSONString()
 	common.OptionMap["ExposeRatioEnabled"] = strconv.FormatBool(ratio_setting.IsExposeRatioEnabled())
 
 	// 自动添加所有注册的模型配置
@@ -577,6 +578,8 @@ func updateOptionMap(key string, value string) (err error) {
 		operation_setting.AutoModelEnabled = value == "true"
 	case "AutoModelCandidates":
 		err = operation_setting.SetAutoModelCandidates(value)
+	case "AutoModelWeights":
+		err = operation_setting.SetAutoModelWeights(value)
 	case "StreamCacheQueueLength":
 		setting.StreamCacheQueueLength, _ = strconv.Atoi(value)
 	case "PayMethods":
