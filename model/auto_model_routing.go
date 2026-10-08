@@ -20,6 +20,12 @@ type AutoModelRoutingTarget struct {
 // per-channel queries. Memory and DB modes follow their respective selectors.
 func GetAutoModelRoutingTargets(group string) (map[string][]AutoModelRoutingTarget, error) {
 	result := make(map[string][]AutoModelRoutingTarget)
+	// Column names are initialised by chooseDB(); a caller that wires up its own
+	// DB (tests, embedded use) would otherwise build "WHERE  = ?" and get a SQL
+	// syntax error. Same guard as GetTokenByKey.
+	if commonGroupCol == "" {
+		initCol()
+	}
 	if common.MemoryCacheEnabled {
 		channelSyncLock.RLock()
 		defer channelSyncLock.RUnlock()

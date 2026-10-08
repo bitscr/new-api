@@ -94,7 +94,10 @@ func TestAutoModelRankingExcludesCoolingRouteEvidence(t *testing.T) {
 		autoModelHealthKey("g", "m", 1): {Until: now.Add(time.Minute)},
 	}
 	got := rankAutoModelCandidatesFromSnapshot("g", []string{"m", "fresh"}, targets, health, cooldowns, now)
-	require.Equal(t, []string{"fresh", "m"}, got)
+	// 先挑渠道再挑模型：渠道优先级是第一关键字。m 的 ch1（优先级 5）整体冷却被跳过，
+	// 但它剩下的可用渠道 ch2 优先级 1 仍高于 fresh 的 ch3（0），所以 m 排前。
+	// 冷却证据依然被排除（ch1 的满分不进 m 的期望值），只是排序口径跟着渠道优先级走。
+	require.Equal(t, []string{"m", "fresh"}, got)
 	// A sole authorized candidate remains eligible under all-cooling fallback.
 	cooldowns[autoModelHealthKey("g", "m", 2)] = autoModelCooldownState{Until: now.Add(time.Minute)}
 	got = rankAutoModelCandidatesFromSnapshot("g", []string{"m"}, targets, health, cooldowns, now)

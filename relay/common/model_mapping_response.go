@@ -84,6 +84,7 @@ func (w *relayResponseWriter) Write(data []byte) (int, error) {
 	if err == nil && n == len(rewritten) {
 		return len(data), nil
 	}
+	markClientDeliveryBroken(w.context)
 	return n, err
 }
 
@@ -94,7 +95,16 @@ func (w *relayResponseWriter) WriteString(data string) (int, error) {
 	if err == nil && n == len(rewritten) {
 		return len(data), nil
 	}
+	markClientDeliveryBroken(w.context)
 	return n, err
+}
+
+// markClientDeliveryBroken 只在真的没写完时记录：客户端提前断开是"这次交付被
+// 截断"的硬证据（见 answer_observation.go 的 ClientDeliveryBroken）。
+func markClientDeliveryBroken(c *gin.Context) {
+	if info := GetRelayInfo(c); info != nil {
+		info.MarkClientDeliveryBroken()
+	}
 }
 
 // observeClientAnswer 在响应写给客户端的必经之路记录正文观察，

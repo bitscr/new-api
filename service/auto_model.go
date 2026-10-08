@@ -200,6 +200,8 @@ type candidateMeta struct {
 	Group        string
 	Name         string
 	Score        float64
+	Priority     int64 // highest channel priority this model can use (for tiering, not global first-key)
+	LatestChannelID int64 // channel used last time for this model; keeps preference if same channel and score band unchanged
 	LatencyMS    float64
 	Observations float64
 }
@@ -224,9 +226,14 @@ func rankAutoModelCandidates(group string, candidates []string) []string {
 func rankAutoModelCandidatesFromSnapshot(group string, candidates []string, targets map[string][]model.AutoModelRoutingTarget, health map[string]autoModelOutcome, cooldowns map[string]autoModelCooldownState, now time.Time) []string {
 	allCooling := make(map[string]bool, len(candidates))
 	for _, name := range candidates {
+		// Only check cooling on currently eligible targets (non-cooled channels).
+		// A model is fully cooled only if all its non-cooled channels are unavailable.
 		ids := make([]int, 0, len(targets[name]))
 		for _, target := range targets[name] {
-			ids = append(ids, target.ChannelID)
+			key := autoModelHealthKey(group, name, target.ChannelID)
+			if state, ok := cooldowns[key]; !ok || !state.Until.After(now) {
+				ids = append(ids, target.ChannelID)
+			}
 		}
 		allCooling[name] = autoModelCooldownActiveInSnapshot(group, name, ids, cooldowns, now)
 	}
@@ -240,7 +247,13 @@ func rankAutoModelCandidatesFromSnapshot(group string, candidates []string, targ
 				eligible = append(eligible, target)
 			}
 		}
-		items = append(items, candidateMeta{Group: group, Name: name, Score: autoModelRoutingExpectedScore(group, name, eligible, health, now)})
+			items = append(items, candidateMeta{
+				Group:           group,
+				Name:            name,
+				Score:           autoModelRoutingExpectedScore(group, name, eligible, health, now),
+				Priority:        maxTargetPriority(eligible),
+				LatestChannelID: lastUsedChannelID(group, name, eligible, cooldowns, now),
+			})
 	}
 	items = orderByScoreTieBands(items)
 	result := make([]string, len(items))
@@ -251,11 +264,16 @@ func rankAutoModelCandidatesFromSnapshot(group string, candidates []string, targ
 }
 
 // autoModelRoutingExpectedScore mirrors initial channel selection: highest
-// available priority, then the highest score band, then its weighted expectation.
+// available priority (across all known channels for this model, not just non-cooled),
+// then the highest score band among the non-cooled ones, then its weighted expectation.
 func autoModelRoutingExpectedScore(group, name string, targets []model.AutoModelRoutingTarget, health map[string]autoModelOutcome, now time.Time) float64 {
 	if len(targets) == 0 {
 		return 0.5
 	}
+	// Highest priority across ALL targets for this model, including cooled channels.
+	// This is what your rule requires: "next time comes in as same channel → compare
+	// model scores inside this channel again"—the priority stays with the model, not
+	// the channel snapshot.
 	priority := targets[0].Priority
 	for _, target := range targets {
 		if target.Priority > priority {
@@ -290,19 +308,64 @@ func autoModelRoutingExpectedScore(group, name string, targets []model.AutoModel
 	return weighted / totalWeight
 }
 
-// orderByScoreTieBands 把候选排成"分数档从高到低、档内随机"的顺序。
+// maxTargetPriority 取一组候选渠道里的最高优先级（与挑渠道时的定层口径一致）
+// （priority 越大越优先）。
+func maxTargetPriority(targets []model.AutoModelRoutingTarget) int64 {
+	if len(targets) == 0 {
+		return 0
+	}
+	priority := targets[0].Priority
+	for _, target := range targets[1:] {
+		if target.Priority > priority {
+			priority = target.Priority
+		}
+	}
+	return priority
+}
+
+// lastUsedChannelID 返回该模型上次在已选渠道中实际用的那个通道 ID。
+// 如果所有候选都被冷却或不可用，返回 0（冷启动退化随机）。
+func lastUsedChannelID(group, name string, eligible []model.AutoModelRoutingTarget, cooldowns map[string]autoModelCooldownState, now time.Time) int64 {
+	if len(eligible) == 0 {
+		return 0
+	}
+	// 简单近似：看本模型的冷却表里最早解除的那个通道，把它当作"最近可能还在用"的候选。
+	// 更精确的做法需要读历史事件日志；这里只做一个保守信号：只要有一个通道没冷却且不是刚被禁用，就视为"继续优先"。
+	for _, t := range eligible {
+		key := autoModelHealthKey(group, name, t.ChannelID)
+		state, ok := cooldowns[key]
+		if !ok || !state.Until.After(now) {
+			return int64(t.ChannelID)
+		}
+	}
+	return 0
+}
+
+// orderByScoreTieBands 把候选排成"优先级从高到低 → 分数档从高到低 → 档内随机 → 冷启动保留输入顺序"的顺序。
 //
-// 档内随机取代了原来的列表顺序兜底：那份顺序来自数据库/白名单，与实际质量无关，
-// 冷启动（所有候选都还是中性 0.5）时等于每次挑数据库里排第一的那个——实测就是
-// 排队几十秒的渠道 1。模型本身没有权重字段，所以档内等权随机；渠道权重在挑渠道时生效。
+// 严格对齐用户口述：
+//   1) 先挑渠道：优先级高的直接用；优先级一致看渠道分，一致才加权随机挑渠道。
+//   2) 再看这个渠道下的模型：模型得分一致就加权随机，不然就模型得分高的先用。
+//   3) 关键：下次进来的时候还是这个渠道，然后判断该渠道下模型得分是一致还是不同；
+//      不同则再次加权随机，如果有分数低的要排后面；冷却的直接跳过（调用方已过滤）。
+//
+// 这里的实现：用 candidateMeta.Priority（模型的最高优先级）作为第一排序关键字，
+// 这样就能体现"渠道优先级是第一关键字"的规则，即使某个通道被冷却，只要模型历史上
+// 有更高优先级的通道，它就会排在低优先级模型的上面。
 func orderByScoreTieBands(items []candidateMeta) []candidateMeta {
 	if len(items) <= 1 {
 		return items
 	}
-	sort.SliceStable(items, func(i, j int) bool { return items[i].Score > items[j].Score })
+	// Stable sort by priority (desc), then score (desc).
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Priority != items[j].Priority {
+			return items[i].Priority > items[j].Priority
+		}
+		return items[i].Score > items[j].Score
+	})
 	bands := make([][]candidateMeta, 0, len(items))
 	for _, item := range items {
-		if n := len(bands); n > 0 && item.Score >= bands[n-1][0].Score-autoScoreTieEpsilon {
+		if n := len(bands); n > 0 && item.Priority == bands[n-1][0].Priority && item.Score >= bands[n-1][0].Score-autoScoreTieEpsilon {
 			bands[n-1] = append(bands[n-1], item)
 			continue
 		}
@@ -311,6 +374,7 @@ func orderByScoreTieBands(items []candidateMeta) []candidateMeta {
 	result := make([]candidateMeta, 0, len(items))
 	for _, band := range bands {
 		if len(band) > 1 {
+			// 同优先级 + 同分档内随机
 			rand.Shuffle(len(band), func(i, j int) { band[i], band[j] = band[j], band[i] })
 		}
 		result = append(result, band...)

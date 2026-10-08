@@ -291,7 +291,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.EndAttempt()
 
 		if newAPIError == nil {
-			if autoModelRequestContextError(c) != nil {
+			if autoModelClientAbandoned(c, relayInfo) {
 				// Some stream adaptors return nil on client disconnect. Do not
 				// classify a partial answer as healthy or as an upstream failure.
 				relayInfo.LastError = nil
@@ -310,7 +310,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			return
 		}
 		model.ReleaseChannelDailySuccess(reservation)
-		if canceledErr := autoModelCanceledRequestError(c, newAPIError); canceledErr != nil {
+		if canceledErr := autoModelCanceledRequestError(c, newAPIError); canceledErr != nil && autoModelClientAbandoned(c, relayInfo) {
 			// The client disappearing is not evidence against this upstream. Keep
 			// earlier real failures queued, but do not penalize or retry this attempt.
 			newAPIError = canceledErr
@@ -626,7 +626,7 @@ func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam 
 // recordAutoModelFeedback captures this attempt now; flushing later must not read
 // mutable RelayInfo fields belonging to another model/channel or a later attempt.
 func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, success bool) {
-	if !isAutoModelRequest(c) || info == nil || autoModelRequestContextError(c) != nil {
+	if !isAutoModelRequest(c) || info == nil || autoModelClientAbandoned(c, info) {
 		return
 	}
 	queueAutoModelFeedback(c, info, autoModelFeedback{
@@ -638,10 +638,27 @@ func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, succes
 
 // An unusable HTTP 200 is the final failure of this combination, not a success.
 func recordAutoModelUnusableAnswer(c *gin.Context, info *relaycommon.RelayInfo, reason string) {
-	if !isAutoModelRequest(c) || info == nil || autoModelRequestContextError(c) != nil {
+	if !isAutoModelRequest(c) || info == nil || autoModelClientAbandoned(c, info) {
 		return
 	}
 	queueAutoModelFeedback(c, info, autoModelFeedback{unusable: true, reason: reason})
+}
+
+// autoModelClientAbandoned 判断"客户端在拿到本次交付物之前就离开了"。
+//
+// 不能只看 c.Request.Context().Err()：客户端收完正文后正常关闭连接（curl、SDK、
+// 下位机都是收到完整响应立即断开）时 ctx 同样是 canceled，于是每个正常完成的请求
+// 都会被判成"客户端断开"，全部 auto 反馈被丢弃——分数不更新、慢成功的冷却不触发。
+// 所以以"写入没能完成"为主信号（ClientDeliveryBroken），ctx 取消只在一个字节都
+// 没写出去（客户端在等到任何内容前就断了）时才成立。
+func autoModelClientAbandoned(c *gin.Context, info *relaycommon.RelayInfo) bool {
+	if info != nil && info.ClientDeliveryBroken() {
+		return true
+	}
+	if autoModelRequestContextError(c) == nil {
+		return false
+	}
+	return c.Writer == nil || !c.Writer.Written()
 }
 
 type autoModelFeedbackKey struct {

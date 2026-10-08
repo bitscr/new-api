@@ -46,14 +46,42 @@ type answerChoiceBody struct {
 }
 
 type answerObservation struct {
-	mu            sync.Mutex
-	parsed        bool // 见过结构可识别的完成体（带 choices）
-	textSeen      bool // 横幅之外还有正文
-	bannerSeen    bool // 见过告警横幅
-	reasoningSeen bool // 见过思考内容
-	toolsSeen     bool // 见过工具调用
-	undecidable   bool // finish_reason=length/content_filter：不下结论
-	sample        string
+	mu             sync.Mutex
+	parsed         bool // 见过结构可识别的完成体（带 choices）
+	textSeen       bool // 横幅之外还有正文
+	bannerSeen     bool // 见过告警横幅
+	reasoningSeen  bool // 见过思考内容
+	toolsSeen      bool // 见过工具调用
+	undecidable    bool // finish_reason=length/content_filter：不下结论
+	deliveryBroken bool // 有一批字节没能写完：客户端在交付完成前断开
+	sample         string
+}
+
+// MarkClientDeliveryBroken 记录"有一批写给客户端的字节没能完整送达"。
+//
+// 这是判断客户端是否在拿到完整回答之前断开的唯一可靠信号。只看
+// c.Request.Context().Err() 会误判：客户端收完正文后正常关闭连接（curl、SDK、
+// 下位机都是收到完整响应立即断开）时 ctx 同样变成 canceled，于是"客户端已断开"
+// 永远为真，所有 auto 反馈都被丢弃：分数不再更新，慢成功也不再触发冷却。
+func (info *RelayInfo) MarkClientDeliveryBroken() {
+	if info == nil || info.answer == nil {
+		return
+	}
+	observation := info.answer
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	observation.deliveryBroken = true
+}
+
+// ClientDeliveryBroken 报告本次尝试的响应是否有字节没能写完。
+func (info *RelayInfo) ClientDeliveryBroken() bool {
+	if info == nil || info.answer == nil {
+		return false
+	}
+	observation := info.answer
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	return observation.deliveryBroken
 }
 
 // ObserveClientAnswer 观察一段即将写给客户端的数据（SSE 行或整包 JSON）。
