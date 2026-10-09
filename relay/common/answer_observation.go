@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	basecommon "github.com/QuantumNous/new-api/common"
 )
@@ -22,6 +24,13 @@ import (
 // 从写给客户端的响应体里判断这次到底有没有有效回答。
 const answerSampleLimit = 120
 
+// Retain only possible banner content, never an unbounded completion or a map
+// sized by an upstream choice index. Exceeding either limit is inconclusive.
+const (
+	answerChoiceLimit  = 16
+	answerContentLimit = 4096
+)
+
 // answerBannerPatterns 识别网关告警横幅。只有"整段正文只剩横幅"才算无效回答，
 // 所以规则宁可窄一点：横幅 + 其它正文 = 正常回答（模型可能只是在引用这句话）。
 //
@@ -31,8 +40,11 @@ var answerBannerPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?is)[\[【]\s*(?:gateway\s+)?(?:warning|warn)\b[^\]】]*[\]】]`),
 	regexp.MustCompile(`(?is)[\[【]\s*(?:gateway\s+)?(?:notice|alert)\b[^\]】]*[\]】]`),
 	regexp.MustCompile(`(?is)[\[【]\s*(?:网关)?(?:告警|警告)[^\]】]*[\]】]`),
+	regexp.MustCompile(`(?is)[\[【]\s*upstream\s+error\s*[:：][^\]】]*[\]】]`),
 	regexp.MustCompile(`(?is)^\s*(?:gateway\s+)?(?:warning|warn)\s*[:：][^\n]*`),
 	// 未闭合：从方括号一路到行尾/文本末尾，中间不能再出现闭合方括号
+	// An unfinished Upstream Error label and body must both exclude CR/LF.
+	regexp.MustCompile(`(?is)[\[【][ 	\f]*upstream[ 	\f]+error[ 	\f]*[:：][^\]】\r\n]*$`),
 	regexp.MustCompile(`(?is)[\[【]\s*(?:gateway\s+)?(?:warning|warn)\b[^\]】\n]*$`),
 	regexp.MustCompile(`(?is)[\[【]\s*(?:网关)?(?:告警|警告)\s*[:：]?[^\]】\n]*$`),
 }
@@ -47,17 +59,32 @@ type answerChoiceBody struct {
 	FunctionCall     json.RawMessage `json:"function_call"`
 }
 
+type answerChoiceObservation struct {
+	index      int
+	content    []byte
+	prefix     string
+	prefixDone bool
+}
+
+// A cheap incremental prefix gate, not the banner grammar. A completed prefix
+// only permits bounded retention; stripAnswerBanners makes the final decision.
+// Keep this a superset of the starts accepted by answerBannerPatterns.
+var answerBannerPrefixes = []string{
+	"[warn", "[gateway warn", "[notice", "[gateway notice", "[alert", "[gateway alert",
+	"[告警", "[警告", "[网关告警", "[网关警告", "[upstream error",
+	"warn", "gateway warn",
+}
+
 type answerObservation struct {
 	mu             sync.Mutex
 	parsed         bool // 见过结构可识别的完成体（带 choices）
 	protocolError  bool // 显式上游协议错误，即使已有部分正文也不能算成功
 	textSeen       bool // 横幅之外还有正文
-	bannerSeen     bool // 见过告警横幅
 	reasoningSeen  bool // 见过思考内容
 	toolsSeen      bool // 见过工具调用
-	undecidable    bool // finish_reason=length/content_filter：不下结论
+	undecidable    bool // 截断/过滤、选择索引不明或观察超限：不下结论
 	deliveryBroken bool // 有一批字节没能写完：客户端在交付完成前断开
-	sample         string
+	choices        []answerChoiceObservation
 }
 
 // MarkClientDeliveryBroken 记录"有一批写给客户端的字节没能完整送达"。
@@ -166,8 +193,21 @@ func (info *RelayInfo) ClientAnswerUnusable() (bool, string) {
 	if observation.textSeen || observation.reasoningSeen || observation.toolsSeen {
 		return false, ""
 	}
-	if observation.bannerSeen {
-		return true, "响应正文只是上游网关的告警横幅：" + observation.sample
+	// Only classify whole delivered choices here, never each delta in observe.
+	// A read during a partial label must not permanently mark it as real text.
+	sample := ""
+	for _, choice := range observation.choices {
+		text := string(choice.content)
+		visible, banners := stripAnswerBanners(text)
+		if strings.TrimSpace(visible) != "" {
+			return false, ""
+		}
+		if banners > 0 && sample == "" {
+			sample = truncateAnswerSample(strings.TrimSpace(text))
+		}
+	}
+	if sample != "" {
+		return true, "响应正文只是上游网关的告警横幅：" + sample
 	}
 	return true, "200 但响应正文为空（无正文/思考内容/工具调用）"
 }
@@ -178,6 +218,7 @@ func (observation *answerObservation) observe(payload []byte) {
 	}
 	var probe struct {
 		Choices []struct {
+			Index        json.RawMessage   `json:"index"`
 			Delta        *answerChoiceBody `json:"delta"`
 			Message      *answerChoiceBody `json:"message"`
 			FinishReason string            `json:"finish_reason"`
@@ -210,24 +251,105 @@ func (observation *answerObservation) observe(payload []byte) {
 		if strings.TrimSpace(body.ReasoningContent) != "" || rawHasValue(body.Reasoning) {
 			observation.reasoningSeen = true
 		}
-		text := flattenAnswerContent(body.Content)
-		if strings.TrimSpace(text) == "" {
+		if observation.textSeen || observation.reasoningSeen || observation.toolsSeen || observation.undecidable {
+			observation.choices = nil
 			continue
 		}
-		visible, banners := stripAnswerBanners(text)
-		if banners > 0 {
-			observation.bannerSeen = true
-			if observation.sample == "" {
-				observation.sample = truncateAnswerSample(strings.TrimSpace(text))
-			}
+		text := flattenAnswerContent(body.Content)
+		if text == "" {
+			continue
 		}
-		if strings.TrimSpace(visible) != "" {
-			observation.textSeen = true
-			if observation.sample == "" {
-				observation.sample = truncateAnswerSample(strings.TrimSpace(visible))
-			}
+		index := 0
+		missingIndex := len(choice.Index) == 0 || bytes.Equal(bytes.TrimSpace(choice.Index), []byte("null"))
+		if (missingIndex && len(probe.Choices) != 1) ||
+			(!missingIndex && (basecommon.Unmarshal(choice.Index, &index) != nil || index < 0)) {
+			// An ambiguous/malformed index cannot safely join any previous choice.
+			observation.undecidable = true
+			observation.choices = nil
+			continue
+		}
+		observation.observeContent(index, text)
+	}
+}
+
+// observeContent runs under observation.mu. Apart from a small label prefix,
+// fragments are only appended, so byte-at-a-time delivery does not repeatedly
+// regex-parse a growing answer. Ordinary prose drops all retained candidates.
+func (observation *answerObservation) observeContent(index int, text string) {
+	var choice *answerChoiceObservation
+	for i := range observation.choices {
+		if observation.choices[i].index == index {
+			choice = &observation.choices[i]
+			break
 		}
 	}
+	if choice == nil {
+		text = strings.TrimLeftFunc(text, unicode.IsSpace)
+		if text == "" {
+			return
+		}
+		if len(observation.choices) == answerChoiceLimit {
+			observation.undecidable = true
+			observation.choices = nil
+			return
+		}
+		if observation.choices == nil {
+			observation.choices = make([]answerChoiceObservation, 0, answerChoiceLimit)
+		}
+		observation.choices = append(observation.choices, answerChoiceObservation{index: index})
+		choice = &observation.choices[len(observation.choices)-1]
+	}
+	if !choice.acceptPrefix(text) {
+		observation.textSeen = true
+		observation.choices = nil
+		return
+	}
+	if len(text) > answerContentLimit-len(choice.content) {
+		// Never classify a truncated prefix as an error-only answer.
+		observation.undecidable = true
+		observation.choices = nil
+		return
+	}
+	if choice.content == nil {
+		choice.content = make([]byte, 0, answerContentLimit)
+	}
+	choice.content = append(choice.content, text...)
+}
+
+func (choice *answerChoiceObservation) acceptPrefix(text string) bool {
+	if choice.prefixDone {
+		return true
+	}
+	for _, r := range text {
+		if r == '【' && choice.prefix == "" {
+			r = '['
+		}
+		switch r {
+		case ' ', '	', '\n', '\r', '\f': // regexp's ASCII \s
+			if choice.prefix == "" || choice.prefix == "[" || strings.HasSuffix(choice.prefix, " ") {
+				continue
+			}
+			r = ' '
+		}
+		choice.prefix += string(r)
+		size := utf8.RuneCountInString(choice.prefix)
+		possible := false
+		for _, prefix := range answerBannerPrefixes {
+			runes := []rune(prefix)
+			if size <= len(runes) && strings.EqualFold(choice.prefix, string(runes[:size])) {
+				possible = true
+				if size == len(runes) {
+					choice.prefixDone = true
+					choice.prefix = ""
+					return true
+				}
+			}
+		}
+		if !possible {
+			return false
+		}
+	}
+	return true
 }
 
 // clientAnswerPayloads 从一段写给客户端的数据里取出可解析的 JSON 载荷。

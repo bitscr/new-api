@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -388,10 +389,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		recordAutoModelFeedback(c, relayInfo, false)
 
 		if autoRequest {
-			// Ordinary errors exclude only this (group, model, channel), not every
-			// other model on the channel. 400/404 switches spend the same budget
-			// as 5xx retries; there is no extra uncounted hard-switch allowance.
-			if shouldRetryAutoModelRoute(c, relayInfo, newAPIError, autoBudget.remainingRetries) &&
+			// Model-specific failures retain sibling-model fallback. Channel-scoped
+			// failures skip its remaining models for this request only. Both spend
+			// the same frozen budget and retain pair-only persistent feedback.
+			if prepareAutoModelRetry(c, relayInfo, newAPIError, autoBudget.remainingRetries) &&
 				trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
 				continue
 			}
@@ -665,12 +666,29 @@ func canRetryAutoModelRequest(c *gin.Context, info *relaycommon.RelayInfo) bool 
 		(c.Writer == nil || !c.Writer.Written()) && (info == nil || !info.ClientDeliveryBroken())
 }
 
-func shouldRetryAutoModelRoute(c *gin.Context, info *relaycommon.RelayInfo, err *types.NewAPIError, remaining int) bool {
+// prepareAutoModelRetry applies only a request-scoped channel exclusion. It must
+// run after every retry guard, before the existing route-plan advancement.
+func prepareAutoModelRetry(c *gin.Context, info *relaycommon.RelayInfo, err *types.NewAPIError, remaining int) bool {
 	if remaining <= 0 || !canRetryAutoModelRequest(c, info) || err == nil ||
-		types.IsSkipRetryError(err) || operation_setting.IsAlwaysSkipRetryCode(err.GetErrorCode()) {
+		types.IsSkipRetryError(err) || operation_setting.IsAlwaysSkipRetryCode(err.GetErrorCode()) ||
+		service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		return false
 	}
-	return shouldRetry(c, err, remaining) || autoModelSwitchableError(err)
+	if info == nil || (!info.HasUpstreamDispatch() && !types.IsChannelError(err)) {
+		return false // Local request rejection is not evidence to retry an upstream.
+	}
+	switch service.ClassifyAutoModelRetry(err) {
+	case service.AutoModelRetryNextModel:
+		return true
+	case service.AutoModelRetryNextChannel:
+		if info.ChannelMeta == nil || info.ChannelId <= 0 {
+			return false // Do not silently turn an unidentifiable channel into a model retry.
+		}
+		service.MarkAutoModelChannelFailed(c, info.ChannelId)
+		return true
+	default:
+		return false
+	}
 }
 
 const autoModelAttemptedRoutesKey = "auto_model_attempted_routes"
@@ -742,7 +760,10 @@ func getFixedAutoModelChannel(c *gin.Context, info *relaycommon.RelayInfo, route
 		if service.IsChannelRPMLimitSkipped(c, route.ChannelID) {
 			return nil, service.NewChannelRPMLimitError(service.ChannelRPMGroupLimitExceededMessage)
 		}
-		return nil, newChannelDailySuccessLimitError()
+		if service.GetChannelDailySuccessLimitSkippedIDs(c)[route.ChannelID] {
+			return nil, newChannelDailySuccessLimitError()
+		}
+		return nil, newAutoModelRouteError("auto model channel excluded after upstream failure")
 	}
 	value, _ := c.Get(autoModelAttemptedRoutesKey)
 	attempted, _ := value.(map[service.AutoModelRoute]bool)
@@ -978,7 +999,7 @@ func rewriteAutoModelRequestBody(c *gin.Context, modelName string) (common.BodyS
 // recordAutoModelFeedback captures this attempt now; flushing later must not read
 // mutable RelayInfo fields belonging to another model/channel or a later attempt.
 func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, success bool) {
-	if !isAutoModelRequest(c) || info == nil || autoModelClientAbandoned(c, info) {
+	if !isAutoModelRequest(c) || info == nil || !info.HasUpstreamDispatch() || autoModelClientAbandoned(c, info) {
 		return
 	}
 	queueAutoModelFeedback(c, info, autoModelFeedback{
@@ -990,7 +1011,7 @@ func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, succes
 
 // An unusable HTTP 200 is the final failure of this combination, not a success.
 func recordAutoModelUnusableAnswer(c *gin.Context, info *relaycommon.RelayInfo, reason string) {
-	if !isAutoModelRequest(c) || info == nil || autoModelClientAbandoned(c, info) {
+	if !isAutoModelRequest(c) || info == nil || !info.HasUpstreamDispatch() || autoModelClientAbandoned(c, info) {
 		return
 	}
 	queueAutoModelFeedback(c, info, autoModelFeedback{unusable: true, reason: reason})
@@ -1020,6 +1041,7 @@ type autoModelFeedbackKey struct {
 }
 
 type autoModelFeedback struct {
+	sequence  int // order of this key's last observation in the request
 	success   bool
 	latencyMS int64
 	elapsedMS int64 // cooldown signal: successful TTFB (or non-stream elapsed), failed elapsed
@@ -1040,8 +1062,12 @@ func queueAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, feedbac
 	if pending == nil {
 		pending = make(map[autoModelFeedbackKey]autoModelFeedback)
 	}
-	// Last attempt wins: many failed retries count once, and a later success is
-	// allowed to replace an earlier failure (including its stale latency).
+	// Last attempt wins, including its position: a replacement must be applied
+	// after observations of other models that happened before this attempt.
+	feedback.sequence = 1
+	for _, previous := range pending {
+		feedback.sequence = max(feedback.sequence, previous.sequence+1)
+	}
 	pending[key] = feedback
 	c.Set(autoModelFeedbackContextKey, pending)
 }
@@ -1057,27 +1083,24 @@ func takeAutoModelFeedback(c *gin.Context) map[autoModelFeedbackKey]autoModelFee
 }
 
 func flushAutoModelFeedback(c *gin.Context) {
-	for key, feedback := range takeAutoModelFeedback(c) {
+	pending := takeAutoModelFeedback(c)
+	keys := make([]autoModelFeedbackKey, 0, len(pending))
+	for key := range pending {
+		keys = append(keys, key)
+	}
+	// Channel EWMA spans model keys and is order-sensitive. Never feed it in
+	// map iteration order, even though each individual model is deduplicated.
+	sort.Slice(keys, func(i, j int) bool {
+		return pending[keys[i]].sequence < pending[keys[j]].sequence
+	})
+	for _, key := range keys {
+		feedback := pending[key]
 		if feedback.unusable {
 			service.RecordAutoModelUnusableAnswer(key.group, key.modelName, key.channelID, feedback.reason)
 		} else {
 			service.RecordAutoModelOutcome(key.group, key.modelName, key.channelID, feedback.success, feedback.latencyMS, feedback.elapsedMS)
 		}
 	}
-}
-
-// autoModelSwitchableError 判断错误是否属于"换一个候选模型很可能就行"的情况：
-// 上游不认这个模型（404）或不认这次请求的某个参数（400/422 等）。
-func autoModelSwitchableError(err *types.NewAPIError) bool {
-	if err == nil {
-		return false
-	}
-	switch err.StatusCode {
-	case http.StatusNotFound, http.StatusBadRequest, http.StatusUnprocessableEntity,
-		http.StatusNotImplemented, http.StatusMethodNotAllowed:
-		return true
-	}
-	return false
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {

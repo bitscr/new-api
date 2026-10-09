@@ -316,13 +316,19 @@ def run_case(binary, base, stub, cache, case, baseline):
     with stub.state_lock:
         calls = list(stub.calls[begin:])
     expected = ["probe-target"] + ["probe-ok" if case in BAD_CASES else "probe-target"] * 2
-    if case == "http_error":
-        expected.insert(1, "probe-ok")  # The first request can retry before any bytes were sent.
     failures = check_usage_logs(case, responses, error_logs, log_views)
     if [item["model"] for item in calls] != expected:
         failures.append("wrong route sequence, expected " + repr(expected))
-    if any(response["status"] != 200 for response in responses):
-        failures.append("fixture failed outside the HTTP-200 relay path")
+    expected_statuses = [400, 200, 200] if case == "http_error" else [200, 200, 200]
+    if [response["status"] for response in responses] != expected_statuses:
+        failures.append("unexpected client statuses, expected " + repr(expected_statuses))
+    if case == "http_error":
+        try:
+            rejection = json.loads(responses[0]["body"])
+            if rejection.get("error", {}).get("code") != "fixture_rejected":
+                failures.append("generic HTTP 400 lost its original upstream rejection")
+        except (ValueError, AttributeError):
+            failures.append("generic HTTP 400 did not return the original JSON error")
     for stage, observed in (("before_restart", before_restart), ("after_restart", cooldowns)):
         keys = [(row["group"], row["model"], row["channel_id"], row["level"]) for row in observed]
         wanted = [("default", "probe-target", 1, 1)] if case in BAD_CASES else []
@@ -336,13 +342,26 @@ def run_case(binary, base, stub, cache, case, baseline):
             failures.append("client lost the upstream error envelope")
         if case != "hidden_error" and errors and errors[0] != ERROR:
             failures.append("client error envelope was altered")
-    if baseline is not None and any(responses[0][key] != baseline["responses"][0][key]
-                                    for key in ("status", "body")):
-        failures.append("first client response changed from the recorded baseline")
+    intentional_change = (case == "http_error" and baseline is not None
+                          and baseline["responses"][0]["status"] == 200
+                          and responses[0]["status"] == 400)
+    if baseline is not None and not intentional_change:
+        current, previous = responses[0], baseline["responses"][0]
+        # HTTP error messages can contain the generated request ID. Keep the raw
+        # responses as evidence, ignoring only that known metadata in comparison.
+        def comparable(response):
+            body = response["body"]
+            request_id = response.get("request_id")
+            if request_id:
+                body = body.replace(request_id, "<request-id>")
+            return response["status"], body
+        if comparable(current) != comparable(previous):
+            failures.append("first client response changed from the recorded baseline")
     return {"case": case, "memory_cache": cache, "version": version, "assets": assets,
             "calls": calls, "responses": responses, "before_restart": before_restart,
             "cooldowns": cooldowns, "error_logs": error_logs, "log_views": log_views,
-            "failures": failures}
+            "failures": failures,
+            "intentional_baseline_change": "generic400_no_compatibility_fallback" if intentional_change else None}
 
 
 def main():

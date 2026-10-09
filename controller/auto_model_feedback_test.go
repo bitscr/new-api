@@ -28,6 +28,7 @@ func TestAutoModelFeedbackRetrySuccessReplacesFailure(t *testing.T) {
 		AttemptStartTime: start,
 		AttemptEndTime:   start.Add(40 * time.Second),
 	}
+	info.MarkUpstreamDispatch()
 	for i := 0; i < 51; i++ {
 		recordAutoModelFeedback(c, info, false)
 	}
@@ -62,6 +63,7 @@ func TestAutoModelFeedbackKeepsGroupModelAndChannelIndependent(t *testing.T) {
 		AttemptStartTime: start,
 		AttemptEndTime:   start.Add(30 * time.Second),
 	}
+	info.MarkUpstreamDispatch()
 	for i := 0; i < 51; i++ {
 		recordAutoModelFeedback(c, info, false)
 	}
@@ -91,6 +93,7 @@ func TestAutoModelFeedbackKeepsGroupModelAndChannelIndependent(t *testing.T) {
 func TestAutoModelFeedbackUnusableFinalAnswerReplacesFailure(t *testing.T) {
 	c := newAutoModelFeedbackTestContext()
 	info := &relaycommon.RelayInfo{UsingGroup: "default", OriginModelName: "model-a", ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 1}}
+	info.MarkUpstreamDispatch()
 	recordAutoModelFeedback(c, info, false)
 	recordAutoModelUnusableAnswer(c, info, "empty response")
 	pending := takeAutoModelFeedback(c)
@@ -103,8 +106,10 @@ func TestAutoModelFeedbackUnusableFinalAnswerReplacesFailure(t *testing.T) {
 
 func TestAutoModelFeedbackIgnoresNonAutoAndMissingInfo(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	recordAutoModelFeedback(c, &relaycommon.RelayInfo{}, true)
-	recordAutoModelUnusableAnswer(c, &relaycommon.RelayInfo{}, "empty")
+	info := &relaycommon.RelayInfo{}
+	info.MarkUpstreamDispatch()
+	recordAutoModelFeedback(c, info, true)
+	recordAutoModelUnusableAnswer(c, info, "empty")
 	require.Empty(t, takeAutoModelFeedback(c))
 	c = newAutoModelFeedbackTestContext()
 	recordAutoModelFeedback(c, nil, true)

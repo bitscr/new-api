@@ -78,6 +78,7 @@ func TestAutoModelCancellationDoesNotOverwritePriorFeedback(t *testing.T) {
 		AttemptStartTime: start,
 		AttemptEndTime:   start.Add(30 * time.Second),
 	}
+	info.MarkUpstreamDispatch()
 	recordAutoModelFeedback(c, info, false)
 	cancel()
 

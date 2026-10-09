@@ -29,6 +29,7 @@ func doChannelRPMGuardedRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 	if !result.Allowed {
 		return nil, service.NewChannelRPMLimitError("")
 	}
+	info.MarkUpstreamDispatch()
 	resp, err := request()
 	if isRealUpstreamRPM429(resp, err) {
 		service.RecordChannelRPM429(c.Request.Context(), info.ChannelId, info.ChannelSetting.RPMProtection)
@@ -72,6 +73,7 @@ func doChannelRPMGuardedTaskRequest(c *gin.Context, info *relaycommon.RelayInfo,
 	if !result.Allowed {
 		return nil, service.NewChannelRPMLimitError("")
 	}
+	info.MarkUpstreamDispatch()
 	resp, err := request()
 	if isRealUpstreamRPM429(resp, err) {
 		service.RecordChannelRPM429(c.Request.Context(), info.ChannelId, info.ChannelSetting.RPMProtection)

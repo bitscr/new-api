@@ -100,6 +100,7 @@ type RelayInfo struct {
 	AttemptStartTime         time.Time
 	AttemptFirstResponseTime time.Time
 	AttemptEndTime           time.Time
+	upstreamDispatch         bool
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool
@@ -728,7 +729,7 @@ func (info *RelayInfo) GetEstimatePromptTokens() int {
 	return info.estimatePromptTokens
 }
 
-// BeginAttempt starts an upstream attempt without resetting request-level log timing.
+// BeginAttempt starts a relay attempt without resetting request-level log timing.
 func (info *RelayInfo) BeginAttempt() {
 	if info == nil {
 		return
@@ -736,9 +737,24 @@ func (info *RelayInfo) BeginAttempt() {
 	info.AttemptStartTime = time.Now()
 	info.AttemptFirstResponseTime = time.Time{}
 	info.AttemptEndTime = time.Time{}
+	info.upstreamDispatch = false
 	if info.answer != nil {
 		info.answer = &answerObservation{}
 	}
+}
+
+// MarkUpstreamDispatch records entry into the upstream request callback, after
+// local validation and admission guards. It does not imply bytes were sent:
+// a failed connection attempt is still evidence about the selected upstream.
+func (info *RelayInfo) MarkUpstreamDispatch() {
+	if info != nil {
+		info.upstreamDispatch = true
+	}
+}
+
+// HasUpstreamDispatch reports whether this attempt entered upstream dispatch.
+func (info *RelayInfo) HasUpstreamDispatch() bool {
+	return info != nil && info.upstreamDispatch
 }
 
 // EndAttempt freezes elapsed time before controller error handling or later retries.

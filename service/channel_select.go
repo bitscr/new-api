@@ -14,6 +14,7 @@ import (
 
 const channelDailySuccessLimitSkippedIDsKey = "channel_daily_success_limit_skipped_ids"
 const channelRPMLimitSkippedIDsKey = "channel_rpm_limit_skipped_ids"
+const autoModelFailedChannelIDsKey = "auto_model_failed_channel_ids"
 
 type RetryParam struct {
 	Ctx                 *gin.Context
@@ -75,14 +76,29 @@ func GetChannelRPMLimitSkippedIDs(c *gin.Context) map[int]bool {
 // 收益：实测有一次请求对同一个渠道重试了 51 次、白等两分钟，最后客户端超时断开。
 const maxChannelAttemptsPerRequest = 2
 
-// GetAutoModelHardExcludedChannelIDs returns a caller-owned snapshot of the
-// request's channel-wide daily-success and RPM exclusions only. Auto route plans
-// track attempts and cooldowns per (group, model, channel): use_channel's legacy
-// channel-wide attempt count must not exclude other models on the same channel.
+// MarkAutoModelChannelFailed skips a channel only for this request. It does not
+// create a persistent channel cooldown or pretend a local quota/RPM limit fired.
+func MarkAutoModelChannelFailed(c *gin.Context, channelID int) {
+	if c == nil || channelID <= 0 {
+		return
+	}
+	skipped := getChannelSkippedIDs(c, autoModelFailedChannelIDsKey)
+	skipped[channelID] = true
+	c.Set(autoModelFailedChannelIDsKey, skipped)
+}
+
+// GetAutoModelHardExcludedChannelIDs returns a caller-owned snapshot of this
+// request's daily-success, RPM and upstream channel-failure exclusions. Ordinary
+// model failures and use_channel's legacy attempt count do not exclude a channel.
 func GetAutoModelHardExcludedChannelIDs(c *gin.Context) map[int]bool {
 	excluded := GetChannelDailySuccessLimitSkippedIDs(c)
 	for id, skipped := range GetChannelRPMLimitSkippedIDs(c) {
 		if skipped {
+			excluded[id] = true
+		}
+	}
+	for id, skipped := range getChannelSkippedIDs(c, autoModelFailedChannelIDsKey) {
+		if id > 0 && skipped {
 			excluded[id] = true
 		}
 	}

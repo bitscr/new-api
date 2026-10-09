@@ -45,6 +45,9 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
 	}
+	if err := relaycommon.ApplyAutoReasoningEffort(c, info, request); err != nil {
+		return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
 
 	includeUsage := true
 	// 判断用户是否需要返回使用情况
@@ -108,11 +111,10 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 				println("requestBody: ", string(debugBytes))
 			}
 		}
-		if upstreamBytes, bErr := storage.Bytes(); bErr == nil {
-			relaycommon.SetReasoningEffortFromRequest(info, upstreamBytes)
-			relaycommon.SetConversationUpstreamRequest(info, upstreamBytes)
+		requestBody, err = relaycommon.PrepareEffortPassthrough(c, info, storage)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
 		}
-		requestBody = common.ReaderOnly(storage)
 	} else {
 		convertedRequest, err := adaptor.ConvertOpenAIRequest(c, info, request)
 		if err != nil {

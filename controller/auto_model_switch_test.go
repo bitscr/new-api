@@ -16,23 +16,35 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// auto 遇到"这个渠道服务不了这个候选"的错误要换候选，而不是把 404/400 甩给客户端。
-func TestAutoModelSwitchableError(t *testing.T) {
-	require.True(t, autoModelSwitchableError(types.NewErrorWithStatusCode(
-		errors.New("model not supported"), types.ErrorCodeGetChannelFailed, http.StatusNotFound)))
-	require.True(t, autoModelSwitchableError(types.NewErrorWithStatusCode(
-		errors.New("response_format unavailable"), types.ErrorCodeGetChannelFailed, http.StatusBadRequest)))
-	require.True(t, autoModelSwitchableError(types.NewErrorWithStatusCode(
-		errors.New("unprocessable"), types.ErrorCodeGetChannelFailed, http.StatusUnprocessableEntity)))
-
-	// 这些不该触发换候选：服务端故障走正常重试，客户端问题不该放大成多次上游调用
-	require.False(t, autoModelSwitchableError(nil))
-	require.False(t, autoModelSwitchableError(types.NewErrorWithStatusCode(
-		errors.New("upstream 500"), types.ErrorCodeGetChannelFailed, http.StatusInternalServerError)))
-	require.False(t, autoModelSwitchableError(types.NewErrorWithStatusCode(
-		errors.New("rate limited"), types.ErrorCodeGetChannelFailed, http.StatusTooManyRequests)))
-	require.False(t, autoModelSwitchableError(types.NewErrorWithStatusCode(
-		errors.New("unauthorized"), types.ErrorCodeGetChannelFailed, http.StatusUnauthorized)))
+// Compatibility fallback needs model evidence, not just a 400/404/422 status.
+func TestAutoModelCompatibilityFallbackRequiresModelEvidence(t *testing.T) {
+	oldAuto := operation_setting.AutoModelEnabled
+	oldCodes := operation_setting.AutomaticRetryStatusCodesToString()
+	operation_setting.AutoModelEnabled = true
+	t.Cleanup(func() {
+		operation_setting.AutoModelEnabled = oldAuto
+		require.NoError(t, operation_setting.AutomaticRetryStatusCodesFromString(oldCodes))
+	})
+	require.NoError(t, operation_setting.AutomaticRetryStatusCodesFromString("429"))
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 7}}
+	info.MarkUpstreamDispatch()
+	for _, tc := range []struct {
+		status  int
+		message string
+		want    bool
+	}{
+		{http.StatusNotFound, "model not supported", true},
+		{http.StatusBadRequest, "response_format unavailable", false},
+		{http.StatusUnprocessableEntity, "unprocessable", false},
+		{http.StatusInternalServerError, "upstream 500", false},
+		{http.StatusTooManyRequests, "rate limited", true},
+		{http.StatusUnauthorized, "unauthorized", false},
+	} {
+		c := newAutoModelFeedbackTestContext()
+		err := types.NewErrorWithStatusCode(errors.New(tc.message), types.ErrorCodeGetChannelFailed, tc.status)
+		require.Equal(t, tc.want, prepareAutoModelRetry(c, info, err, 1), tc.message)
+	}
+	require.False(t, prepareAutoModelRetry(newAutoModelFeedbackTestContext(), info, nil, 1))
 }
 
 func TestTrySwitchAutoModelSkipsUnauthorizedCandidates(t *testing.T) {

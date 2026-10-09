@@ -80,7 +80,7 @@ func newAutoModelRouteTestContext(t *testing.T, group string, routes []service.A
 	info := &relaycommon.RelayInfo{
 		TokenGroup: group, UserGroup: group, UsingGroup: group,
 		RelayFormat: types.RelayFormatOpenAI,
-		Request: &dto.GeneralOpenAIRequest{Model: "auto"},
+		Request:     &dto.GeneralOpenAIRequest{Model: "auto"},
 		UserSetting: dto.UserSetting{AcceptUnsetRatioModel: true},
 	}
 	if len(routes) > 0 {
@@ -398,9 +398,9 @@ func TestAutoModelAttemptBudgetFreezesFirstDispatchOverride(t *testing.T) {
 	oldRetryTimes := common.RetryTimes
 	t.Cleanup(func() { common.RetryTimes = oldRetryTimes })
 	for _, tc := range []struct {
-		name string
-		global int
-		override *int
+		name         string
+		global       int
+		override     *int
 		wantAttempts int
 	}{
 		{name: "global", global: 3, wantAttempts: 4},
@@ -434,20 +434,21 @@ func TestAutoModelRetryStopsOnBudgetSkipResponseAndCancellation(t *testing.T) {
 	c := newAutoModelFeedbackTestContext()
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	info := &relaycommon.RelayInfo{}
+	info.MarkUpstreamDispatch()
 	upstream := types.NewErrorWithStatusCode(errors.New("model unsupported"), types.ErrorCodeGetChannelFailed, http.StatusNotFound)
-	require.True(t, shouldRetryAutoModelRoute(c, info, upstream, 1))
-	require.False(t, shouldRetryAutoModelRoute(c, info, upstream, 0), "404 must not acquire two uncounted hard switches")
-	require.False(t, shouldRetryAutoModelRoute(c, info, types.NewErrorWithStatusCode(errors.New("local validation"),
+	require.True(t, prepareAutoModelRetry(c, info, upstream, 1))
+	require.False(t, prepareAutoModelRetry(c, info, upstream, 0), "404 must not acquire two uncounted hard switches")
+	require.False(t, prepareAutoModelRetry(c, info, types.NewErrorWithStatusCode(errors.New("local validation"),
 		types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry()), 10))
 	channelErr := types.NewError(errors.New("channel error"), types.ErrorCodeChannelNoAvailableKey)
-	require.False(t, shouldRetryAutoModelRoute(c, info, channelErr, 0), "channel errors cannot bypass the total budget")
+	require.False(t, prepareAutoModelRetry(c, info, channelErr, 0), "channel errors cannot bypass the total budget")
 	_, err := c.Writer.Write([]byte("partial response"))
 	require.NoError(t, err)
-	require.False(t, shouldRetryAutoModelRoute(c, info, upstream, 10))
+	require.False(t, prepareAutoModelRetry(c, info, upstream, 10))
 	active := newAutoModelFeedbackTestContext()
 	ctx, cancel := context.WithCancel(context.Background())
 	active.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
 	cancel()
-	require.False(t, shouldRetryAutoModelRoute(active, info, upstream, 10))
+	require.False(t, prepareAutoModelRetry(active, info, upstream, 10))
 	require.Same(t, upstream, autoModelCanceledRequestError(active, upstream))
 }

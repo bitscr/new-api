@@ -121,3 +121,22 @@ func TestRelayInfoBeginAttemptResetsAnswerObservation(t *testing.T) {
 	unobserved.BeginAttempt()
 	require.Nil(t, unobserved.answer, "do not enable observation on manually constructed relay info")
 }
+
+func TestRelayInfoBeginAttemptResetsUpstreamDispatch(t *testing.T) {
+	var missing *RelayInfo
+	missing.MarkUpstreamDispatch()
+	require.False(t, missing.HasUpstreamDispatch())
+
+	info := &RelayInfo{}
+	require.False(t, info.HasUpstreamDispatch(), "zero-value info has not entered dispatch")
+	info.BeginAttempt()
+	require.False(t, info.HasUpstreamDispatch(), "starting local work is not dispatch")
+	info.MarkUpstreamDispatch()
+	info.MarkUpstreamDispatch()
+	info.EndAttempt()
+	require.True(t, info.HasUpstreamDispatch(), "dispatch remains observable through final feedback")
+	info.BeginAttempt()
+	require.False(t, info.HasUpstreamDispatch(), "a retry must not inherit the previous attempt's dispatch")
+	info.EndAttempt()
+	require.False(t, info.HasUpstreamDispatch(), "an undispatched attempt stays unobserved when ended")
+}
