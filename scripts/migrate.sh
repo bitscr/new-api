@@ -45,6 +45,46 @@ warn() { printf '\033[33m[new-api]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31m[new-api]\033[0m %s\n' "$*" >&2; exit 1; }
 step() { printf '\n\033[36m==> %s\033[0m\n' "$*"; }
 
+usage() {
+  cat <<'USAGE'
+new-api 数据迁移脚本（把已备份的数据库还原到本机）
+
+用途：换机器 / 重装后，把之前备份的 one-api.db 放回去并让服务带上原有数据，
+      不用重新配置渠道、令牌、用户和面板设置。
+
+用法：
+  sudo bash migrate.sh --db /path/to/one-api.db
+  sudo bash migrate.sh --db /path/to/one-api.db --dry-run
+
+通过 curl 管道运行（无需先下载）：
+  curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/migrate.sh \
+    | sudo bash -s -- --db /path/to/one-api.db
+
+可用参数（都会传给脚本本体，所以 curl 形式下用 `bash -s -- <参数>`）：
+  --db <path>        要还原的数据库文件（必填）
+  --dry-run          只检查并打印计划，不写入、不重启（可以安全地先跑一遍）
+  --force            目标已存在数据库时也覆盖（默认拒绝；覆盖前会自动备份）
+  --restart / --no-restart   还原后是否重启服务（默认重启）
+  -h, --help         显示本帮助
+
+可用环境变量（写在 sudo 后面，例如 sudo NEW_API_DIR=/data bash ...）：
+  NEW_API_DIR        数据目录（默认 /opt/new-api）
+  NEW_API_USER       运行用户（默认 newapi）
+  NEW_API_SERVICE    systemd 服务名（默认 new-api）
+  NEW_API_PORT       探活端口（默认从 unit 里读 --port，读不到用 3000）
+  NEW_API_DB_NAME    库文件名（默认 one-api.db）
+
+安全约定：
+  - 目标已有数据库时绝不静默覆盖：先备份成 <db>.bak-<时间戳>，再写入。
+  - 写入前会校验源文件是 SQLite 库，避免把 -wal、压缩包误当数据库。
+  - 写入前停止服务：SQLite 运行中写入会产生不一致快照。
+  - 还原后修正属主/权限并为目录补写权限：SQLite 的 journal 要在库所在目录创建文件，
+    属主或目录权限不对会以 "attempt to write a readonly database" 启动失败。
+
+Docker 部署不需要本脚本：直接把库放进挂载出来的数据目录即可（默认 ./new-api-data）。
+USAGE
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --db)         shift; [ $# -gt 0 ] || die "--db 需要一个文件路径"; DB_SRC="$1" ;;
@@ -52,7 +92,7 @@ while [ $# -gt 0 ]; do
     --force)      FORCE=1 ;;
     --restart)    DO_RESTART=1 ;;
     --no-restart) DO_RESTART=0 ;;
-    -h|--help)    sed -n '2,30p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help)    usage; exit 0 ;;
     *)            die "未知参数: $1（可用: --db <path> / --dry-run / --force / --restart / --no-restart / --help）" ;;
   esac
   shift

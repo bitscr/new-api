@@ -410,12 +410,65 @@ docker compose up -d
 
 ### 方式一：二进制部署 —— 用迁移脚本（推荐）
 
-```bash
-# 1. 先看一眼会发生什么（只检查，不做任何改动）
-curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/migrate.sh | sudo bash -s -- --db ~/one-api.db --dry-run
+**先把库从旧机器拷出来。** 一定要先停服务，否则可能拿到不一致的快照：
 
-# 2. 确认无误后执行
-curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/migrate.sh | sudo bash -s -- --db ~/one-api.db
+```bash
+# 在【旧机器】上执行
+sudo systemctl stop new-api
+sudo cp /opt/new-api/one-api.db ~/one-api.db
+sudo systemctl start new-api
+# 然后把这个文件传到新机器，例如:
+#   scp ~/one-api.db user@新机器:~/
+```
+
+**脚本不需要和 db 文件放在一起。** 你从哪里运行脚本都行，只要 `--db` 后面写的路径对。下面三种写法都可以：
+
+```bash
+# 1) 绝对路径(最省事,推荐)
+sudo bash migrate.sh --db /home/you/one-api.db
+
+# 2) 相对路径:相对你【当前所在目录】解析,不是相对脚本
+cd /srv/backup && sudo bash migrate.sh --db one-api.db
+
+# 3) 先 cd 到 db 所在目录,再只写文件名
+cd ~ && sudo bash migrate.sh --db one-api.db
+```
+
+**通过 curl 直接运行**（不用先下载脚本，注意 `bash -s --` 后面才是脚本的参数）：
+
+```bash
+# 第 1 步:先干跑看看(只检查,不写入、不重启)
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/migrate.sh \
+  | sudo bash -s -- --db ~/one-api.db --dry-run
+
+# 第 2 步:确认无误后执行
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/migrate.sh \
+  | sudo bash -s -- --db ~/one-api.db
+```
+
+`--dry-run` 会先把计划打出来，让你确认无误再动手。全新机器上的真实输出：
+
+```
+==> 校验源数据库
+[new-api] 文件头校验通过（5140480 字节）
+[new-api] 表结构校验通过（options/channels/users 均存在）
+
+==> 迁移计划
+  源数据库 : /root/one-api.db
+  目标位置 : /opt/new-api/one-api.db
+  数据目录 : /opt/new-api
+  运行用户 : newapi
+  服务名   : new-api
+  模式     : 仅检查（--dry-run）
+
+  结论 : 可以执行，未检测到冲突
+[new-api] 仅检查完成，未做任何改动
+```
+
+如果目标机器上**已经有**数据库，`--dry-run` 会改报：
+
+```
+  结论 : 会被拒绝（需要 --force）
 ```
 
 脚本会：校验传来的确实是 new-api 的库（不是 `-wal` 或压缩包）→ 停服务 → 备份现有库为 `one-api.db.bak-<时间戳>` → 还原 → 修正属主与权限 → 启动并探活 → 打印回滚命令。
@@ -423,6 +476,10 @@ curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/migrate
 - 目标已存在数据库时**默认拒绝覆盖**，避免误删线上数据；确认要覆盖加 `--force`
 - 有非空 `-wal` 时自动一起还原，并清除目标侧陈旧的 `-wal`
 - 支持 `NEW_API_DIR` / `NEW_API_USER` / `NEW_API_SERVICE` / `NEW_API_PORT` 覆盖默认值
+- `--help` 查看全部选项（curl 管道下也能用）
+
+> **关于 `~` 的坑**：`~/one-api.db` 是在你**当前 shell** 里先展开成 `/home/你的用户名/one-api.db` 再交给 sudo 的，所以一般没问题。但如果你用 `sudo -i` 或 `sudo sh -c "... ~/..."`，`~` 会变成 `/root`，文件就找不到了。不确定时用**绝对路径**最稳。
+
 
 <details>
 <summary>方式二：手动还原（等同于脚本做的事）</summary>
