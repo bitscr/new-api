@@ -13,7 +13,7 @@ on:
       platforms:
         description: "Target platforms"
         required: false
-        default: "linux/amd64,linux/arm64"
+        default: "linux/amd64,linux/arm64,linux/386,linux/arm/v7"
 
 jobs:
   prepare:
@@ -28,8 +28,7 @@ jobs:
       version: ${{ steps.vars.outputs.version }}
       matrix: ${{ steps.vars.outputs.matrix }}
       platforms: ${{ steps.vars.outputs.platforms }}
-      has_amd64: ${{ steps.vars.outputs.has_amd64 }}
-      has_arm64: ${{ steps.vars.outputs.has_arm64 }}
+      slugs: ${{ steps.vars.outputs.slugs }}
 
     steps:
       - name: Prepare image metadata
@@ -41,49 +40,61 @@ jobs:
           repo="${GITHUB_REPOSITORY,,}"
           image="ghcr.io/${repo}"
           version="custom-$(date +'%Y%m%d')-${GITHUB_SHA::7}"
-          requested_platforms="${REQUESTED_PLATFORMS:-linux/amd64,linux/arm64}"
+          requested_platforms="${REQUESTED_PLATFORMS:-linux/amd64,linux/arm64,linux/386,linux/arm/v7}"
           requested_platforms="${requested_platforms//[[:space:]]/}"
 
-          has_amd64=false
-          has_arm64=false
-
+          # platform -> {"arch": buildx arch/variant, "slug": tag suffix, "platform": buildx platform}
+          # 32-bit ARM stops at v7: the runtime base publishes arm/v5 and arm/v7 but no
+          # arm/v6, so a v6 request would fail in the final stage.
+          matrix_items=()
+          seen=()
+          platforms_out=()
           IFS=',' read -ra platforms <<< "$requested_platforms"
           for platform in "${platforms[@]}"; do
             case "$platform" in
               linux/amd64)
-                has_amd64=true
+                entry='{"arch":"amd64","slug":"amd64","platform":"linux/amd64"}'
                 ;;
               linux/arm64)
-                has_arm64=true
+                entry='{"arch":"arm64","slug":"arm64","platform":"linux/arm64"}'
+                ;;
+              linux/386)
+                entry='{"arch":"386","slug":"386","platform":"linux/386"}'
+                ;;
+              linux/arm/v7)
+                entry='{"arch":"armv7","slug":"armv7","platform":"linux/arm/v7"}'
                 ;;
               *)
-                echo "::error::Unsupported platform '$platform'. Supported platforms: linux/amd64, linux/arm64"
+                echo "::error::Unsupported platform '$platform'. Supported: linux/amd64, linux/arm64, linux/386, linux/arm/v7"
                 exit 1
                 ;;
             esac
+
+            # De-duplicate so a repeated platform cannot publish the same tag twice.
+            slug="$(echo "$entry" | sed -E 's/.*"slug":"([^"]+)".*/\1/')"
+            if [[ " ${seen[*]-} " == *" $slug "* ]]; then
+              continue
+            fi
+            seen+=("$slug")
+            matrix_items+=("$entry")
+            platforms_out+=("$platform")
           done
 
-          if [ "$has_amd64" = true ] && [ "$has_arm64" = true ]; then
-            matrix='{"include":[{"arch":"amd64","platform":"linux/amd64"},{"arch":"arm64","platform":"linux/arm64"}]}'
-            normalized_platforms="linux/amd64,linux/arm64"
-          elif [ "$has_amd64" = true ]; then
-            matrix='{"include":[{"arch":"amd64","platform":"linux/amd64"}]}'
-            normalized_platforms="linux/amd64"
-          elif [ "$has_arm64" = true ]; then
-            matrix='{"include":[{"arch":"arm64","platform":"linux/arm64"}]}'
-            normalized_platforms="linux/arm64"
-          else
+          if [ "${#matrix_items[@]}" -eq 0 ]; then
             echo "::error::At least one target platform is required"
             exit 1
           fi
+
+          matrix="{\"include\":[$(IFS=,; echo "${matrix_items[*]}")]}"
+          normalized_platforms="$(IFS=,; echo "${platforms_out[*]}")"
+          slugs="$(printf '%s\n' "${seen[@]}" | paste -sd, -)"
 
           {
             echo "image=$image"
             echo "version=$version"
             echo "matrix=$matrix"
             echo "platforms=$normalized_platforms"
-            echo "has_amd64=$has_amd64"
-            echo "has_arm64=$has_arm64"
+            echo "slugs=$slugs"
           } >> "$GITHUB_OUTPUT"
 
   build_single_arch:
@@ -111,31 +122,25 @@ jobs:
         id: tags
         shell: bash
         env:
-          ARCH: ${{ matrix.arch }}
+          SLUG: ${{ matrix.slug }}
           IMAGE: ${{ needs.prepare.outputs.image }}
           VERSION: ${{ needs.prepare.outputs.version }}
           REQUESTED_TAG: ${{ github.event.inputs.tag }}
         run: |
           {
             echo "value<<EOF"
-            echo "$IMAGE:latest-$ARCH"
-            echo "$IMAGE:$VERSION-$ARCH"
+            echo "$IMAGE:latest-$SLUG"
+            echo "$IMAGE:$VERSION-$SLUG"
             if [ -n "$REQUESTED_TAG" ] && [ "$REQUESTED_TAG" != "latest" ]; then
-              echo "$IMAGE:$REQUESTED_TAG-$ARCH"
-            fi
-
-            if [ "$ARCH" = "amd64" ]; then
-              echo "$IMAGE:latest"
-              echo "$IMAGE:$VERSION"
-              if [ -n "$REQUESTED_TAG" ] && [ "$REQUESTED_TAG" != "latest" ]; then
-                echo "$IMAGE:$REQUESTED_TAG"
-              fi
+              echo "$IMAGE:$REQUESTED_TAG-$SLUG"
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # The build stages cross-compile on the amd64 runner, but the final stage is the
+      # target base image and runs apt-get there, so every non-amd64 target needs QEMU.
       - name: Set up QEMU
-        if: matrix.arch == 'arm64'
+        if: matrix.platform != 'linux/amd64'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
@@ -155,8 +160,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ steps.tags.outputs.value }}
-          cache-from: type=gha,scope=ghcr-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=ghcr-${{ matrix.arch }}
+          cache-from: type=gha,scope=ghcr-${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=ghcr-${{ matrix.slug }}
           provenance: false
           sbom: false
 
@@ -194,19 +199,16 @@ jobs:
       - name: Create and push manifests
         shell: bash
         env:
-          HAS_AMD64: ${{ needs.prepare.outputs.has_amd64 }}
-          HAS_ARM64: ${{ needs.prepare.outputs.has_arm64 }}
+          SLUGS: ${{ needs.prepare.outputs.slugs }}
           IMAGE: ${{ needs.prepare.outputs.image }}
           VERSION: ${{ needs.prepare.outputs.version }}
           REQUESTED_TAG: ${{ github.event.inputs.tag }}
         run: |
           sources=()
-          if [ "$HAS_AMD64" = "true" ]; then
-            sources+=("$IMAGE:$VERSION-amd64")
-          fi
-          if [ "$HAS_ARM64" = "true" ]; then
-            sources+=("$IMAGE:$VERSION-arm64")
-          fi
+          IFS=',' read -ra slugs <<< "$SLUGS"
+          for slug in "${slugs[@]}"; do
+            sources+=("$IMAGE:$VERSION-$slug")
+          done
 
           publish_manifest() {
             local tag="$1"
