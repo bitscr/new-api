@@ -47,7 +47,7 @@ Docker 镜像、源码编译、配置与部署教程见下文。
 | 方式 | 适用场景 | 状态 |
 | --- | --- | --- |
 | **二进制 + systemd** | 最轻量，无 Docker 环境 | ✅ 推荐 |
-| **Docker / Compose** | 容器化环境 | ⚠️ 镜像暂不可用（见下） |
+| **Docker / Compose** | 容器化环境 | ✅ 多架构镜像（amd64 / arm64 / 386 / armv7） |
 | **源码编译** | 需要定制修改 | ✅ 可用 |
 
 ---
@@ -164,10 +164,10 @@ sudo systemctl status new-api
 
 ## 方式二：Docker 部署
 
-> ⚠️ **镜像暂不可用**：GHCR 发布流水线目前构建失败（push 阶段被拒），`ghcr.io/bitscr/new-api` 尚无可用镜像。修复后会更新本节；当前请使用方式一或方式三。
+镜像发布在 GitHub Container Registry：`ghcr.io/bitscr/new-api`，支持 **amd64 / arm64 / 386 / armv7**（`latest` 是多架构清单，Docker 会按本机架构自动选择）。
 
 <details>
-<summary>Docker 命令（待镜像可用后生效）</summary>
+<summary>Docker 命令</summary>
 
 ### 1. 拉取镜像并运行（默认 SQLite）
 
@@ -179,13 +179,15 @@ docker run -d \
   --restart always \
   -p 3000:3000 \
   -v ./new-api-data:/data \
-  -v ./new-api-logs:/app/logs \
+  -v ./new-api-logs:/data/logs \
   ghcr.io/bitscr/new-api:latest
 ```
 
-- 数据目录：容器内 `/data`（SQLite 数据库文件默认存放在此）
-- 日志目录：容器内 `/app/logs`
+- 数据目录：容器内 `/data`（SQLite 数据库文件 `one-api.db` 就存放在这里）
+- 日志目录：容器内 **`/data/logs`**
 - 默认端口：`3000`
+
+> **日志路径注意**：镜像的工作目录是 `/data`，且默认 `--log-dir` 是相对路径 `./logs`，所以日志落在 **`/data/logs`**。想改到别处，显式传参数：`docker run ... ghcr.io/bitscr/new-api:latest --log-dir /app/logs`（此时才该挂 `/app/logs`）。
 
 ### 2. 初始化
 
@@ -392,7 +394,92 @@ docker compose up -d
 - SQLite（Docker）：备份挂载出来的数据目录（默认 `/data` 或 `./new-api-data`）
 - PostgreSQL / MySQL：使用对应 `pg_dump` / `mysqldump` 备份
 - 配置：二进制部署的 `/opt/new-api/env`、Docker 的 `.env` 与 compose 文件
-- 日志：备份 `/opt/new-api/logs` 或 `/app/logs` 目录
+- 日志：备份 `/opt/new-api/logs` 或容器内 `/data/logs` 目录
+
+> **备份前先停服务**：SQLite 在运行中写入，热拷贝可能拿到不一致的快照。
+> `sudo systemctl stop new-api && sudo cp /opt/new-api/one-api.db ~/ && sudo systemctl start new-api`
+> 若目录下存在非空的 `one-api.db-wal`，必须连它一起备份，否则会丢最近的事务。
+
+---
+
+## 数据迁移（换机器 / 重装后还原）
+
+数据全在**一个数据库文件**里：渠道、密钥、用户、令牌、计费配置、面板设置、日志都在库中，前端资源已编进二进制（`go:embed`）。所以只要保住那个库文件，就能完整还原，不用重新配置。
+
+> 文件名是 **`one-api.db`**（沿用历史命名，不是 `new-api.db`）。二进制部署在 `/opt/new-api/one-api.db`，Docker 部署在挂载出来的数据目录里（默认 `/data/one-api.db`）。
+
+### 方式一：二进制部署 —— 用迁移脚本（推荐）
+
+```bash
+# 1. 先看一眼会发生什么（只检查，不做任何改动）
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/migrate.sh | sudo bash -s -- --db ~/one-api.db --dry-run
+
+# 2. 确认无误后执行
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/migrate.sh | sudo bash -s -- --db ~/one-api.db
+```
+
+脚本会：校验传来的确实是 new-api 的库（不是 `-wal` 或压缩包）→ 停服务 → 备份现有库为 `one-api.db.bak-<时间戳>` → 还原 → 修正属主与权限 → 启动并探活 → 打印回滚命令。
+
+- 目标已存在数据库时**默认拒绝覆盖**，避免误删线上数据；确认要覆盖加 `--force`
+- 有非空 `-wal` 时自动一起还原，并清除目标侧陈旧的 `-wal`
+- 支持 `NEW_API_DIR` / `NEW_API_USER` / `NEW_API_SERVICE` / `NEW_API_PORT` 覆盖默认值
+
+<details>
+<summary>方式二：手动还原（等同于脚本做的事）</summary>
+
+```bash
+# 1. 停服务（必须:SQLite 运行中写入会产生不一致快照）
+sudo systemctl stop new-api
+
+# 2. 备份现有库
+sudo cp -a /opt/new-api/one-api.db /opt/new-api/one-api.db.bak-$(date +%Y%m%d%H%M%S)
+# 有非空 -wal 的话连它一起处理
+sudo rm -f /opt/new-api/one-api.db-wal /opt/new-api/one-api.db-shm
+
+# 3. 放入备份的库
+sudo cp -f ~/one-api.db /opt/new-api/one-api.db
+
+# 4. 关键:修正属主与权限(否则启动失败 attempt to write a readonly database)
+sudo chown newapi:newapi /opt/new-api/one-api.db
+sudo chmod 644 /opt/new-api/one-api.db
+sudo chown newapi:newapi /opt/new-api          # 目录必须可写(journal 要在目录内建文件)
+
+# 5. 启动并验证
+sudo systemctl start new-api
+curl -s http://127.0.0.1:3000/api/status
+```
+
+**这一步最容易踩坑。** 实测:库属主为 `root` 时服务启动立刻失败（`attempt to write a readonly database`）——因为程序以 `newapi` 用户运行，需要能写库、并在库所在目录创建 journal 文件。
+
+</details>
+
+### 方式三：Docker 部署 —— 把库放进挂载目录
+
+Docker 路径不需要额外脚本，**全自动**：
+
+```bash
+# 1. 停掉容器
+docker stop new-api
+
+# 2. 把库放进挂载出来的数据目录
+cp ~/one-api.db ./new-api-data/one-api.db
+
+# 3. 重新启动
+docker start new-api
+```
+
+容器内以 root 运行，没有属主问题。数据目录是 `/data`，库文件名 `one-api.db`。
+
+### 迁移时不必带的东西
+
+- **`SESSION_SECRET` 不需要带。** 它只用于 session cookie 签名，不参与数据加密；日志会显示它每次启动随机生成，属正常。实测带上与不带，原有 API 密钥鉴权都正常通过。
+- **`logs/`、`data/`、`web/` 目录**：不承载数据（`web/` 为空，前端内嵌在二进制里）。
+- **被覆盖掉的只有 `/opt/new-api/env` 里的 `env`-only 配置**（例如 `ERROR_LOG_ENABLED`）。这些不在数据库里，换机器后需要照原样填一次；面板里能配的选项都在库中，会随库还原。
+
+### 环境变量 vs 数据库里
+
+- **跟着库走（自动还原）**：所有面板可配项 —— 渠道、令牌、用户、分组、模型倍率、计费表达式、重试次数、系统名称等。
+- **需要在新机器上重新提供**：`/opt/new-api/env` 里的 `env`-only 开关（如 `ERROR_LOG_ENABLED`、`STREAMING_TIMEOUT`、`MAX_REQUEST_BODY_MB`）、`SQL_DSN`（用外部数据库时）、`REDIS_CONN_STRING`，以及 systemd unit 里的 `--port`。
 
 ---
 

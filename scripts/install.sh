@@ -61,12 +61,15 @@ if [ -z "$ARCH" ]; then
   case "$(uname -m)" in
     x86_64|amd64)   ARCH="amd64" ;;
     aarch64|arm64)  ARCH="arm64" ;;
-    *) die "不支持的架构 $(uname -m)，只提供 amd64 / arm64 构建。可用 NEW_API_ARCH 强制指定。" ;;
+    *) die "不支持的架构 $(uname -m)。本脚本安装的是 Release 二进制，只提供 amd64 / arm64。
+  32 位设备（i386 / armv7）请改用 Docker 镜像，它支持 amd64 / arm64 / 386 / armv7。
+  也可以用 NEW_API_ARCH 强制指定。详见 README 的「方式二：Docker 部署」。" ;;
   esac
 fi
 case "$ARCH" in
   amd64|arm64) ;;
-  *) die "NEW_API_ARCH 只能是 amd64 或 arm64（当前: $ARCH）" ;;
+  *) die "NEW_API_ARCH 只能是 amd64 或 arm64（当前: $ARCH）。
+  Release 二进制没有 386 / armv7 产物；这些架构请用 Docker 镜像。" ;;
 esac
 
 # 已装过时，端口默认沿用 unit 里已有的 --port
