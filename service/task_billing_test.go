@@ -45,6 +45,7 @@ func TestMain(m *testing.M) {
 		&model.TopUp{},
 		&model.UserSubscription{},
 		&model.AutoModelCooldown{},
+		&model.AutoModelScore{},
 	); err != nil {
 		panic("failed to migrate: " + err.Error())
 	}

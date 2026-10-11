@@ -8,16 +8,20 @@ Usage (from the repository root, with permission to create a network namespace):
 """
 
 import argparse
+from contextlib import ExitStack
 import hashlib
 import http.server
+import importlib.util
 import json
 import os
 import pathlib
 import re
 import secrets
+import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -26,6 +30,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+
+_NAMESPACE_SPEC = importlib.util.spec_from_file_location(
+    'fixture_namespace', pathlib.Path(__file__).with_name('fixture_namespace.py'))
+assert _NAMESPACE_SPEC is not None and _NAMESPACE_SPEC.loader is not None
+fixture_namespace = importlib.util.module_from_spec(_NAMESPACE_SPEC)
+_NAMESPACE_SPEC.loader.exec_module(fixture_namespace)
 
 CASES = (
     "normal", "direct_banner", "error_envelope", "hidden_error",
@@ -66,6 +76,7 @@ def fixture_chunk(case, model):
 
 class FixtureServer(http.server.ThreadingHTTPServer):
     def __init__(self, address):
+        fixture_namespace.require_namespace()
         self.state_lock = threading.Lock()
         self.case = ""
         self.calls = []
@@ -121,16 +132,14 @@ def stop(process, log):
     log.close()
 
 
-def start(binary, root, port, cache):
-    if {name for _, name in socket.if_nameindex()} != {"lo"}:
-        raise RuntimeError(
-            "Unsafe bootstrap: an isolated network namespace containing only lo is required; "
-            "run with unshare --net and 'ip link set dev lo up' (see module docstring)."
-        )
+def start(binary, root, port, cache, extra_env=None):
+    fixture_namespace.require_namespace()
     env = {key: os.environ[key] for key in ("PATH", "HOME", "LANG", "TMPDIR") if key in os.environ}
     env.update({"SQLITE_PATH": str(root / "one-api.db"), "GIN_MODE": "release",
                 "MEMORY_CACHE_ENABLED": cache, "SESSION_SECRET": secrets.token_hex(32),
                 "ERROR_LOG_ENABLED": "true"})
+    if extra_env:
+        env.update(extra_env)
     log = (root / ("process-" + str(time.time_ns()) + ".log")).open("wb")
     try:
         process = subprocess.Popen([str(binary), "--port", str(port), "--log-dir", str(root / "logs")],
@@ -202,7 +211,7 @@ def ask(root, port, token, index):
 def rows(root):
     with sqlite3.connect("file:" + str(root / "one-api.db") + "?mode=ro", uri=True) as conn:
         conn.row_factory = sqlite3.Row
-        return [dict(row) for row in conn.execute('SELECT "group",model,channel_id,level,reason FROM auto_model_cooldowns ORDER BY id')]
+        return [dict(row) for row in conn.execute('SELECT "group",model,channel_id,level,reason,permanent,until FROM auto_model_cooldowns ORDER BY id')]
 
 
 def usage_error_rows(root):
@@ -364,7 +373,7 @@ def run_case(binary, base, stub, cache, case, baseline):
             "intentional_baseline_change": "generic400_no_compatibility_fallback" if intentional_change else None}
 
 
-def main():
+def run():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=pathlib.Path)
     parser.add_argument("--cache", choices=("false", "true", "both"), default="both")
@@ -372,20 +381,34 @@ def main():
     parser.add_argument("--baseline-results", type=pathlib.Path,
                         help="also assert unchanged first-response bytes against a prior run")
     args = parser.parse_args()
-    binary = args.binary.resolve(strict=True)
-    base = pathlib.Path(tempfile.mkdtemp(prefix="auto-sse-errors-", dir=os.environ.get("TMPDIR")))
-    modes = ("false", "true") if args.cache == "both" else (args.cache,)
-    baseline = {}
-    if args.baseline_results:
-        prior = json.loads(args.baseline_results.read_text())["results"]
-        baseline = {(item["memory_cache"], item["case"]): item for item in prior}
-        if any((cache, case) not in baseline for cache in modes for case in args.cases):
-            parser.error("baseline does not contain every requested case")
-    with binary.open("rb") as source:
-        binary_hash = hashlib.file_digest(source, "sha256").hexdigest()
-    stub = FixtureServer(("127.0.0.1", 0))
-    worker = threading.Thread(target=stub.serve_forever, daemon=True)
-    worker.start()
+    try:
+        isolation = fixture_namespace.require_namespace()
+    except Exception as exc:
+        parser.error(str(exc))
+    with ExitStack() as bootstrap:
+        binary = args.binary.resolve(strict=True)
+        base = pathlib.Path(tempfile.mkdtemp(prefix="auto-sse-errors-", dir=os.environ.get("TMPDIR")))
+        bootstrap.callback(shutil.rmtree, base)
+        modes = ("false", "true") if args.cache == "both" else (args.cache,)
+        baseline = {}
+        if args.baseline_results:
+            prior = json.loads(args.baseline_results.read_text())["results"]
+            baseline = {(item["memory_cache"], item["case"]): item for item in prior}
+            if any((cache, case) not in baseline for cache in modes for case in args.cases):
+                parser.error("baseline does not contain every requested case")
+        with binary.open("rb") as source:
+            binary_hash = hashlib.file_digest(source, "sha256").hexdigest()
+        try:
+            stub = FixtureServer(("127.0.0.1", 0))
+        except fixture_namespace.NamespaceError as exc:
+            parser.error(str(exc))
+        bootstrap.callback(stub.server_close)
+        worker = threading.Thread(target=stub.serve_forever, daemon=True)
+        worker.start()
+        bootstrap.callback(worker.join, timeout=3)
+        bootstrap.callback(stub.shutdown)
+        # Successful evidence is retained; the matrix below now owns the server.
+        bootstrap.pop_all()
     results = []
     try:
         for cache in modes:
@@ -393,9 +416,11 @@ def main():
                 result = run_case(binary, base, stub, cache, case, baseline.get((cache, case)))
                 results.append(result)
                 (base / "results.json").write_text(json.dumps({"binary": str(binary), "sha256": binary_hash,
-                    "expected_cases": len(modes) * len(args.cases), "results": results}, ensure_ascii=False, indent=2))
+                    "expected_cases": len(modes) * len(args.cases), "isolation": isolation, "results": results}, ensure_ascii=False, indent=2))
                 print(json.dumps({"case": case, "cache": cache, "calls": [item["model"] for item in result["calls"]],
                                   "cooldown_count": len(result["cooldowns"]), "failures": result["failures"]}, ensure_ascii=False), flush=True)
+    except fixture_namespace.NamespaceError as exc:
+        parser.error(str(exc))
     finally:
         stub.shutdown()
         stub.server_close()
@@ -404,6 +429,14 @@ def main():
     failed = sum(bool(result["failures"]) for result in results)
     print(json.dumps({"total": len(results), "failed": failed, "sha256": binary_hash}), flush=True)
     return 1 if failed else 0
+
+
+def main():
+    try:
+        return run()
+    except Exception as error:
+        print(f"Infrastructure error: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

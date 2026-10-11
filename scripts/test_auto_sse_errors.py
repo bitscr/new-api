@@ -1,4 +1,4 @@
-"""Safety tests for the real-binary SSE fixture (no processes are started)."""
+"""Safety tests for the real-binary SSE fixture (no gateways are started)."""
 
 import importlib.util
 import io
@@ -21,8 +21,14 @@ spec.loader.exec_module(harness)
 
 class StartIsolationTests(unittest.TestCase):
     def setUp(self):
-        self.interfaces = self.enterContext(mock.patch.object(harness.socket, "if_nameindex"))
-        self.popen = self.enterContext(mock.patch.object(harness.subprocess, "Popen"))
+        harness.fixture_namespace.require_namespace()
+        self.interfaces = self.enterContext(mock.patch.object(
+            harness.socket, "if_nameindex", return_value=harness.socket.if_nameindex()))
+        # Mock gateway spawning, not the independent ip inspection subprocesses.
+        self.popen = mock.Mock()
+        self.enterContext(mock.patch.object(harness, "subprocess", types.SimpleNamespace(
+            Popen=self.popen, STDOUT=harness.subprocess.STDOUT,
+            TimeoutExpired=harness.subprocess.TimeoutExpired)))
         self.popen.return_value.poll.return_value = None
         self.open_log = self.enterContext(mock.patch.object(pathlib.Path, "open", mock.mock_open()))
         self.urlopen = self.enterContext(mock.patch.object(harness.urllib.request, "urlopen"))
@@ -45,7 +51,6 @@ class StartIsolationTests(unittest.TestCase):
         self.assert_rejected([])
 
     def test_start_enables_error_logging(self):
-        self.interfaces.return_value = [(1, "lo")]
         harness.start(*self.start_args)
         self.assertEqual(
             self.popen.call_args.kwargs["env"].get("ERROR_LOG_ENABLED"), "true",
@@ -53,7 +58,6 @@ class StartIsolationTests(unittest.TestCase):
         )
 
     def test_start_allows_loopback_only(self):
-        self.interfaces.return_value = [(1, "lo")]
         process, log, version = harness.start(*self.start_args)
         self.popen.assert_called_once()
         self.open_log.assert_called_once_with("wb")

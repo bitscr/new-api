@@ -65,6 +65,10 @@ func main() {
 		}
 	}()
 
+	// Restore passive scores before serving, and flush before closing the DB.
+	stopAutoModelScorePersistence := service.StartAutoModelScorePersistence()
+	defer stopAutoModelScorePersistence()
+
 	if common.RedisEnabled {
 		// for compatibility with old versions
 		common.MemoryCacheEnabled = true

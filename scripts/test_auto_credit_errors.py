@@ -74,7 +74,6 @@ class CreditBootstrapTests(unittest.TestCase):
         self.binary = self.root / 'not-a-gateway'
         self.binary.write_bytes(b'non-executable input for bootstrap contracts only\n')
         for patcher in (
-            mock.patch.object(credit.socket, 'if_nameindex', return_value=[(1, 'lo')]),
             mock.patch.dict(os.environ, {'TMPDIR': str(self.runs)}),
         ):
             patcher.start()

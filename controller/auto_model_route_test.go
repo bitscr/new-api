@@ -394,34 +394,43 @@ func TestAutoModelRouteTieredSwitchPricesConcreteRawModel(t *testing.T) {
 	require.JSONEq(t, `"route-tiered"`, string(fields["model"]))
 }
 
+// auto 预算仍然"首次 dispatch 冻结":渠道 override(哪怕巨大)不能扩大它,
+// 区别只是冻结的数值来自 auto 专用上限,而不是 common.RetryTimes。
 func TestAutoModelAttemptBudgetFreezesFirstDispatchOverride(t *testing.T) {
 	oldRetryTimes := common.RetryTimes
 	t.Cleanup(func() { common.RetryTimes = oldRetryTimes })
 	for _, tc := range []struct {
-		name         string
-		global       int
-		override     *int
-		wantAttempts int
+		name     string
+		global   int
+		override *int
+		limit    string
 	}{
-		{name: "global", global: 3, wantAttempts: 4},
-		{name: "zero", global: 0, wantAttempts: 1},
-		{name: "negative-global", global: -1, wantAttempts: 1},
-		{name: "override", global: 20, override: common.GetPointer(2), wantAttempts: 3},
-		{name: "zero-override", global: 20, override: common.GetPointer(0), wantAttempts: 1},
-		{name: "negative-override", global: 20, override: common.GetPointer(-5), wantAttempts: 1},
+		{name: "global", global: 3},
+		{name: "zero", global: 0},
+		{name: "negative-global", global: -1},
+		{name: "override", global: 20, override: common.GetPointer(2)},
+		{name: "zero-override", global: 20, override: common.GetPointer(0)},
+		{name: "negative-override", global: 20, override: common.GetPointer(-5)},
+		{name: "huge-override", global: 50, override: common.GetPointer(1000)},
+		{name: "configured-limit", global: 50, limit: "7"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			common.RetryTimes = tc.global
+			if tc.limit != "" {
+				t.Setenv("AUTO_MODEL_MAX_ATTEMPTS", tc.limit)
+			}
+			wantAttempts := operation_setting.AutoModelMaxAttempts()
 			var budget autoModelAttemptBudget
 			retry := &service.RetryParam{}
 			require.True(t, budget.beginAttempt(&model.Channel{RetryTimes: tc.override}, retry))
+			// 后续尝试继续拿巨大的渠道 override:预算不能被撑大。
 			for budget.canAttempt() {
-				require.Less(t, budget.attempts, tc.wantAttempts)
+				require.Less(t, budget.attempts, wantAttempts)
 				require.True(t, budget.beginAttempt(&model.Channel{RetryTimes: common.GetPointer(1000)}, retry))
 			}
-			require.Equal(t, tc.wantAttempts, budget.attempts)
+			require.Equal(t, wantAttempts, budget.attempts)
 			require.Zero(t, budget.remainingRetries)
-			require.Equal(t, tc.wantAttempts-1, retry.GetEffectiveRetryTimes())
+			require.Equal(t, wantAttempts-1, retry.GetEffectiveRetryTimes())
 			require.False(t, budget.beginAttempt(&model.Channel{}, retry))
 		})
 	}

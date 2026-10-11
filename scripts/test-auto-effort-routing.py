@@ -170,9 +170,7 @@ CASES = build_cases()
 
 
 def guard_namespace():
-    if ({name for _, name in socket.if_nameindex()} != {"lo"}
-            or os.readlink("/proc/self/ns/net") == os.readlink("/proc/1/ns/net")):
-        raise RuntimeError("isolated network namespace required: use unshare --net with only lo enabled")
+    return sse.fixture_namespace.require_namespace()
 
 
 @contextlib.contextmanager
@@ -225,6 +223,7 @@ class FixtureServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self):
+        guard_namespace()
         self.state_lock = threading.Lock()
         self.case = None
         self.calls = []
@@ -451,30 +450,37 @@ def run():
         parser.error("binary is required unless --list-cases is used")
     if len(args.cases) != len(set(args.cases)):
         parser.error("duplicate --cases selections are not allowed")
-    guard_namespace()
+    isolation = guard_namespace()
     temp = pathlib.Path(os.environ.get("TMPDIR", ""))
     if not temp.is_absolute() or temp == pathlib.Path("/tmp") or pathlib.Path("/tmp") in temp.parents:
         parser.error("set TMPDIR to an absolute scratch directory outside /tmp")
-    source = args.binary.resolve(strict=True)
-    base = pathlib.Path(tempfile.mkdtemp(prefix="auto-reasoning-effort-", dir=temp))
-    binary = base / "new-api"
-    shutil.copy2(source, binary)
-    digest = file_hash(source)
-    if file_hash(binary) != digest:
-        raise RuntimeError("copied binary SHA256 mismatch")
-    os.environ["HOME"] = str(base)
-    urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
-    modes = ("false", "true") if args.cache == "both" else (args.cache,)
-    expected_ids = [cache + ":" + case_id for cache in modes for case_id in args.cases]
-    report = {"source_binary": str(source), "executed_binary": str(binary), "sha256": digest,
-              "netns": os.readlink("/proc/self/ns/net"), "interfaces": socket.if_nameindex(),
-              "declared_cases": len(CASES), "expected_cases": len(expected_ids),
-              "expected_ids": expected_ids, "manifest": [CASES[key] for key in args.cases], "results": []}
-    output = base / "results.json"
-    persist(output, report)
-    stub = FixtureServer()
-    worker = threading.Thread(target=stub.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
-    worker.start()
+    with contextlib.ExitStack() as bootstrap:
+        source = args.binary.resolve(strict=True)
+        base = pathlib.Path(tempfile.mkdtemp(prefix="auto-reasoning-effort-", dir=temp))
+        bootstrap.callback(shutil.rmtree, base)
+        binary = base / "new-api"
+        shutil.copy2(source, binary)
+        digest = file_hash(source)
+        if file_hash(binary) != digest:
+            raise RuntimeError("copied binary SHA256 mismatch")
+        os.environ["HOME"] = str(base)
+        urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
+        modes = ("false", "true") if args.cache == "both" else (args.cache,)
+        expected_ids = [cache + ":" + case_id for cache in modes for case_id in args.cases]
+        report = {"source_binary": str(source), "executed_binary": str(binary), "sha256": digest,
+                  "netns": isolation["netns"], "interfaces": isolation["interfaces"], "isolation": isolation,
+                  "declared_cases": len(CASES), "expected_cases": len(expected_ids),
+                  "expected_ids": expected_ids, "manifest": [CASES[key] for key in args.cases], "results": []}
+        output = base / "results.json"
+        persist(output, report)
+        stub = FixtureServer()
+        bootstrap.callback(stub.server_close)
+        worker = threading.Thread(target=stub.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        worker.start()
+        bootstrap.callback(worker.join, timeout=3)
+        bootstrap.callback(stub.shutdown)
+        # Keep completed bootstrap evidence; normal matrix cleanup takes ownership.
+        bootstrap.pop_all()
     try:
         for cache in modes:
             for case_id in args.cases:

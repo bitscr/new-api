@@ -30,6 +30,9 @@ func InitOptionMap() {
 	common.OptionMapRWMutex.Lock()
 	common.OptionMap = make(map[string]string)
 
+	// auto 的四个数值先由环境变量打底,再由数据库里的面板值覆盖(见 loadOptionsFromDatabase)。
+	operation_setting.InitAutoModelSettingsFromEnv()
+
 	// 添加原有的系统配置
 	common.OptionMap["FileUploadPermission"] = strconv.Itoa(common.FileUploadPermission)
 	common.OptionMap["FileDownloadPermission"] = strconv.Itoa(common.FileDownloadPermission)
@@ -188,6 +191,11 @@ func InitOptionMap() {
 	common.OptionMap["AutoModelEnabled"] = strconv.FormatBool(operation_setting.AutoModelEnabled)
 	common.OptionMap["AutoModelCandidates"] = operation_setting.AutoModelCandidatesToJSONString()
 	common.OptionMap["AutoModelWeights"] = operation_setting.AutoModelWeightsToJSONString()
+	common.OptionMap["AutoModelMaxAttempts"] = strconv.Itoa(operation_setting.AutoModelMaxAttempts())
+	common.OptionMap["AutoModelPermanentCooldownHours"] = strconv.Itoa(int(operation_setting.AutoModelPermanentCooldownBase() / time.Hour))
+	common.OptionMap["AutoModelPermanentCooldownMaxDays"] = strconv.Itoa(int(operation_setting.AutoModelPermanentCooldownMax() / (24 * time.Hour)))
+	common.OptionMap["AutoModelScoreDecayMinutes"] = strconv.Itoa(operation_setting.AutoModelScoreDecayMinutes())
+	common.OptionMap["AutoModelPermanentKeywords"] = operation_setting.AutoModelPermanentKeywordsToString()
 	common.OptionMap["ExposeRatioEnabled"] = strconv.FormatBool(ratio_setting.IsExposeRatioEnabled())
 
 	// 自动添加所有注册的模型配置
@@ -237,6 +245,16 @@ func UpdateOption(key string, value string) error {
 	DB.Save(&option)
 	// Update OptionMap
 	return updateOptionMap(key, value)
+}
+
+// autoModelSetIntOption 解析面板提交的整数字符串再交给 setter。
+// 解析失败保持原值不动,不把 0 或负数写进运行时配置。
+func autoModelSetIntOption(value string, set func(int)) {
+	parsed, parseErr := strconv.Atoi(strings.TrimSpace(value))
+	if parseErr != nil {
+		return
+	}
+	set(parsed)
 }
 
 func updateOptionMap(key string, value string) (err error) {
@@ -580,6 +598,16 @@ func updateOptionMap(key string, value string) (err error) {
 		err = operation_setting.SetAutoModelCandidates(value)
 	case "AutoModelWeights":
 		err = operation_setting.SetAutoModelWeights(value)
+	case "AutoModelMaxAttempts":
+		autoModelSetIntOption(value, operation_setting.SetAutoModelMaxAttempts)
+	case "AutoModelPermanentCooldownHours":
+		autoModelSetIntOption(value, operation_setting.SetAutoModelPermanentCooldownHours)
+	case "AutoModelPermanentCooldownMaxDays":
+		autoModelSetIntOption(value, operation_setting.SetAutoModelPermanentCooldownMaxDays)
+	case "AutoModelScoreDecayMinutes":
+		autoModelSetIntOption(value, operation_setting.SetAutoModelScoreDecayMinutes)
+	case "AutoModelPermanentKeywords":
+		operation_setting.SetAutoModelPermanentKeywords(value)
 	case "StreamCacheQueueLength":
 		setting.StreamCacheQueueLength, _ = strconv.Atoi(value)
 	case "PayMethods":

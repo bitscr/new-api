@@ -23,14 +23,17 @@ func rankAutoModelTestCandidates(group string, candidates []string) []string {
 
 func TestAutoModelEvidenceExpiresAndDoesNotRevive(t *testing.T) {
 	now := time.Unix(1700000000, 0)
-	old := autoModelOutcome{Score: 1, Observations: 100000, LatencyMS: 75000, UpdatedAt: now.Add(-10 * time.Minute)}
+	// 衰减窗口是可配置的,所以断言必须跟着窗口走,不能写死 10 分钟:
+	// 不变式是"超过窗口即完全中立、窗口一半处保留一半"。
+	window := time.Duration(autoModelHalfLifeMs()) * time.Millisecond
+	old := autoModelOutcome{Score: 1, Observations: 100000, LatencyMS: 75000, UpdatedAt: now.Add(-window)}
 	require.Equal(t, 0.5, effectiveScore(old, now))
 	fresh := updateAutoModelOutcome(old, true, true, 100, now)
 	require.InDelta(t, 0.65, fresh.Score, 0.000001)
 	require.Equal(t, 1.0, fresh.Observations)
 	require.Equal(t, 100.0, fresh.LatencyMS)
 	half := old
-	half.UpdatedAt = now.Add(-5 * time.Minute)
+	half.UpdatedAt = now.Add(-window / 2)
 	decayed := decayAutoModelOutcome(half, now)
 	require.Equal(t, 10.0, decayed.Observations)
 	require.Equal(t, 0.75, decayed.Score)

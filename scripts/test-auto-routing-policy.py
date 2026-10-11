@@ -98,6 +98,20 @@ def cases():
              'This endpoint does not support streaming: a validation error occurred with this model.',
              [1, 2], codes='400', client_status=200),
         case('generic400', 400, 'invalid_request', 'Invalid request field independent of model', [1], client_status=400),
+        # 关键词判据:内置清单认不出上游自己发明的错误串,那类失败原本只拿 15 分钟
+        # 抖动冷却并被反复重试。加了关键词后同一个失败要变成 24h 起的长冷却。
+        # 这三个用例共用同样的请求形态,只改管理员关键词,证明差异确实来自判据。
+        case('keyword-promotes', 400, 'unsupported_feature',
+             'tools / function calling is not supported by the upstream anonymous backend',
+             [1], client_status=400, permanent_rows=1,
+             options={'AutoModelPermanentKeywords': 'function calling is not supported'}),
+        case('keyword-absent-control', 400, 'unsupported_feature',
+             'tools / function calling is not supported by the upstream anonymous backend',
+             [1], client_status=400, permanent_rows=0, jitter_rows=1),
+        # 保护项优先:关键词命中上下文超长也必须留在抖动阶梯,冷却一整天是错的。
+        case('keyword-protected-context', 400, 'context_length_exceeded', 'Maximum context length exceeded',
+             [1, 1, 1, 2], permanent_rows=0, jitter_rows=3,
+             options={'AutoModelPermanentKeywords': 'maximum context length'}),
         case('model400', 400, 'model_not_found', 'Requested model not found', [1, 1, 1, 2], codes='429'),
         case('negated-model-compat', 400, 'invalid_request',
              'No model is unsupported. The request JSON is malformed.',
@@ -118,10 +132,16 @@ def cases():
              "Your account rate limit is exceeded: only for model 'gpt-4o'; other models remain available.",
              [1, 1, 1, 2], codes='429', client_status=200),
         case('written200-error', 200, 'upstream_error', 'Explicit protocol failure', [1], style='sse_error', client_status=200),
-        case('budget-zero', 503, 'server_error', 'Upstream unavailable', [1], retries=0, client_status=503),
-        case('budget-one', 503, 'server_error', 'Upstream unavailable', [1, 2], retries=1),
+        # auto 预算:auto 用自己的 AUTO_MODEL_MAX_ATTEMPTS,不再跟着 options.RetryTimes
+        # 走。这里刻意写 RetryTimes=50,模型级失败(会逐个换同渠道的下一个模型),
+        # 断言仍然只能花 auto 默认上限 4 次。
+        case('auto-budget-cap', 404, 'model_not_found', 'Requested model not found', [1, 1, 1, 1],
+             retries=50, model_count=8, client_status=404),
+        case('budget-one', 503, 'server_error', 'Upstream unavailable', [1, 2],
+             auto_max_attempts=2),
         case('many-models503', 503, 'server_error', 'Upstream unavailable', [1, 2], model_count=55),
-        case('model-budget', 404, 'model_not_found', 'Requested model not found', [1, 1, 1], retries=2, client_status=404),
+        case('model-budget', 404, 'model_not_found', 'Requested model not found', [1, 1], retries=2,
+             auto_max_attempts=2, client_status=404),
         case('local-max', 200, '', '', [], style='healthy', first_model='gpt-5.4', model_count=1,
              effort='max', client_status=400, cooldown_count=0),
         case('local-high-control', 200, '', '', [1], style='healthy', first_model='gpt-5.4', model_count=1,
@@ -214,6 +234,7 @@ class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, spec, bad_models):
+        h.fixture_namespace.require_namespace()
         self.spec, self.bad_models = spec, set(bad_models)
         self.lock = threading.Lock()
         self.calls, self.fixture_errors = [], []
@@ -222,8 +243,8 @@ class Server(http.server.ThreadingHTTPServer):
 
 
 @contextlib.contextmanager
-def gateway(binary, root, port, cache, cleanup):
-    process, log, _ = h.start(binary, root, port, cache)
+def gateway(binary, root, port, cache, cleanup, extra_env=None):
+    process, log, _ = h.start(binary, root, port, cache, extra_env=extra_env)
     try:
         yield
     finally:
@@ -246,6 +267,10 @@ def seed(root, token, upstream, spec, bad_models, refusal_port=None):
                            'RetryTimes': str(spec.get('retries', 50)),
                            'AutomaticRetryStatusCodes': spec['codes']}.items():
             db.execute('UPDATE options SET value=? WHERE key=?', (value, key))
+        # 面板/DB 值优先于环境变量:关键词与四个数值都走这里,与真实面板写库一致。
+        for key, value in spec.get('options', {}).items():
+            db.execute("INSERT INTO options (key,value) VALUES (?,?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
         if spec.get('refuse'):
             if refusal_port is None:
                 raise ValueError('a reserved refusal port is required')
@@ -273,13 +298,27 @@ def ask(root, port, token, spec, index):
     return result
 
 
+def auto_env(spec):
+    """auto 预算由环境变量决定;用例显式声明它,不依赖默认值巧合。"""
+    if 'auto_max_attempts' in spec:
+        return {'AUTO_MODEL_MAX_ATTEMPTS': str(spec['auto_max_attempts'])}
+    return None
+
+
 def run_case(binary, root, spec, cache):
-    root.mkdir()
-    count = spec.get('model_count', 3)
-    bad_models = [spec['first_model']] if 'first_model' in spec else [f'probe-bad-{i:02}' for i in range(count)]
-    server = Server(spec, bad_models)
-    thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True)
-    thread.start()
+    with contextlib.ExitStack() as bootstrap:
+        root.mkdir()
+        bootstrap.callback(shutil.rmtree, root)
+        count = spec.get('model_count', 3)
+        bad_models = [spec['first_model']] if 'first_model' in spec else [f'probe-bad-{i:02}' for i in range(count)]
+        server = Server(spec, bad_models)
+        bootstrap.callback(server.server_close)
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True)
+        thread.start()
+        bootstrap.callback(thread.join, timeout=3)
+        bootstrap.callback(server.shutdown)
+        # Retain case evidence once normal matrix cleanup takes ownership.
+        bootstrap.pop_all()
     cleanup, responses, initial_calls, all_calls, cooldowns = [], [], [], [], []
     failures, errors = [], []
     after_restart, refusal, refused_socket = None, None, None
@@ -298,11 +337,11 @@ def run_case(binary, root, spec, cache):
         port, token = h.free_port(), secrets.token_hex(24)
         if refusal and refusal['port'] in (port, server.server_port):
             raise RuntimeError('refusal endpoint collides with a listener')
-        with gateway(binary, root, port, cache, cleanup):
+        with gateway(binary, root, port, cache, cleanup, auto_env(spec)):
             pass
         seed(root, token, 'http://127.0.0.1:' + str(server.server_port), spec, bad_models,
              refusal_port=refusal['port'] if refusal else None)
-        with gateway(binary, root, port, cache, cleanup):
+        with gateway(binary, root, port, cache, cleanup, auto_env(spec)):
             responses.append(ask(root, port, token, spec, 1))
             with server.lock:
                 initial_calls = list(server.calls)
@@ -333,7 +372,7 @@ def run_case(binary, root, spec, cache):
         if spec.get('restart'):
             with server.lock:
                 server.recovered = True
-            with gateway(binary, root, port, cache, cleanup):
+            with gateway(binary, root, port, cache, cleanup, auto_env(spec)):
                 after_restart = h.rows(root)
                 responses.append(ask(root, port, token, spec, 2))
         with server.lock:
@@ -367,6 +406,20 @@ def run_case(binary, root, spec, cache):
             keys = {(row['group'], row['model'], row['channel_id']) for row in observed_rows}
             if keys != expected_keys or any(row['level'] != 1 for row in observed_rows):
                 failures.append(stage + ' cooldown pairs/levels differ from the observed failed routes')
+            # 永久级判据不能只看标志位:窗口本身必须真的是长阶梯(~24h),
+            # 否则"升级为长冷却"就只是换了个字段名,行为没变。
+            if spec.get('permanent_rows') is not None:
+                permanent = [row for row in observed_rows if row['permanent']]
+                if len(permanent) != spec['permanent_rows']:
+                    failures.append(f'{stage} permanent rows {len(permanent)} != {spec["permanent_rows"]}')
+                for row in permanent:
+                    remaining = row['until'] - int(time.time())
+                    if remaining < 23 * 3600:
+                        failures.append(f'{stage} permanent cooldown window {remaining}s is not the long ladder')
+            if spec.get('jitter_rows') is not None:
+                jitter = [row for row in observed_rows if not row['permanent']]
+                if len(jitter) != spec['jitter_rows']:
+                    failures.append(f'{stage} jitter rows {len(jitter)} != {spec["jitter_rows"]}')
         if spec.get('followup'):
             later = all_calls[len(initial_calls):]
             cooled_models = {r['model'] for r in cooldowns}
@@ -412,14 +465,19 @@ def run():
         return 0
     if not args.binary or not os.environ.get('TMPDIR'):
         parser.error('binary and TMPDIR are required')
-    if {name for _, name in socket.if_nameindex()} != {'lo'}:
-        parser.error('refusing wildcard bootstrap outside a loopback-only network namespace')
-    source = pathlib.Path(args.binary).resolve(strict=True)
-    work = pathlib.Path(tempfile.mkdtemp(prefix='auto-policy-', dir=os.environ['TMPDIR']))
-    binary = work / 'gateway'
-    shutil.copy2(source, binary)
-    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    output = {'binary_sha256': digest, 'expected_cases': len(manifest), 'results': []}
+    try:
+        isolation = h.fixture_namespace.require_namespace()
+    except Exception as exc:
+        parser.error(str(exc))
+    with contextlib.ExitStack() as bootstrap:
+        source = pathlib.Path(args.binary).resolve(strict=True)
+        work = pathlib.Path(tempfile.mkdtemp(prefix='auto-policy-', dir=os.environ['TMPDIR']))
+        bootstrap.callback(shutil.rmtree, work)
+        binary = work / 'gateway'
+        shutil.copy2(source, binary)
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        bootstrap.pop_all()
+    output = {'binary_sha256': digest, 'expected_cases': len(manifest), 'isolation': isolation, 'results': []}
     for spec in manifest:
         row = run_case(binary, work / spec['name'], spec, args.cache)
         output['results'].append(row)

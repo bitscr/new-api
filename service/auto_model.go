@@ -5,6 +5,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -28,8 +29,18 @@ type autoModelOutcome struct {
 var autoModelHealth = types.NewRWMap[string, autoModelOutcome]()
 var autoModelChannelHealth = types.NewRWMap[string, autoModelOutcome]()
 
-// autoModelHalfLifeMs 用于读取时的评分时间衰减（线性衰减至 10 分钟）。
-const autoModelHalfLifeMs = 600000
+// Serialize dual-layer publication, persistence snapshots and restore merges.
+// Lock order is this mutex -> RWMap; never hold it during SQL/cooldown I/O.
+var autoModelScoreMutex sync.Mutex
+
+// autoModelHalfLifeMs 用于读取时的评分时间衰减。
+//
+// 它必须长于抖动冷却窗口(15 分钟),否则冷却到期时评分已经归零回到中立 0.5,
+// 组合带着"零记忆"重回候选池,惩罚与教训脱节;评分持久化也只剩"重启很快"这一种
+// 场景有意义。默认 30 分钟,可在面板调整(AutoModelScoreDecayMinutes)。
+func autoModelHalfLifeMs() int64 {
+	return int64(operation_setting.AutoModelScoreDecayMinutes()) * 60 * 1000
+}
 
 // autoModelLatencyAlpha 是延迟 EWMA 平滑系数，沿用现有的 0.2 / 0.8。
 const autoModelLatencyAlpha = 0.2
@@ -76,14 +87,16 @@ func recordAutoModelOutcome(group, name string, channelID int, success bool, lat
 		return
 	}
 	key := autoModelHealthKey(group, name, channelID)
+	autoModelScoreMutex.Lock()
+	now := time.Now()
 	autoModelHealth.Update(key, func(current autoModelOutcome, exists bool) autoModelOutcome {
-		// Read the clock under the map lock, so a delayed writer cannot roll the
-		// timestamp back or overwrite another request's observation.
-		return updateAutoModelOutcome(current, exists, success, latencyMs, time.Now())
+		// One observation time under the publication lock belongs to both layers.
+		return updateAutoModelOutcome(current, exists, success, latencyMs, now)
 	})
 	autoModelChannelHealth.Update(autoModelChannelHealthKey(group, channelID), func(current autoModelOutcome, exists bool) autoModelOutcome {
-		return updateAutoModelOutcome(current, exists, success, latencyMs, time.Now())
+		return updateAutoModelOutcome(current, exists, success, latencyMs, now)
 	})
+	autoModelScoreMutex.Unlock()
 	if modelOnlyCooldown {
 		reason := strings.TrimSpace(cooldownReason)
 		if reason == "" {
@@ -102,7 +115,7 @@ const autoModelMaxObservations = 20.0
 // Applying this before both reads and writes prevents fresh feedback from
 // reviving an expired latency or an unbounded historical confidence count.
 func decayAutoModelOutcome(outcome autoModelOutcome, now time.Time) autoModelOutcome {
-	ageFactor := 1.0 - math.Max(0, float64(now.Sub(outcome.UpdatedAt).Milliseconds()))/float64(autoModelHalfLifeMs)
+	ageFactor := 1.0 - math.Max(0, float64(now.Sub(outcome.UpdatedAt).Milliseconds()))/float64(autoModelHalfLifeMs())
 	ageFactor = math.Max(0, ageFactor)
 	outcome.Observations = math.Min(autoModelMaxObservations, math.Max(0, outcome.Observations)) * ageFactor
 	outcome.Score = 0.5 + (outcome.Score-0.5)*ageFactor

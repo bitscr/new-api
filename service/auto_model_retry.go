@@ -75,6 +75,94 @@ func autoModelCompatibilityStatus(status int) bool {
 	return false
 }
 
+// AutoModelPermanentFailure 判定一次上游失败是不是"确定性"的:这类失败重试也
+// 不会好(鉴权/权限、模型不存在、模型不支持、param=model 的非法请求),应该给
+// 永久级长冷却,而不是和限流/超时/5xx 一样只冷却 15 分钟。
+//
+// 判据是正面枚举,不做"认不出就当永久":认不出的失败按抖动处理,宁可多试几次,
+// 也不误杀一个只是暂时出问题的模型。上下文超长(context_length_exceeded)与请求
+// 内容有关,不算模型不存在,因此也不在这里。
+//
+// 内置判据之外,管理员可以在面板补关键词(一行一个),覆盖上游冒出的新错误串,
+// 否则那些失败只会拿到 15 分钟冷却并被反复重试。关键词只升级冷却时长,
+// 作用域仍是单个 (group, model, channel)。
+func AutoModelPermanentFailure(err *types.NewAPIError) bool {
+	if err == nil {
+		return false
+	}
+	if autoModelProtectedTransient(err) {
+		// 保护项优先于任何关键词:上下文超长和泛化请求错误是"这次请求"的问题,
+		// 不是"这个模型不存在"。管理员加错关键词也不能把它们变成永久封禁。
+		return false
+	}
+	switch err.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return true
+	}
+	detail := err.ToOpenAIError()
+	codes := []string{
+		strings.ToLower(strings.TrimSpace(string(err.GetErrorCode()))),
+		strings.ToLower(strings.TrimSpace(detail.Type)),
+	}
+	modelParam := strings.EqualFold(strings.TrimSpace(detail.Param), "model")
+	for _, code := range codes {
+		switch code {
+		case "model_not_found", "model_not_supported", "unsupported_model", "unsupported_model_feature":
+			return true
+		case "not_found", "invalid_value", "unsupported_value", "unsupported_parameter", "invalid_request":
+			// 只有明确指向 model 参数时才算确定性:泛化的 invalid_request
+			// (请求体别的字段写错、端点不支持等)不是模型不存在。
+			if modelParam {
+				return true
+			}
+		}
+	}
+	return autoModelMatchesPermanentKeyword(err)
+}
+
+// autoModelProtectedTransient 列出永远按抖动处理的失败,即使管理员关键词命中。
+// 它描述的是"这次请求/这次输入"而不是"这个模型不存在",冷却一整天是错的:
+// context_length_exceeded 只要截断重发就能过,不是模型坏了。
+//
+// 注意这里只保护上下文超长。泛化 400/422 不在这里,因为它们本来就不会被判永久
+// (判据是正面枚举);但如果管理员明确加了某个 400 关键词,那是他的判断,应当生效。
+func autoModelProtectedTransient(err *types.NewAPIError) bool {
+	detail := err.ToOpenAIError()
+	for _, code := range []string{
+		strings.ToLower(strings.TrimSpace(string(err.GetErrorCode()))),
+		strings.ToLower(strings.TrimSpace(detail.Type)),
+	} {
+		if code == "context_length_exceeded" {
+			return true
+		}
+	}
+	return false
+}
+
+// autoModelMatchesPermanentKeyword 在错误正文与错误 code 里找管理员关键词。
+// 命中范围刻意包含 code,因为很多上游只在结构化字段里给原因。
+func autoModelMatchesPermanentKeyword(err *types.NewAPIError) bool {
+	keywords := operation_setting.AutoModelPermanentKeywords()
+	if len(keywords) == 0 {
+		return false
+	}
+	detail := err.ToOpenAIError()
+	haystacks := []string{
+		strings.ToLower(err.Error()),
+		strings.ToLower(detail.Message),
+		strings.ToLower(string(err.GetErrorCode())),
+		strings.ToLower(detail.Type),
+	}
+	for _, keyword := range keywords {
+		for _, haystack := range haystacks {
+			if haystack != "" && strings.Contains(haystack, keyword) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Evidence must identify a model, not merely a generic invalid request. Param
 // alone is insufficient: require a rejection code whose meaning is compatible.
 func autoModelRetryModelEvidence(err *types.NewAPIError) (modelScoped, incompatible bool) {

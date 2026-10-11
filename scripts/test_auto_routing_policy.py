@@ -47,7 +47,7 @@ class PolicyEvidenceTests(unittest.TestCase):
                "channel_id": 1, "level": 1, "reason": "synthetic failure"}
 
         @contextlib.contextmanager
-        def gateway(binary, root, port, cache, cleanup):
+        def gateway(binary, root, port, cache, cleanup, extra_env=None):
             cleanup.append({"reaped": True, "log_closed": True})
             yield
 
@@ -117,7 +117,6 @@ class PolicyEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="policy-main-") as directory, \
                 mock.patch.dict(os.environ, {"TMPDIR": directory}), \
                 mock.patch.object(sys, "argv", ["policy-fixture", __file__, "--case", "generic503"]), \
-                mock.patch.object(fixture.socket, "if_nameindex", return_value=[(1, "lo")]), \
                 mock.patch.object(fixture, "run_case", return_value=result), \
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
             self.assertEqual(fixture.main(), 1)
@@ -152,7 +151,6 @@ class PolicyEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="policy-entry-") as directory, \
                 mock.patch.dict(os.environ, {"TMPDIR": directory}), \
                 mock.patch.object(sys, "argv", ["policy-fixture", str(pathlib.Path(directory) / "missing")]), \
-                mock.patch.object(fixture.socket, "if_nameindex", return_value=[(1, "lo")]), \
                 contextlib.redirect_stderr(io.StringIO()) as stderr:
             try:
                 code = fixture.main()

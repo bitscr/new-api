@@ -25,6 +25,9 @@ import SettingsSidebarModulesAdmin from '../../pages/Setting/Operation/SettingsS
 import SettingsSensitiveWords from '../../pages/Setting/Operation/SettingsSensitiveWords';
 import SettingsLog from '../../pages/Setting/Operation/SettingsLog';
 import SettingsMonitoring from '../../pages/Setting/Operation/SettingsMonitoring';
+import SettingsAutoModelCooldown from '../../pages/Setting/Operation/SettingsAutoModelCooldown';
+import SettingsAutoModelTargeting from '../../pages/Setting/Operation/SettingsAutoModelTargeting';
+import SettingsAutoModelPolicy from '../../pages/Setting/Operation/SettingsAutoModelPolicy';
 import SettingsCreditLimit from '../../pages/Setting/Operation/SettingsCreditLimit';
 import SettingsCheckin from '../../pages/Setting/Operation/SettingsCheckin';
 import { API, showError, toBoolean } from '../../helpers';
@@ -150,6 +153,18 @@ const OperationSetting = () => {
         {/* 监控设置 */}
         <Card style={{ marginTop: '10px' }}>
           <SettingsMonitoring options={inputs} refresh={onRefresh} />
+        </Card>
+        {/* auto 冷却:必须能看到并解除,否则加错判据就是 30 天解不开的封条 */}
+        <Card style={{ marginTop: '10px' }}>
+          <SettingsAutoModelCooldown />
+        </Card>
+        {/* auto 判据与时长:内置判据认不出新错误串,需要能人工补充 */}
+        <Card style={{ marginTop: '10px' }}>
+          <SettingsAutoModelPolicy options={inputs} refresh={onRefresh} />
+        </Card>
+        {/* auto 候选范围与权重:改错直接改变选路结果,放在判据之后、需显式校验 */}
+        <Card style={{ marginTop: '10px' }}>
+          <SettingsAutoModelTargeting options={inputs} refresh={onRefresh} />
         </Card>
         {/* 额度设置 */}
         <Card style={{ marginTop: '10px' }}>

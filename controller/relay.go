@@ -386,7 +386,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.LastError = newAPIError
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
-		recordAutoModelFeedback(c, relayInfo, false)
+		recordAutoModelUpstreamFailure(c, relayInfo, newAPIError)
 
 		if autoRequest {
 			// Model-specific failures retain sibling-model fallback. Channel-scoped
@@ -633,6 +633,10 @@ func autoModelCanceledRequestError(c *gin.Context, current *types.NewAPIError) *
 // autoModelAttemptBudget is frozen by the first actual dispatch. Channel/model
 // switches cannot reset or enlarge it, including channel-specific retry overrides.
 // remainingRetries excludes the first attempt, avoiding an overflowing limit+1.
+//
+// auto 路径不再共用命名请求的 RetryTimes:那个值(本机 50)是为命名模型调优的,
+// auto 的每次重试都会真的换一个上游组合,50 次意味着一次请求能打 50+ 个上游。
+// auto 用自己更小的上限(见 operation_setting.AutoModelMaxAttempts)。
 type autoModelAttemptBudget struct {
 	started          bool
 	attempts         int
@@ -648,9 +652,12 @@ func (b *autoModelAttemptBudget) beginAttempt(channel *model.Channel, retryParam
 		return false
 	}
 	if !b.started {
+		// 记录渠道 override 到 retryParam 只是为了让下游拿到一致的重试序号;
+		// auto 自己的预算来自专用上限,不受它影响。
 		retryParam.SetEffectiveRetryTimesFromChannel(channel)
-		retryParam.SetEffectiveRetryTimes(retryParam.GetEffectiveRetryTimes())
-		b.remainingRetries = retryParam.GetEffectiveRetryTimes()
+		// remainingRetries 不含首次:上限 4 次 dispatch = 1 次首发 + 3 次重试。
+		b.remainingRetries = max(0, operation_setting.AutoModelMaxAttempts()-1)
+		retryParam.SetEffectiveRetryTimes(b.remainingRetries)
 		b.started = true
 	} else {
 		b.remainingRetries--
@@ -1009,6 +1016,45 @@ func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, succes
 	})
 }
 
+// recordAutoModelUpstreamFailure 记录一次上游失败,并在入队时定格它的"永久性":
+// 模型不存在/无权/不支持这类确定性失败重试也不会自愈,要的是长冷却,而不是
+// 15 分钟后再来一次。分类必须现在做,不能等 flush(那时 RelayInfo 可能已经
+// 是另一次尝试的字段)。
+//
+// 失败也带上耗时:一个 200ms 就被拒的组合和一个卡满 60 秒才失败的组合,对客户端
+// 是两种体验。早先失败一律 latencyMS=0,评分里两者的延迟惩罚完全相同,耗着不
+// 说话的那个反而被当成"响应快"。耗时走和成功相同的 EWMA,所以它只影响评分排序,
+// 不改变冷却判据。
+func recordAutoModelUpstreamFailure(c *gin.Context, info *relaycommon.RelayInfo, err *types.NewAPIError) {
+	if !isAutoModelRequest(c) || info == nil || !info.HasUpstreamDispatch() || autoModelClientAbandoned(c, info) {
+		return
+	}
+	elapsedMS := observedAutoModelCooldownLatency(info, false)
+	queueAutoModelFeedback(c, info, autoModelFeedback{
+		success:   false,
+		latencyMS: elapsedMS,
+		elapsedMS: elapsedMS,
+		permanent: service.AutoModelPermanentFailure(err),
+		reason:    autoModelPermanentFailureReason(err),
+	})
+}
+
+// autoModelPermanentFailureReason 给出日志/排查用的一句话原因,不参与判定。
+func autoModelPermanentFailureReason(err *types.NewAPIError) string {
+	if err == nil {
+		return ""
+	}
+	detail := err.ToOpenAIError()
+	code := strings.TrimSpace(string(err.GetErrorCode()))
+	if code == "" {
+		code = strings.TrimSpace(detail.Type)
+	}
+	if code == "" {
+		code = "unknown"
+	}
+	return fmt.Sprintf("%s(HTTP %d)", code, err.StatusCode)
+}
+
 // An unusable HTTP 200 is the final failure of this combination, not a success.
 func recordAutoModelUnusableAnswer(c *gin.Context, info *relaycommon.RelayInfo, reason string) {
 	if !isAutoModelRequest(c) || info == nil || !info.HasUpstreamDispatch() || autoModelClientAbandoned(c, info) {
@@ -1047,6 +1093,9 @@ type autoModelFeedback struct {
 	elapsedMS int64 // cooldown signal: successful TTFB (or non-stream elapsed), failed elapsed
 	unusable  bool
 	reason    string
+	// permanent 在入队时定格:这次失败是不是确定性失败(模型不存在/无权/不支持)。
+	// 队列是延迟 flush 的,不能等到 flush 时再读可能已被复用/覆盖的 RelayInfo。
+	permanent bool
 }
 
 const autoModelFeedbackContextKey = "auto_model_feedback_pending"
@@ -1095,9 +1144,13 @@ func flushAutoModelFeedback(c *gin.Context) {
 	})
 	for _, key := range keys {
 		feedback := pending[key]
-		if feedback.unusable {
+		switch {
+		case feedback.unusable:
 			service.RecordAutoModelUnusableAnswer(key.group, key.modelName, key.channelID, feedback.reason)
-		} else {
+		case feedback.permanent:
+			// 确定性失败:24h 起步的长冷却,仍然只挡这一个组合。
+			service.RecordAutoModelPermanentFailure(key.group, key.modelName, key.channelID, feedback.reason)
+		default:
 			service.RecordAutoModelOutcome(key.group, key.modelName, key.channelID, feedback.success, feedback.latencyMS, feedback.elapsedMS)
 		}
 	}

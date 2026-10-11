@@ -18,7 +18,10 @@ type AutoModelCooldown struct {
 	Until     int64  `json:"until" gorm:"bigint;index"`
 	Level     int    `json:"level"`
 	Reason    string `json:"reason" gorm:"type:varchar(255)"`
-	UpdatedAt int64  `json:"updated_at" gorm:"bigint"`
+	// Permanent 标记这是"确定性失败"(模型不存在/无权/不支持)的长冷却,
+	// 与限流、超时、5xx 那类会自愈的抖动失败区分开。老行为 false。
+	Permanent bool  `json:"permanent" gorm:"not null;default:false"`
+	UpdatedAt int64 `json:"updated_at" gorm:"bigint"`
 }
 
 func (AutoModelCooldown) TableName() string {
@@ -35,7 +38,7 @@ func GetAutoModelCooldowns() ([]AutoModelCooldown, error) {
 func UpsertAutoModelCooldown(row *AutoModelCooldown) error {
 	return DB.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "group"}, {Name: "model"}, {Name: "channel_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"until", "level", "reason", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"until", "level", "reason", "permanent", "updated_at"}),
 	}).Create(row).Error
 }
 

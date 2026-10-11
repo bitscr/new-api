@@ -87,9 +87,7 @@ class MainEntryTests(unittest.TestCase):
         self.root = pathlib.Path(directory)
         self.enterContext(mock.patch.dict(os.environ, {"TMPDIR": directory}))
         self.enterContext(mock.patch.object(fixture.urllib.request, "_opener"))
-        self.enterContext(mock.patch.object(fixture.socket, "if_nameindex", return_value=[(1, "lo")]))
-        self.enterContext(mock.patch.object(fixture.os, "readlink", side_effect=lambda path:
-            "net:[host]" if path == "/proc/1/ns/net" else "net:[fixture]"))
+        fixture.guard_namespace()  # Keep bootstrap controls in a real isolated namespace.
         self.args = [str(pathlib.Path(__file__)), "--cases", "chat.max.qwen3"]
 
     def invoke(self, args=None):

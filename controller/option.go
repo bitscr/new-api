@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
@@ -345,11 +346,17 @@ func UpdateOption(c *gin.Context) {
 			return
 		}
 	case "AutoModelCandidates":
-		var candidates map[string][]string
-		err = common.Unmarshal([]byte(option.Value.(string)), &candidates)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{"success": false, "message": "无效的 AutoModelCandidates JSON: " + err.Error()})
-			return
+		// 空串与 "{}" 都表示"清空白名单,所有分组回退默认(不限制)",这是
+		// SetAutoModelCandidates 明确支持的语义。早先这里无条件 Unmarshal,
+		// 空串会被 JSON 解析拒掉——于是面板上把文本框删空再保存就报
+		// "unexpected end of JSON input",管理员没法把白名单改回不限制。
+		// 校验必须接受 setter 接受的输入。
+		if trimmed := strings.TrimSpace(option.Value.(string)); trimmed != "" {
+			var candidates map[string][]string
+			if err = common.Unmarshal([]byte(trimmed), &candidates); err != nil {
+				c.JSON(http.StatusOK, gin.H{"success": false, "message": "无效的 AutoModelCandidates JSON: " + err.Error()})
+				return
+			}
 		}
 	case "AutoModelWeights":
 		if err = operation_setting.ValidateAutoModelWeights(option.Value.(string)); err != nil {
@@ -360,6 +367,38 @@ func UpdateOption(c *gin.Context) {
 		if option.Value.(string) != "true" && option.Value.(string) != "false" {
 			c.JSON(http.StatusOK, gin.H{"success": false, "message": "AutoModelEnabled 必须是 true 或 false"})
 			return
+		}
+	case "AutoModelMaxAttempts", "AutoModelPermanentCooldownHours",
+		"AutoModelPermanentCooldownMaxDays", "AutoModelScoreDecayMinutes":
+		// 这四个都是"至少 1"的正整数;写 0 或负数会直接让 auto 不可用。
+		parsed, parseErr := strconv.Atoi(strings.TrimSpace(option.Value.(string)))
+		if parseErr != nil || parsed < 1 {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "该选项必须是大于等于 1 的整数",
+			})
+			return
+		}
+		// 冷却封顶必须不低于首次窗口,否则阶梯首犯就超过封顶,语义自相矛盾。
+		if option.Key == "AutoModelPermanentCooldownMaxDays" {
+			baseHours := operation_setting.AutoModelPermanentCooldownBase()
+			if time.Duration(parsed)*24*time.Hour < baseHours {
+				c.JSON(http.StatusOK, gin.H{
+					"success": false,
+					"message": "封顶天数换算后不能小于首次冷却时长",
+				})
+				return
+			}
+		}
+	case "AutoModelPermanentKeywords":
+		// 关键词是"把某类失败升级为长冷却"的判据,代价高:命中即 24h 起。
+		// 只做最基本的可用性校验,不猜测管理员的意图;但显然无意义或会误伤的
+		// 条目必须在写库前挡住,否则一次粘贴就把一片组合封 30 天。
+		for _, line := range strings.Split(option.Value.(string), "\n") {
+			if message := operation_setting.ValidateAutoModelPermanentKeyword(line); message != "" {
+				c.JSON(http.StatusOK, gin.H{"success": false, "message": message})
+				return
+			}
 		}
 	case "console_setting.api_info":
 		err = console_setting.ValidateConsoleSettings(option.Value.(string), "ApiInfo")

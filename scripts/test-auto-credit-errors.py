@@ -108,6 +108,7 @@ def answer_text(response, stream):
 
 class Upstream(http.server.ThreadingHTTPServer):
     def __init__(self):
+        fixture.fixture_namespace.require_namespace()
         self.lock = threading.Lock()
         self.case = None
         self.calls = []
@@ -311,8 +312,10 @@ def main():
     parser.add_argument('--cases', nargs='+', choices=CASES, default=list(CASES))
     parser.add_argument('--baseline-results', type=Path)
     args = parser.parse_args()
-    if socket.if_nameindex() != [(1, 'lo')]:
-        parser.error('verified loopback-only network namespace required before bootstrap')
+    try:
+        isolation = fixture.fixture_namespace.require_namespace()
+    except Exception as exc:
+        parser.error(str(exc))
     try:
         with ExitStack() as bootstrap:
             base = Path(tempfile.mkdtemp(prefix='auto-credit-errors-', dir=os.environ['TMPDIR']))
@@ -328,7 +331,8 @@ def main():
                 parser.error('baseline must contain every selected case')
             results = []
             report = {'source_binary': str(args.binary), 'executed_binary': str(binary), 'sha256': source_hash,
-                      'expected_cases': len(ids), 'expected_ids': ids, 'interfaces': socket.if_nameindex(),
+                      'expected_cases': len(ids), 'expected_ids': ids, 'interfaces': isolation['interfaces'],
+                      'isolation': isolation,
                       'results': results, 'stub_stopped': False}
             upstream = Upstream()
             bootstrap.callback(upstream.server_close)
