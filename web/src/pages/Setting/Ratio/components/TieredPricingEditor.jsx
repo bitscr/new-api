@@ -964,6 +964,49 @@ function CacheTokenEstimatorInputs({
 // Cost estimator (works with any Expr string)
 // ---------------------------------------------------------------------------
 
+// Time-of-day helpers for the estimator. These must mirror the backend engine
+// (pkg/billingexpr/run.go timeInZone): weekday is 0=Sunday..6=Saturday, month is
+// 1..12, and an empty or unknown timezone falls back to UTC rather than throwing.
+const WEEKDAY_INDEX = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+function timePartsInZone(tz) {
+  const zone = String(tz == null ? '' : tz).trim();
+  const opts = {
+    timeZone: zone || 'UTC',
+    hour12: false,
+    weekday: 'short',
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: 'numeric',
+  };
+  let fmt;
+  try {
+    fmt = new Intl.DateTimeFormat('en-US', opts);
+  } catch {
+    // Unknown timezone: behave like the backend and fall back to UTC.
+    fmt = new Intl.DateTimeFormat('en-US', { ...opts, timeZone: 'UTC' });
+  }
+  const parts = {};
+  for (const part of fmt.formatToParts(new Date())) parts[part.type] = part.value;
+  return {
+    // Some ICU versions render midnight as "24" under hour12:false; the engine uses 0-23.
+    hour: Number(parts.hour) % 24,
+    minute: Number(parts.minute),
+    weekday: WEEKDAY_INDEX[parts.weekday],
+    month: Number(parts.month),
+    day: Number(parts.day),
+  };
+}
+
+const TIME_ENV_FNS = {
+  hour: (tz) => timePartsInZone(tz).hour,
+  minute: (tz) => timePartsInZone(tz).minute,
+  weekday: (tz) => timePartsInZone(tz).weekday,
+  month: (tz) => timePartsInZone(tz).month,
+  day: (tz) => timePartsInZone(tz).day,
+};
+
 function evalExprLocally(exprStr, p, c, extraTokenValues) {
   try {
     let matchedTier = '';
@@ -975,7 +1018,7 @@ function evalExprLocally(exprStr, p, c, extraTokenValues) {
     const cacheCreateTokens = extraTokenValues.cacheCreateTokens || 0;
     const cacheCreate1hTokens = extraTokenValues.cacheCreate1hTokens || 0;
     const len = p + cacheReadTokens + cacheCreateTokens + cacheCreate1hTokens;
-    const env = { p, c, len, tier: tierFn, max: Math.max, min: Math.min, abs: Math.abs, ceil: Math.ceil, floor: Math.floor };
+    const env = { p, c, len, tier: tierFn, max: Math.max, min: Math.min, abs: Math.abs, ceil: Math.ceil, floor: Math.floor, ...TIME_ENV_FNS };
     for (const field of EXTRA_ESTIMATOR_FIELDS) {
       env[field.var] = extraTokenValues[field.stateKey] || 0;
     }
