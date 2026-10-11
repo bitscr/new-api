@@ -115,7 +115,7 @@ tar -xzf new-api-linux-amd64.tar.gz
 sudo install -m 0755 new-api-linux-amd64 /usr/local/bin/new-api
 ```
 
-> 二进制由 CI 发布：仓库打 `v*` tag（或手动触发「Build release binaries」workflow）后，产出 `new-api-linux-amd64.tar.gz` / `new-api-linux-arm64.tar.gz` 及其 `.sha256` 校验文件。
+> 二进制由 CI 发布，且**只在手动触发时**构建：在仓库 Actions 页面选「Build release binaries」→ Run workflow，填入 tag（如 `v1.0.0`），产出 `new-api-linux-amd64.tar.gz` / `new-api-linux-arm64.tar.gz` 及其 `.sha256` 校验文件。推送代码或打 tag **不会**自动触发构建。
 
 #### 2. 准备目录与配置
 
@@ -165,6 +165,8 @@ sudo systemctl status new-api
 ## 方式二：Docker 部署
 
 镜像发布在 GitHub Container Registry：`ghcr.io/bitscr/new-api`，支持 **amd64 / arm64 / 386 / armv7**（`latest` 是多架构清单，Docker 会按本机架构自动选择）。
+
+> **镜像是手动构建的。** 推送代码或打 tag **不会**触发构建；需要更新镜像时，到仓库 Actions 页面选「Publish Docker image to GHCR」→ Run workflow（可留空平台参数使用默认的四个架构）。
 
 <details>
 <summary>Docker 命令</summary>

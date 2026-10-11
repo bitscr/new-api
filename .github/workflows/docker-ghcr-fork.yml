@@ -1,9 +1,8 @@
 name: Publish Docker image to GHCR
 
+# 只允许手动触发：Actions 页面「Run workflow」，或本机有凭据时 gh workflow run。
+# 刻意不配置 push / schedule：推送和定时都不会自动构建或部署镜像。
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       tag:
