@@ -1,0 +1,156 @@
+/*
+Copyright (C) 2026 bitscr
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For licensing inquiries, please open an issue at https://github.com/bitscr/new-api/issues
+*/
+
+import React, { useRef } from 'react';
+import { Form, Button } from '@douyinfe/semi-ui';
+import { IconSearch } from '@douyinfe/semi-icons';
+
+const UsersFilters = ({
+  formInitValues,
+  setFormApi,
+  searchUsers,
+  loadUsers,
+  activePage,
+  pageSize,
+  groupOptions,
+  loading,
+  searching,
+  t,
+}) => {
+  const formApiRef = useRef(null);
+  const statusOptions = [
+    { label: t('已启用'), value: 'enabled' },
+    { label: t('已禁用'), value: 'disabled' },
+    { label: t('已注销'), value: 'deleted' },
+  ];
+  const quotaOrderOptions = [
+    { label: `${t('剩余额度')} ↑`, value: 'asc' },
+    { label: `${t('剩余额度')} ↓`, value: 'desc' },
+  ];
+
+  const handleReset = () => {
+    if (!formApiRef.current) return;
+    formApiRef.current.reset();
+    setTimeout(() => {
+      loadUsers(1, pageSize);
+    }, 100);
+  };
+
+  return (
+    <Form
+      initValues={formInitValues}
+      getFormApi={(api) => {
+        setFormApi(api);
+        formApiRef.current = api;
+      }}
+      onSubmit={() => {
+        searchUsers(1, pageSize);
+      }}
+      allowEmpty={true}
+      autoComplete='off'
+      layout='horizontal'
+      trigger='change'
+      stopValidateWithError={false}
+      className='w-full md:w-auto order-1 md:order-2'
+    >
+      <div className='flex flex-col md:flex-row md:flex-wrap items-center gap-2 w-full md:w-auto'>
+        <div className='relative w-full md:w-64'>
+          <Form.Input
+            field='searchKeyword'
+            prefix={<IconSearch />}
+            placeholder={t('支持搜索用户的 ID、用户名、显示名称、邮箱地址和邀请码')}
+            showClear
+            pure
+            size='small'
+          />
+        </div>
+        <div className='w-full md:w-48'>
+          <Form.Select
+            field='searchGroup'
+            placeholder={t('选择分组')}
+            optionList={groupOptions}
+            onChange={(value) => {
+              // Group change triggers automatic search
+              setTimeout(() => {
+                searchUsers(1, pageSize);
+              }, 100);
+            }}
+            className='w-full'
+            showClear
+            pure
+            size='small'
+          />
+        </div>
+        <div className='w-full md:w-36'>
+          <Form.Select
+            field='statusFilter'
+            placeholder={t('状态')}
+            optionList={statusOptions}
+            onChange={() => {
+              setTimeout(() => {
+                searchUsers(1, pageSize);
+              }, 100);
+            }}
+            className='w-full'
+            showClear
+            pure
+            size='small'
+          />
+        </div>
+        <div className='w-full md:w-40'>
+          <Form.Select
+            field='quotaOrder'
+            placeholder={t('排序')}
+            optionList={quotaOrderOptions}
+            onChange={() => {
+              setTimeout(() => {
+                searchUsers(1, pageSize);
+              }, 100);
+            }}
+            className='w-full'
+            showClear
+            pure
+            size='small'
+          />
+        </div>
+        <div className='flex gap-2 w-full md:w-auto'>
+          <Button
+            type='tertiary'
+            htmlType='submit'
+            loading={loading || searching}
+            className='flex-1 md:flex-initial md:w-auto'
+            size='small'
+          >
+            {t('查询')}
+          </Button>
+          <Button
+            type='tertiary'
+            onClick={handleReset}
+            className='flex-1 md:flex-initial md:w-auto'
+            size='small'
+          >
+            {t('重置')}
+          </Button>
+        </div>
+      </div>
+    </Form>
+  );
+};
+
+export default UsersFilters;

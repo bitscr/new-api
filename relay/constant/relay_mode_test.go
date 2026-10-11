@@ -1,0 +1,64 @@
+package constant
+
+import "testing"
+
+func TestPath2RelayModeVideoEndpoints(t *testing.T) {
+	tests := []struct {
+		path string
+		want int
+	}{
+		{path: "/v1/video/generations", want: RelayModeVideoSubmit},
+		{path: "/v1/videos/generations", want: RelayModeVideoSubmit},
+		{path: "/v1/videos", want: RelayModeVideoSubmit},
+		{path: "/v1/videos/video_123/remix", want: RelayModeVideoSubmit},
+		{path: "/v1/video/generations/task_123", want: RelayModeVideoFetchByID},
+		{path: "/v1/videos/task_123", want: RelayModeVideoFetchByID},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := Path2RelayMode(tt.path); got != tt.want {
+				t.Fatalf("Path2RelayMode(%q) = %d, want %d", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPath2RelayModeAudioGenerationEndpoints(t *testing.T) {
+	tests := []struct {
+		path string
+		want int
+	}{
+		{path: "/v1/audio/generations", want: RelayModeAudioGenerationSubmit},
+		{path: "/v1/audio/generations/task_123", want: RelayModeAudioGenerationFetchByID},
+		{path: "/v1/music/generations", want: RelayModeAudioGenerationSubmit},
+		{path: "/v1/music/generations/task_123", want: RelayModeAudioGenerationFetchByID},
+		{path: "/v1/audio/speech", want: RelayModeAudioSpeech},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := Path2RelayMode(tt.path); got != tt.want {
+				t.Fatalf("Path2RelayMode(%q) = %d, want %d", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPath2RelayModeBatchGenerationEndpoints(t *testing.T) {
+	tests := []struct {
+		path string
+		want int
+	}{
+		{path: "/v1/batch/generations", want: RelayModeBatchGenerationSubmit},
+		{path: "/v1/batch/generations/task_123", want: RelayModeBatchGenerationFetchByID},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := Path2RelayMode(tt.path); got != tt.want {
+				t.Fatalf("Path2RelayMode(%q) = %d, want %d", tt.path, got, tt.want)
+			}
+		})
+	}
+}

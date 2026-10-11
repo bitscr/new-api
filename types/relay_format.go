@@ -1,0 +1,23 @@
+package types
+
+type RelayFormat string
+
+const (
+	RelayFormatTypeSafe                  RelayFormat = "typesafe"
+	RelayFormatOpenAI                    RelayFormat = "openai"
+	RelayFormatClaude                                = "claude"
+	RelayFormatGemini                                = "gemini"
+	RelayFormatOpenAIResponses                       = "openai_responses"
+	RelayFormatOpenAIResponsesCompaction             = "openai_responses_compaction"
+	RelayFormatOpenAIAudio                           = "openai_audio"
+	RelayFormatOpenAIImage                           = "openai_image"
+	RelayFormatOpenAIRealtime                        = "openai_realtime"
+	RelayFormatOpenAILocalSearch                     = "openai_local_search"
+	RelayFormatRerank                                = "rerank"
+	RelayFormatEmbedding                             = "embedding"
+	RelayFormatMistralNative                         = "mistral_native"
+	RelayFormatMistralRealtime                       = "mistral_realtime"
+
+	RelayFormatTask    = "task"
+	RelayFormatMjProxy = "mj_proxy"
+)

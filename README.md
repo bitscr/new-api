@@ -1,0 +1,406 @@
+<div align="center">
+
+![new-api](/web/public/logo.png)
+
+# New API
+
+**AI 模型网关与资产管理平台** — 兼容 OpenAI / Claude / Midjourney 等接口格式的 API 聚合与中继服务。
+
+Docker 镜像、源码编译、配置与部署教程见下文。
+
+</div>
+
+---
+
+## 项目来源与致谢
+
+本项目为 **new-api** 的再开发与独立化版本，代码主体源自上游 **Futureppo 维护的 [new-api](https://github.com/Futureppo/new-api)** 仓库（其上游可继续追溯至 [CalciumIon](https://github.com/CalciumIon/new-api) / [QuantumNous](https://github.com/QuantumNous/new-api) 维护的原版项目）。
+
+> [!NOTE]
+> - 本仓库的 Git 历史已重置为单一初始提交（内容独立于上游，不含任何上游提交与历史数据），与上游**没有公共祖先**，无法直接 fast-forward 同步
+> - 如需拉取上游更新：`git remote add upstream https://github.com/Futureppo/new-api.git`，然后 `git fetch upstream` 手动合并
+> - 本项目遵循上游的开放精神继续独立维护，感谢所有上游开发者
+
+---
+
+## 功能特性
+
+- ✅ **多模型聚合**：一个接口聚合 OpenAI、Claude、Gemini、Midjourney、Rerank 等多种模型，统一 OpenAI 兼容格式对外提供
+- ✅ **渠道与负载均衡**：同一模型配置多个渠道，按优先级/权重自动分配；渠道失败自动回退重试（支持分组、令牌配额）
+- ✅ **虚拟 `auto` 模型**：分组内自动路由到当前可用性最好的模型
+- ✅ **多租户管理**：用户、分组、配额、令牌、邀请与禁用管理面板
+- ✅ **可观测性**：请求日志、错误日志、令牌/额度统计
+- ✅ **事件通知**：Webhook 通知、渠道健康检查与告警能力
+- ✅ **一键部署**：支持 Docker / Docker Compose / 源码编译；数据库可选 SQLite、MySQL、PostgreSQL
+
+> [!IMPORTANT]
+> - 本项目仅用于学习与自托管使用，不对稳定性与技术支持作任何保证
+> - 使用者须遵守当地法律法规与所使用上游模型服务（如 OpenAI）的服务条款，不得将其用于非法用途
+> - 在中国境内请勿将未登记的生成式 AI 服务面向公众开放
+
+---
+
+## 部署方式
+
+有三种部署方式，按需选择：
+
+| 方式 | 适用场景 | 状态 |
+| --- | --- | --- |
+| **二进制 + systemd** | 最轻量，无 Docker 环境 | ✅ 推荐 |
+| **Docker / Compose** | 容器化环境 | ⚠️ 镜像暂不可用（见下） |
+| **源码编译** | 需要定制修改 | ✅ 可用 |
+
+---
+
+## 方式一：二进制部署（Linux，推荐）
+
+### 一键安装（二进制 + systemd）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/install.sh | sudo bash
+```
+
+一条命令做完：识别架构（amd64 / arm64）→ 下载最新 Release 资产并校验 sha256 → 建 `newapi` 用户与 `/opt/new-api` 目录 → 写 systemd unit（默认 `--port 3000`）→ 启动服务并等 `/api/status` 探活通过，最后打印当前版本和回滚命令。
+
+```bash
+# 指定版本安装
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/install.sh | sudo bash -s -- --version v0.0.1
+
+# 换端口（会一起写进 unit；已装过的机器也可以单独调）
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/install.sh | sudo NEW_API_PORT=8080 bash
+```
+
+可调环境变量（写在 `sudo` 后面）：`NEW_API_VERSION`、`NEW_API_PORT`、`NEW_API_DIR`、`NEW_API_BIN`、`NEW_API_USER`、`NEW_API_SERVICE`、`NEW_API_REPO`、`NEW_API_ARCH`。
+
+> 脚本只在**缺失时**创建 `/opt/new-api/env` 和 systemd unit。若 unit 已存在且与脚本模板不同，它不会覆盖，而是另存为 `newapi.service.new` 并提示你 `diff` —— 你手工改过 unit 的机器是安全的。
+
+### 验证与初始化
+
+```bash
+curl http://localhost:3000/api/status   # 返回 {"success":true,...} 即服务正常
+systemctl status new-api
+```
+
+浏览器打开 <http://服务器IP:3000> 完成管理员初始化。
+
+### 常用运维命令
+
+```bash
+sudo systemctl restart new-api     # 重启
+sudo systemctl stop new-api        # 停止
+journalctl -u new-api -f           # 查看实时日志
+ls /opt/new-api/logs               # 落盘日志目录
+```
+
+<details>
+<summary>手动分步安装（等同于上面脚本做的事）</summary>
+
+#### 1. 下载二进制
+
+到 [Releases 页面](https://github.com/bitscr/new-api/releases) 下载对应架构的压缩包，或直接：
+
+```bash
+# 查看机器架构
+uname -m   # x86_64 → amd64；aarch64 → arm64
+
+# 下载并解压（以 amd64 为例，文件名以实际 Release 为准）
+wget https://github.com/bitscr/new-api/releases/latest/download/new-api-linux-amd64.tar.gz
+wget https://github.com/bitscr/new-api/releases/latest/download/new-api-linux-amd64.tar.gz.sha256
+
+# Release 里的 .sha256 记录的是构建目录内的相对路径（release/xxx.tar.gz），
+# 直接 sha256sum -c 会报找不到文件，这里取哈希值重拼本地文件名再校验
+echo "$(awk '{print $1}' new-api-linux-amd64.tar.gz.sha256)  new-api-linux-amd64.tar.gz" | sha256sum -c -
+
+tar -xzf new-api-linux-amd64.tar.gz
+sudo install -m 0755 new-api-linux-amd64 /usr/local/bin/new-api
+```
+
+> 二进制由 CI 发布：仓库打 `v*` tag（或手动触发「Build release binaries」workflow）后，产出 `new-api-linux-amd64.tar.gz` / `new-api-linux-arm64.tar.gz` 及其 `.sha256` 校验文件。
+
+#### 2. 准备目录与配置
+
+```bash
+sudo useradd -r -s /usr/sbin/nologin newapi 2>/dev/null || true
+sudo mkdir -p /opt/new-api/{data,logs,web}
+sudo chown -R newapi:newapi /opt/new-api
+
+# 如需使用 MySQL / PostgreSQL / Redis，编辑 /opt/new-api/env：
+sudo tee /opt/new-api/env > /dev/null <<'EOF'
+# SQL_DSN=postgresql://user:password@localhost:5432/new-api
+# REDIS_CONN_STRING=redis://:password@localhost:6379
+EOF
+```
+
+> 二进制内置前端资源（`go:embed`），**不需要**单独的 `web/dist` 目录。
+
+#### 3. systemd 服务
+
+```bash
+sudo tee /etc/systemd/system/new-api.service > /dev/null <<'EOF'
+[Unit]
+Description=New API Service
+After=network.target
+
+[Service]
+User=newapi
+WorkingDirectory=/opt/new-api
+EnvironmentFile=/opt/new-api/env
+ExecStart=/usr/local/bin/new-api --port 3000 --log-dir /opt/new-api/logs
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now new-api
+sudo systemctl status new-api
+```
+
+</details>
+
+---
+
+## 方式二：Docker 部署
+
+> ⚠️ **镜像暂不可用**：GHCR 发布流水线目前构建失败（push 阶段被拒），`ghcr.io/bitscr/new-api` 尚无可用镜像。修复后会更新本节；当前请使用方式一或方式三。
+
+<details>
+<summary>Docker 命令（待镜像可用后生效）</summary>
+
+### 1. 拉取镜像并运行（默认 SQLite）
+
+```bash
+docker pull ghcr.io/bitscr/new-api:latest
+
+docker run -d \
+  --name new-api \
+  --restart always \
+  -p 3000:3000 \
+  -v ./new-api-data:/data \
+  -v ./new-api-logs:/app/logs \
+  ghcr.io/bitscr/new-api:latest
+```
+
+- 数据目录：容器内 `/data`（SQLite 数据库文件默认存放在此）
+- 日志目录：容器内 `/app/logs`
+- 默认端口：`3000`
+
+### 2. 初始化
+
+浏览器打开 <http://localhost:3000>，按照引导完成初始化（创建管理员账号）。
+
+> 如果端口被占用，可改用其他端口：`-p 8080:3000`。
+
+### 3. 验证
+
+```bash
+curl http://localhost:3000/api/status
+```
+
+返回 `{"success":true,...}` 即服务正常。
+
+</details>
+
+---
+
+## 方式二补充：Docker Compose 部署（Redis + 数据库）
+
+仓库内自带 `docker-compose.yml`，默认组合为 **Redis + PostgreSQL**（也可改用 MySQL），包含健康检查与持久化卷：
+
+```bash
+git clone https://github.com/bitscr/new-api.git
+cd new-api
+docker compose up -d
+```
+
+> ⚠️ **生产部署前务必修改所有默认密码**（PostgreSQL `123456`、Redis `123456`），并取消注释设置 `SESSION_SECRET` 随机字符串。
+
+数据库切换说明（详见 `docker-compose.yml` 文件头注释）：
+
+- **PostgreSQL**（默认）：直接 `docker compose up -d`
+- **MySQL**：注释 Postgres 相关 `SQL_DSN` 行、取消注释 MySQL 服务与 `SQL_DSN=root:123456@tcp(mysql:3306)/new-api`，并在 `depends_on` / `volumes` 中取消相应的 MySQL 注释
+
+---
+
+## 方式三：源码编译安装
+
+### 前置要求
+
+| 组件 | 版本要求 | 用途 |
+| --- | --- | --- |
+| Go | ≥ 1.25.1（推荐 1.26.x） | 后端编译 |
+| bun | ≥ 1.2 | 前端依赖与构建 |
+| Node.js（可选） | 20+ | 若使用 `npm` 替代 bun 执行前端脚本 |
+
+### 1. 克隆仓库
+
+```bash
+git clone https://github.com/bitscr/new-api.git
+cd new-api
+```
+
+### 2. 构建前端
+
+```bash
+cd web
+bun install
+DISABLE_ESLINT_PLUGIN='true' bun run build
+cd ..
+```
+
+构建产物输出到 `web/dist`。
+
+### 3. 构建后端
+
+```bash
+# 下载依赖
+go mod download
+
+# 编译（如需注入版本号，参考仓库 Dockerfile 中的 ldflags 写法）
+go build -o new-api
+```
+
+### 4. 运行
+
+```bash
+# 将 web/dist 与后端二进制放在同一目录结构下（或直接使用仓库根目录）
+./new-api
+```
+
+默认监听 `3000` 端口，可用 `--port` 参数修改：
+
+```bash
+./new-api --port 8080
+```
+
+### 5. 配置数据库（可选）
+
+默认使用 SQLite，数据文件保存于数据目录。如需使用 MySQL / PostgreSQL，通过环境变量指定：
+
+```bash
+# PostgreSQL
+export SQL_DSN="postgresql://user:password@host:5432/new-api"
+
+# MySQL
+export SQL_DSN="user:password@tcp(host:3306)/new-api"
+
+./new-api
+```
+
+---
+
+## 环境变量
+
+| 变量 | 说明 | 示例 |
+| --- | --- | --- |
+| `SQL_DSN` | 数据库连接串；留空使用 SQLite | `postgresql://root:123456@postgres:5432/new-api` |
+| `REDIS_CONN_STRING` | Redis 连接串（速率限制/缓存等） | `redis://:123456@redis:6379` |
+| `SESSION_SECRET` | 会话签名密钥；**多机部署必须设置随机字符串** | `random_string` |
+| `TZ` | 时区 | `Asia/Shanghai` |
+| `ERROR_LOG_ENABLED` | 是否启用错误日志记录 | `true` |
+| `BATCH_UPDATE_ENABLED` | 是否启用批量更新 | `true` |
+| `NODE_NAME` | 节点名称（审计日志标识；多实例建议设置） | `node-1` |
+| `STREAMING_TIMEOUT` | 流模式无响应超时（秒），默认 `300` | `300` |
+| `SYNC_FREQUENCY` | 需要定期数据库同步时设置（秒） | `60` |
+
+---
+
+## 反向代理（Nginx + HTTPS 示例）
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name api.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/api.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+
+    client_max_body_size 64m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 600s;
+    }
+}
+
+server {
+    listen 80;
+    server_name api.example.com;
+    return 301 https://$host$request_uri;
+}
+```
+
+---
+
+## 升级与备份
+
+### 一键升级（二进制 + systemd）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/install.sh | sudo bash -s -- --update
+```
+
+脚本会：下载最新 Release → 校验 sha256 → 把旧二进制备份成 `/usr/local/bin/new-api.bak-<时间戳>` → 重启服务并探活，最后打印当前版本和回滚命令。端口、用户、数据目录、env、systemd unit 全部沿用现状，不会重建。
+
+```bash
+# 升级到指定版本
+curl -fsSL https://raw.githubusercontent.com/bitscr/new-api/main/scripts/install.sh | sudo bash -s -- --update --version v0.0.2
+```
+
+回滚（脚本探活失败时也会把这条命令打出来）：
+
+```bash
+sudo systemctl stop new-api
+sudo mv /usr/local/bin/new-api.bak-20261007132415 /usr/local/bin/new-api
+sudo systemctl start new-api
+```
+
+<details>
+<summary>手动升级（等同于上面脚本做的事）</summary>
+
+```bash
+# 1. 下载新版二进制并校验（版本见 Releases）
+wget https://github.com/bitscr/new-api/releases/latest/download/new-api-linux-amd64.tar.gz
+wget https://github.com/bitscr/new-api/releases/latest/download/new-api-linux-amd64.tar.gz.sha256
+echo "$(awk '{print $1}' new-api-linux-amd64.tar.gz.sha256)  new-api-linux-amd64.tar.gz" | sha256sum -c -
+
+# 2. 备份旧二进制、替换、重启
+tar -xzf new-api-linux-amd64.tar.gz
+sudo cp -a /usr/local/bin/new-api /usr/local/bin/new-api.bak-$(date +%Y%m%d)
+sudo install -m 0755 new-api-linux-amd64 /usr/local/bin/new-api
+sudo systemctl restart new-api
+```
+
+</details>
+
+**Docker Compose 升级：**
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+**备份：**
+
+- SQLite（二进制部署）：备份工作目录下的数据库文件 `/opt/new-api/one-api.db`
+- SQLite（Docker）：备份挂载出来的数据目录（默认 `/data` 或 `./new-api-data`）
+- PostgreSQL / MySQL：使用对应 `pg_dump` / `mysqldump` 备份
+- 配置：二进制部署的 `/opt/new-api/env`、Docker 的 `.env` 与 compose 文件
+- 日志：备份 `/opt/new-api/logs` 或 `/app/logs` 目录
+
+---
+
+## 问题与支持
+
+- 问题报告与功能建议：[Issues](https://github.com/bitscr/new-api/issues)
+- 安全漏洞：请使用 GitHub Security Advisories 私密报告，请勿在公开 Issue 中披露
+
+## 许可
+
+GNU Affero General Public License v3.0（AGPL-3.0），详见 [LICENSE](./LICENSE)。

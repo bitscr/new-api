@@ -1,0 +1,136 @@
+package common
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/stretchr/testify/require"
+)
+
+func TestGetEndpointTypesByChannelTypeCohere(t *testing.T) {
+	require.Equal(
+		t,
+		[]constant.EndpointType{constant.EndpointTypeCohereChat},
+		GetEndpointTypesByChannelType(constant.ChannelTypeCohere, "command-a-03-2025"),
+	)
+	require.Equal(
+		t,
+		[]constant.EndpointType{constant.EndpointTypeCohereRerank},
+		GetEndpointTypesByChannelType(constant.ChannelTypeCohere, "rerank-v3.5"),
+	)
+	require.Equal(
+		t,
+		[]constant.EndpointType{constant.EndpointTypeCohereEmbeddings},
+		GetEndpointTypesByChannelType(constant.ChannelTypeCohere, "embed-v4.0"),
+	)
+}
+
+func TestPoeChannelTypeMappingAndEndpoints(t *testing.T) {
+	apiType, ok := ChannelType2APIType(constant.ChannelTypePoe)
+	require.True(t, ok)
+	require.Equal(t, constant.APITypePoe, apiType)
+
+	require.Equal(
+		t,
+		[]constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse},
+		GetEndpointTypesByChannelType(constant.ChannelTypePoe, "sora-2"),
+	)
+}
+
+func TestGetEndpointTypesByChannelTypeVolcEngine(t *testing.T) {
+	tests := []struct {
+		model string
+		want  []constant.EndpointType
+	}{
+		{
+			model: "doubao-seed-2-0-pro-260215",
+			want:  []constant.EndpointType{constant.EndpointTypeOpenAI},
+		},
+		{
+			model: "deepseek-v4-flash-260425",
+			want:  []constant.EndpointType{constant.EndpointTypeOpenAI},
+		},
+		{
+			model: "doubao-embedding-text-240715",
+			want:  []constant.EndpointType{constant.EndpointTypeEmbeddings},
+		},
+		{
+			model: "doubao-embedding-vision-251215",
+			want:  []constant.EndpointType{constant.EndpointTypeEmbeddings},
+		},
+		{
+			model: "doubao-seedream-5-0-260128",
+			want:  []constant.EndpointType{constant.EndpointTypeImageGeneration, constant.EndpointTypeOpenAI},
+		},
+		{
+			model: "doubao-seededit-3-0-i2i-250628",
+			want:  []constant.EndpointType{constant.EndpointTypeImageGeneration, constant.EndpointTypeOpenAI},
+		},
+		{
+			model: "doubao-seedance-2-0-fast-260128",
+			want:  []constant.EndpointType{constant.EndpointTypeOpenAIVideo},
+		},
+		{
+			model: "wan2-1-14b-i2v-250225",
+			want:  []constant.EndpointType{constant.EndpointTypeOpenAIVideo},
+		},
+		{
+			model: "doubao-seed3d-2-0-260328",
+			want:  []constant.EndpointType{constant.EndpointTypeOpenAIVideo},
+		},
+		{
+			model: "hyper3d-gen2-260112",
+			want:  []constant.EndpointType{constant.EndpointTypeOpenAIVideo},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			require.Equal(t, tt.want, GetEndpointTypesByChannelType(constant.ChannelTypeVolcEngine, tt.model))
+		})
+	}
+}
+
+func TestGetEndpointTypesByChannelTypeOpenCode(t *testing.T) {
+	tests := []struct {
+		model string
+		want  []constant.EndpointType
+	}{
+		{model: "gpt-5.6-sol", want: []constant.EndpointType{constant.EndpointTypeOpenAIResponse, constant.EndpointTypeOpenAI}},
+		{model: "grok-4.5", want: []constant.EndpointType{constant.EndpointTypeOpenAIResponse, constant.EndpointTypeOpenAI}},
+		{model: "muse-spark-1.3-contributor-free", want: []constant.EndpointType{constant.EndpointTypeOpenAIResponse, constant.EndpointTypeOpenAI}},
+		{model: "claude-sonnet-5", want: []constant.EndpointType{constant.EndpointTypeAnthropic, constant.EndpointTypeOpenAI}},
+		{model: "qwen3.6-plus", want: []constant.EndpointType{constant.EndpointTypeAnthropic, constant.EndpointTypeOpenAI}},
+		{model: "gemini-3-flash", want: []constant.EndpointType{constant.EndpointTypeGemini, constant.EndpointTypeOpenAI}},
+		{model: "big-pickle", want: []constant.EndpointType{constant.EndpointTypeOpenAI}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			require.Equal(t, tt.want, GetEndpointTypesByChannelType(constant.ChannelTypeOpenCode, tt.model))
+		})
+	}
+}
+
+func TestGetEndpointTypesByChannelTypeOpenCodeGo(t *testing.T) {
+	apiType, ok := ChannelType2APIType(constant.ChannelTypeOpenCodeGo)
+	require.True(t, ok)
+	require.Equal(t, constant.APITypeOpenCodeGo, apiType)
+
+	tests := []struct {
+		model string
+		want  []constant.EndpointType
+	}{
+		{model: "gpt-5.6-luna", want: []constant.EndpointType{constant.EndpointTypeOpenAIResponse, constant.EndpointTypeOpenAI}},
+		{model: "grok-4.5", want: []constant.EndpointType{constant.EndpointTypeOpenAI}},
+		{model: "minimax-m3", want: []constant.EndpointType{constant.EndpointTypeAnthropic, constant.EndpointTypeOpenAI}},
+		{model: "qwen3.8-max", want: []constant.EndpointType{constant.EndpointTypeAnthropic, constant.EndpointTypeOpenAI}},
+		{model: "kimi-k3", want: []constant.EndpointType{constant.EndpointTypeOpenAI}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			require.Equal(t, tt.want, GetEndpointTypesByChannelType(constant.ChannelTypeOpenCodeGo, tt.model))
+		})
+	}
+}

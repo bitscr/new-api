@@ -1,0 +1,327 @@
+package enhancement
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/stretchr/testify/require"
+)
+
+type gitHubAgeBanMockResult struct {
+	login     string
+	createdAt time.Time
+	err       error
+	rateLimit githubAgeBanRateLimit
+}
+
+func stubGitHubAgeBanLookup(t *testing.T, now time.Time, results map[string]gitHubAgeBanMockResult) {
+	t.Helper()
+
+	originalLookup := githubAgeBanLookupUser
+	originalNow := githubAgeBanNow
+	githubAgeBanNow = func() time.Time { return now }
+	githubAgeBanLookupUser = func(ctx context.Context, accountID string) (githubAgeBanLookupInfo, githubAgeBanRateLimit, error) {
+		result, ok := results[accountID]
+		if !ok {
+			return githubAgeBanLookupInfo{}, githubAgeBanRateLimit{}, fmt.Errorf("unexpected github id %s", accountID)
+		}
+		if result.rateLimit.Limited {
+			return githubAgeBanLookupInfo{}, result.rateLimit, nil
+		}
+		if result.err != nil {
+			return githubAgeBanLookupInfo{}, githubAgeBanRateLimit{}, result.err
+		}
+		return githubAgeBanLookupInfo{
+			Login:     result.login,
+			CreatedAt: result.createdAt,
+		}, githubAgeBanRateLimit{}, nil
+	}
+	t.Cleanup(func() {
+		githubAgeBanLookupUser = originalLookup
+		githubAgeBanNow = originalNow
+	})
+}
+
+func seedGitHubAgeBanUser(t *testing.T, id int, role int, status int, githubID string) model.User {
+	t.Helper()
+
+	user := model.User{
+		Id:       id,
+		Username: fmt.Sprintf("github_age_user_%d", id),
+		Password: "password",
+		Role:     role,
+		Status:   status,
+		Email:    fmt.Sprintf("github_age_user_%d@example.com", id),
+		GitHubId: githubID,
+		AffCode:  fmt.Sprintf("github_age_aff_%d", id),
+	}
+	require.NoError(t, model.DB.Create(&user).Error)
+	return user
+}
+
+func requireGitHubAgeBanUserStatus(t *testing.T, id int, status int, reason string) {
+	t.Helper()
+
+	var user model.User
+	require.NoError(t, model.DB.Where("id = ?", id).First(&user).Error)
+	require.Equal(t, status, user.Status)
+	require.Equal(t, reason, user.DisableReason)
+}
+
+func TestBatchBanYoungGitHubUsersRejectsNonPositiveThreshold(t *testing.T) {
+	_, err := BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{MinimumAgeSeconds: 0, DryRun: true}, 900)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "minimum_age_seconds")
+
+	_, err = BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{MinimumAgeSeconds: -1, DryRun: true}, 900)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "minimum_age_seconds")
+}
+
+func TestBatchBanYoungGitHubUsersRejectsInvalidUserIDRange(t *testing.T) {
+	_, err := BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{
+		MinimumAgeSeconds: 60,
+		UserIdStart:       -1,
+		DryRun:            true,
+	}, 900)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "user_id_start")
+
+	_, err = BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{
+		MinimumAgeSeconds: 60,
+		UserIdEnd:         -1,
+		DryRun:            true,
+	}, 900)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "user_id_end")
+
+	_, err = BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{
+		MinimumAgeSeconds: 60,
+		UserIdStart:       200,
+		UserIdEnd:         100,
+		DryRun:            true,
+	}, 900)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "user_id_end")
+}
+
+func TestBatchBanYoungGitHubUsersDryRunDoesNotModifyUsers(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	now := time.Unix(2_000_000_000, 0)
+	seedGitHubAgeBanUser(t, 101, common.RoleCommonUser, common.UserStatusEnabled, "1001")
+	stubGitHubAgeBanLookup(t, now, map[string]gitHubAgeBanMockResult{
+		"1001": {login: "young", createdAt: now.Add(-10 * time.Second)},
+	})
+
+	result, err := BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{
+		MinimumAgeSeconds: 60,
+		DryRun:            true,
+	}, 900)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.TotalCandidates)
+	require.Equal(t, 1, result.Checked)
+	require.Equal(t, 1, result.Matched)
+	require.Equal(t, 0, result.Banned)
+	require.Len(t, result.MatchedUsers, 1)
+	requireGitHubAgeBanUserStatus(t, 101, common.UserStatusEnabled, "")
+}
+
+func TestBatchBanYoungGitHubUsersFiltersByUserIDRange(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	now := time.Unix(2_000_000_000, 0)
+	seedGitHubAgeBanUser(t, 991, common.RoleCommonUser, common.UserStatusEnabled, "991")
+	seedGitHubAgeBanUser(t, 1000, common.RoleCommonUser, common.UserStatusEnabled, "1000")
+	seedGitHubAgeBanUser(t, 1500, common.RoleCommonUser, common.UserStatusEnabled, "1500")
+	seedGitHubAgeBanUser(t, 2000, common.RoleCommonUser, common.UserStatusEnabled, "2000")
+	seedGitHubAgeBanUser(t, 2001, common.RoleCommonUser, common.UserStatusEnabled, "2001")
+	stubGitHubAgeBanLookup(t, now, map[string]gitHubAgeBanMockResult{
+		"1000": {login: "range-start", createdAt: now.Add(-10 * time.Second)},
+		"1500": {login: "range-mid", createdAt: now.Add(-10 * time.Second)},
+		"2000": {login: "range-end", createdAt: now.Add(-10 * time.Second)},
+	})
+
+	result, err := BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{
+		MinimumAgeSeconds: 60,
+		UserIdStart:       1000,
+		UserIdEnd:         2000,
+		DryRun:            true,
+	}, 900)
+
+	require.NoError(t, err)
+	require.Equal(t, 1000, result.UserIdStart)
+	require.Equal(t, 2000, result.UserIdEnd)
+	require.Equal(t, 3, result.TotalCandidates)
+	require.Equal(t, 3, result.Checked)
+	require.Equal(t, 3, result.Matched)
+	require.Len(t, result.MatchedUsers, 3)
+	require.Equal(t, []int{1000, 1500, 2000}, []int{
+		result.MatchedUsers[0].Id,
+		result.MatchedUsers[1].Id,
+		result.MatchedUsers[2].Id,
+	})
+}
+
+func TestBatchBanYoungGitHubUsersExecutesOnlyMatchingEnabledCommonUsers(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	now := time.Unix(2_000_000_000, 0)
+	reason := "young github account"
+	seedGitHubAgeBanUser(t, 201, common.RoleCommonUser, common.UserStatusEnabled, "2001")
+	seedGitHubAgeBanUser(t, 202, common.RoleCommonUser, common.UserStatusEnabled, "2002")
+	seedGitHubAgeBanUser(t, 203, common.RoleCommonUser, common.UserStatusEnabled, "2003")
+	seedGitHubAgeBanUser(t, 204, common.RoleAdminUser, common.UserStatusEnabled, "2004")
+	seedGitHubAgeBanUser(t, 205, common.RoleRootUser, common.UserStatusEnabled, "2005")
+	seedGitHubAgeBanUser(t, 206, common.RoleCommonUser, common.UserStatusDisabled, "2006")
+	seedGitHubAgeBanUser(t, 207, common.RoleCommonUser, common.UserStatusEnabled, "octocat")
+	seedGitHubAgeBanUser(t, 208, common.RoleCommonUser, common.UserStatusEnabled, "")
+	seedGitHubAgeBanUser(t, 209, common.RoleCommonUser, common.UserStatusEnabled, "2009")
+	stubGitHubAgeBanLookup(t, now, map[string]gitHubAgeBanMockResult{
+		"2001":    {login: "young", createdAt: now.Add(-99 * time.Second)},
+		"2002":    {login: "equal", createdAt: now.Add(-100 * time.Second)},
+		"2003":    {login: "old", createdAt: now.Add(-101 * time.Second)},
+		"octocat": {login: "octocat", createdAt: now.Add(-101 * time.Second)},
+	})
+
+	result, err := BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{
+		MinimumAgeSeconds: 100,
+		Reason:            reason,
+	}, 209)
+
+	require.NoError(t, err)
+	require.Equal(t, 5, result.TotalCandidates)
+	require.Equal(t, 4, result.Checked)
+	require.Equal(t, 2, result.Matched)
+	require.Equal(t, 2, result.Banned)
+	require.Equal(t, 1, result.Skipped)
+	require.Len(t, result.MatchedUsers, 2)
+	require.Len(t, result.SkippedUsers, 1)
+	requireGitHubAgeBanUserStatus(t, 201, common.UserStatusDisabled, reason)
+	requireGitHubAgeBanUserStatus(t, 202, common.UserStatusDisabled, reason)
+	requireGitHubAgeBanUserStatus(t, 203, common.UserStatusEnabled, "")
+	requireGitHubAgeBanUserStatus(t, 204, common.UserStatusEnabled, "")
+	requireGitHubAgeBanUserStatus(t, 205, common.UserStatusEnabled, "")
+	requireGitHubAgeBanUserStatus(t, 206, common.UserStatusDisabled, "")
+	requireGitHubAgeBanUserStatus(t, 207, common.UserStatusEnabled, "")
+	requireGitHubAgeBanUserStatus(t, 208, common.UserStatusEnabled, "")
+	requireGitHubAgeBanUserStatus(t, 209, common.UserStatusEnabled, "")
+}
+
+func TestBatchBanYoungGitHubUsersSupportsLegacyUsernameGitHubID(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	now := time.Unix(2_000_000_000, 0)
+	reason := "legacy username github account"
+	seedGitHubAgeBanUser(t, 251, common.RoleCommonUser, common.UserStatusEnabled, "clip-fog-causal")
+	stubGitHubAgeBanLookup(t, now, map[string]gitHubAgeBanMockResult{
+		"clip-fog-causal": {login: "clip-fog-causal", createdAt: now.Add(-2 * time.Hour)},
+	})
+
+	result, err := BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{
+		MinimumAgeSeconds: 31536000,
+		Reason:            reason,
+	}, 900)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.TotalCandidates)
+	require.Equal(t, 1, result.Checked)
+	require.Equal(t, 1, result.Matched)
+	require.Equal(t, 1, result.Banned)
+	require.Len(t, result.MatchedUsers, 1)
+	require.Equal(t, "clip-fog-causal", result.MatchedUsers[0].GitHubLogin)
+	requireGitHubAgeBanUserStatus(t, 251, common.UserStatusDisabled, reason)
+}
+
+func TestBatchBanYoungGitHubUsersExecutesOnlySelectedUsers(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	now := time.Unix(2_000_000_000, 0)
+	reason := "selected github account"
+	seedGitHubAgeBanUser(t, 261, common.RoleCommonUser, common.UserStatusEnabled, "2601")
+	seedGitHubAgeBanUser(t, 262, common.RoleCommonUser, common.UserStatusEnabled, "2602")
+	stubGitHubAgeBanLookup(t, now, map[string]gitHubAgeBanMockResult{
+		"2601": {login: "selected", createdAt: now.Add(-10 * time.Second)},
+		"2602": {login: "cancelled", createdAt: now.Add(-10 * time.Second)},
+	})
+
+	result, err := BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{
+		MinimumAgeSeconds: 60,
+		Reason:            reason,
+		UserIds:           []int{261},
+	}, 900)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.TotalCandidates)
+	require.Equal(t, 1, result.Checked)
+	require.Equal(t, 1, result.Matched)
+	require.Equal(t, 1, result.Banned)
+	requireGitHubAgeBanUserStatus(t, 261, common.UserStatusDisabled, reason)
+	requireGitHubAgeBanUserStatus(t, 262, common.UserStatusEnabled, "")
+}
+
+func TestBatchBanYoungGitHubUsersReportsFailures(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	now := time.Unix(2_000_000_000, 0)
+	seedGitHubAgeBanUser(t, 301, common.RoleCommonUser, common.UserStatusEnabled, "3001")
+	seedGitHubAgeBanUser(t, 302, common.RoleCommonUser, common.UserStatusEnabled, "3002")
+	stubGitHubAgeBanLookup(t, now, map[string]gitHubAgeBanMockResult{
+		"3001": {err: errors.New("github lookup failed: status 404")},
+		"3002": {err: errors.New("invalid github created_at")},
+	})
+
+	result, err := BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{
+		MinimumAgeSeconds: 60,
+		DryRun:            true,
+	}, 900)
+
+	require.NoError(t, err)
+	require.Equal(t, 2, result.Checked)
+	require.Equal(t, 2, result.Failures)
+	require.Len(t, result.FailureUsers, 2)
+	require.False(t, result.RateLimited)
+	requireGitHubAgeBanUserStatus(t, 301, common.UserStatusEnabled, "")
+	requireGitHubAgeBanUserStatus(t, 302, common.UserStatusEnabled, "")
+}
+
+func TestBatchBanYoungGitHubUsersStopsOnRateLimit(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	now := time.Unix(2_000_000_000, 0)
+	seedGitHubAgeBanUser(t, 401, common.RoleCommonUser, common.UserStatusEnabled, "4001")
+	seedGitHubAgeBanUser(t, 402, common.RoleCommonUser, common.UserStatusEnabled, "4002")
+	stubGitHubAgeBanLookup(t, now, map[string]gitHubAgeBanMockResult{
+		"4001": {rateLimit: githubAgeBanRateLimit{Limited: true, Reset: now.Add(time.Hour).Unix()}},
+	})
+
+	result, err := BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{
+		MinimumAgeSeconds: 60,
+	}, 900)
+
+	require.NoError(t, err)
+	require.True(t, result.RateLimited)
+	require.Equal(t, now.Add(time.Hour).Unix(), result.RateLimitReset)
+	require.Equal(t, 1, result.Checked)
+	require.Equal(t, 0, result.Banned)
+	requireGitHubAgeBanUserStatus(t, 401, common.UserStatusEnabled, "")
+	requireGitHubAgeBanUserStatus(t, 402, common.UserStatusEnabled, "")
+}
+
+func TestGitHubAgeManualBanSharesDuration(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	now := time.Now()
+	seedGitHubAgeBanUser(t, 101, common.RoleCommonUser, common.UserStatusEnabled, "1001")
+	seedGitHubAgeBanUser(t, 102, common.RoleCommonUser, common.UserStatusEnabled, "1002")
+	stubGitHubAgeBanLookup(t, now, map[string]gitHubAgeBanMockResult{
+		"1001": {login: "first", createdAt: now.Add(-10 * time.Second)},
+		"1002": {login: "second", createdAt: now.Add(-10 * time.Second)},
+	})
+	result, err := BatchBanYoungGitHubUsers(context.Background(), GitHubAgeBanRequest{MinimumAgeSeconds: 60, DurationMinutes: 3, Reason: "timed"}, 900)
+	require.NoError(t, err)
+	require.Equal(t, 2, result.Banned)
+	var users []model.User
+	require.NoError(t, model.DB.Order("id").Find(&users).Error)
+	require.Equal(t, int64(3), users[0].DisableDurationMinutes)
+	require.Equal(t, users[0].DisableUntil, users[1].DisableUntil)
+	require.GreaterOrEqual(t, users[0].DisableUntil, now.Unix()+180)
+}
