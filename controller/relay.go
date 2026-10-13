@@ -401,7 +401,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.LastError = newAPIError
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
-		recordAutoModelUpstreamFailure(c, relayInfo, newAPIError)
+		if autoModelRequestFault(newAPIError) {
+			// 请求体本身有问题(工具消息结构非法等)时,上游 400 不代表"这条渠道/这个模型
+			// 不稳定"。早先这里照记冷却,于是同一个畸形请求重试到任何候选都被
+			// (group, model, channel) 冷却挡住,而真正的病根是调用方发来的 body。
+			// 只跳过冷却/记分,重试与换候选的既有策略不动。
+			logger.LogInfo(c, fmt.Sprintf("auto model: %s 请求自身非法(HTTP %d),不计入渠道/模型冷却", relayInfo.OriginModelName, newAPIError.StatusCode))
+		} else {
+			recordAutoModelUpstreamFailure(c, relayInfo, newAPIError)
+		}
 
 		if autoRequest {
 			// Model-specific failures retain sibling-model fallback. Channel-scoped
@@ -1052,6 +1060,80 @@ func recordAutoModelUpstreamFailure(c *gin.Context, info *relaycommon.RelayInfo,
 		permanent: service.AutoModelPermanentFailure(err),
 		reason:    autoModelPermanentFailureReason(err),
 	})
+}
+
+// autoModelRequestFault 判定一次上游失败是不是"这次请求体写坏了",而不是
+// "这条渠道/这个模型不行"。命中时不记录 auto 冷却与评分:重试换候选解决不了
+// 请求体的错,冷却反而会把好候选一起挡掉(实测:同一份工具消息结构非法的
+// 请求,连续把渠道 26 上 4 个不同模型各自冷却 15 分钟)。
+//
+// 判据(两类,都必须同时满足"状态码 400/422"+"错误文本指向请求体"):
+//
+// 1) 工具消息结构非法:上游明说 tool_call_id 缺失、function call output 找不到
+//    对应的 function call(实测 wusrouter 渠道 26 的 10:13/10:14 三次)。
+// 2) 上游只回裸状态文本:即只透传 HTTP reason phrase(`Bad Request`、`Unprocessable
+//    Entity`)或干脆是空 body。这类含糊 400 说明上游没给结构化原因,把疑点算到
+//    模型头上没有依据;而"请求体合法但模型/渠道不可用"的情况,上游几乎都会给出
+//    可读的原因(模型不可用、无权、上下文超长、限流……),那些走原有冷却。
+//
+// 认证、限流、模型不存在、上下文超长一律不走这里。仅凭 `invalid_request` 这个泛化
+// 错误码也不走:它可能是模型级问题,冷却语义保持原样。
+func autoModelRequestFault(err *types.NewAPIError) bool {
+	if err == nil || (err.StatusCode != http.StatusBadRequest && err.StatusCode != http.StatusUnprocessableEntity) {
+		return false
+	}
+	if autoModelMessagePointsAtRequestBody(err.Error()) {
+		return true
+	}
+	// 裸状态文本兜底:错误正文只剩状态文本或为空。
+	detail := err.ToOpenAIError()
+	for _, line := range []string{err.Error(), detail.Message} {
+		if autoModelBareStatusText(line, err.StatusCode) {
+			return true
+		}
+	}
+	return false
+}
+
+func autoModelMessagePointsAtRequestBody(message string) bool {
+	text := strings.ToLower(message)
+	for _, marker := range []string{
+		"tool_call_id",
+		"tool call id",
+		"function call output",
+		"function_call_output",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// autoModelBareStatusText 判断一段错误正文是不是"只剩 HTTP 状态文本/为空"。
+// 上游把请求体错误或自身故障都压成 `Bad Request` 时,这里归为请求侧:正文如此
+// 含糊,不足以支撑"这个模型在这条渠道上坏了"的判断。带实义内容的正文(例如
+// `Invalid request field: messages`)不会被误判。
+func autoModelBareStatusText(message string, statusCode int) bool {
+	text := strings.ToLower(strings.TrimSpace(message))
+	if text == "" {
+		return true
+	}
+	text = strings.Trim(strings.TrimSpace(text), ".:;,!?")
+	for _, candidate := range []string{"bad request", "unprocessable entity"} {
+		if text == candidate {
+			return true
+		}
+	}
+	// `bad request (request id: ...)` 一类的包装:去掉括号补充说明后仍是纯状态文本。
+	if strings.HasPrefix(text, "bad request") || strings.HasPrefix(text, "unprocessable entity") {
+		rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "bad request"), "unprocessable entity"))
+		rest = strings.TrimSpace(strings.TrimPrefix(rest, ":"))
+		if rest == "" || strings.HasPrefix(rest, "(request id:") || strings.HasPrefix(rest, "[request id:") {
+			return true
+		}
+	}
+	return false
 }
 
 // autoModelPermanentFailureReason 给出日志/排查用的一句话原因,不参与判定。

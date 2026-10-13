@@ -44,6 +44,11 @@ const OperationSetting = () => {
     /* 通用设置 */
     TopUpLink: '',
     'general_setting.docs_link': '',
+    // 必须出现在这里:本组件只把白名单内的键从 GET /api/option/ 回填进 inputs,
+    // 再整包作为 props.options 下发给 SettingsGeneral。漏了它,子组件的基准快照
+    // 就永远拿不到该键,compareObjects 判不出差异 → 点保存提示"你似乎并没有修改什么"
+    // 且一个请求都不发(全局 UA 保存无效的根因)。
+    'general_setting.global_user_agent': '',
     QuotaPerUnit: 0,
     USDExchangeRate: 0,
     RetryTimes: 0,
