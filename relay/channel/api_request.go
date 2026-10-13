@@ -118,6 +118,42 @@ func isHeaderPassthroughRuleKey(key string) bool {
 	return strings.HasPrefix(lower, headerPassthroughRegexPrefix) || strings.HasPrefix(lower, headerPassthroughRegexPrefixV2)
 }
 
+// hasHeaderPassthroughUserAgentRule 报告渠道透传规则是否会把客户端 User-Agent
+// 原样带给上游(整表透传 "*",或名字能匹配 user-agent 的正则规则)。命中时
+// 全局 UA 兜底必须让位,否则会覆盖掉用户刻意保留的客户端 UA。
+func hasHeaderPassthroughUserAgentRule(source map[string]any) bool {
+	for k := range source {
+		key := strings.TrimSpace(strings.ToLower(k))
+		if key == "" {
+			continue
+		}
+		if key == headerPassthroughAllKey {
+			return true
+		}
+		var pattern string
+		switch {
+		case strings.HasPrefix(key, headerPassthroughRegexPrefix):
+			pattern = strings.TrimSpace(key[len(headerPassthroughRegexPrefix):])
+		case strings.HasPrefix(key, headerPassthroughRegexPrefixV2):
+			pattern = strings.TrimSpace(key[len(headerPassthroughRegexPrefixV2):])
+		default:
+			continue
+		}
+		if pattern == "" {
+			continue
+		}
+		compiled, err := getHeaderPassthroughRegex(pattern)
+		if err != nil {
+			// 非法正则会由主流程报错,这里不参与全局 UA 的判定。
+			continue
+		}
+		if compiled.MatchString("user-agent") {
+			return true
+		}
+	}
+	return false
+}
+
 func shouldSkipPassthroughHeader(name string) bool {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -290,6 +326,18 @@ func processHeaderOverrideWithFilter(info *common.RelayInfo, c *gin.Context, fil
 
 		headerOverride[key] = value
 	}
+
+	// 全局 User-Agent 兜底。优先级(高 → 低):
+	//   渠道显式 User-Agent > 渠道透传(":"*" 或匹配 user-agent 的正则,保留客户端 UA)
+	//   > 全局 UA 设置 > 不设置(Go 默认 Go-http-client/1.1)
+	// 这里的三个条件分别对应:已有显式 user-agent、整表透传、UA 正则透传。
+	if _, ok := headerOverride["user-agent"]; !ok && !passAll &&
+		!hasHeaderPassthroughUserAgentRule(headerOverrideSource) {
+		if globalUserAgent := operation_setting.GetGlobalUserAgent(); globalUserAgent != "" {
+			headerOverride["user-agent"] = globalUserAgent
+		}
+	}
+
 	// Cline requires its own User-Agent even with explicit or runtime overrides.
 	if info.ChannelType == projectconstant.ChannelTypeCline {
 		headerOverride["user-agent"] = cline.UserAgent

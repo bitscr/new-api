@@ -1,6 +1,10 @@
 package operation_setting
 
-import "github.com/QuantumNous/new-api/setting/config"
+import (
+	"strings"
+
+	"github.com/QuantumNous/new-api/setting/config"
+)
 
 // 额度展示类型
 const (
@@ -20,6 +24,9 @@ type GeneralSetting struct {
 	CustomCurrencySymbol string `json:"custom_currency_symbol"`
 	// 自定义货币与美元汇率（1 USD = X Custom）
 	CustomCurrencyExchangeRate float64 `json:"custom_currency_exchange_rate"`
+	// 全局 User-Agent 兜底值:渠道既没有显式 User-Agent、也没有透传客户端 UA 时使用。
+	// 留空表示不设置(由 Go net/http 默认发出 Go-http-client/1.1)。
+	GlobalUserAgent string `json:"global_user_agent"`
 }
 
 // 默认配置
@@ -30,6 +37,13 @@ var generalSetting = GeneralSetting{
 	QuotaDisplayType:           QuotaDisplayTypeUSD,
 	CustomCurrencySymbol:       "¤",
 	CustomCurrencyExchangeRate: 1.0,
+	// 默认不设置全局 UA,保持与旧版本一致(Go 默认 Go-http-client/1.1)
+	GlobalUserAgent: "",
+}
+
+// GetGlobalUserAgent 返回全局 UA 兜底值,未配置时返回空串。
+func GetGlobalUserAgent() string {
+	return strings.TrimSpace(generalSetting.GlobalUserAgent)
 }
 
 func init() {
