@@ -36,3 +36,6 @@ AUTO_MODEL_TODO.md
 /web/.codex-dev-server
 # compiled binary output (go build -o main / new-api)
 /main
+
+# session-local task notes
+*_TODO.md

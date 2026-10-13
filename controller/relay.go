@@ -357,10 +357,25 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			// 200 但没有有效回答（正文为空，或正文只是上游网关的告警横幅）不算成功：
 			// 旧逻辑把它当"快速成功"，auto 于是越选越多这个渠道的这个模型，
 			// 而调用方每次都拿到假答案（实测渠道 #5 近 7 天 10 次全部如此）。
+			//
+			// 这个判定与是否 auto 无关：直连模型（无 auto 路由）同样会收到
+			// 200 + 零内容，旧逻辑在这里什么都不做，于是该渠道可以被无限次重复选中，
+			// 调用方每次进来都拿到空回答。所以 auto 请求走评分冷却，非 auto 请求
+			// 交给渠道级自动禁用（受 AutomaticDisableChannelEnabled / AutoBan 控制，
+			// 关掉这两个开关就维持旧行为）。
 			if unusable, reason := relayInfo.ClientAnswerUnusable(); unusable {
-				logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 没有给出有效回答（%s），不计成功", relayInfo.OriginModelName, reason))
+				if isAutoModelRequest(c) {
+					logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 没有给出有效回答（%s），不计成功", relayInfo.OriginModelName, reason))
+				} else {
+					logger.LogError(c, fmt.Sprintf("渠道 #%d 的 %s 没有给出有效回答（%s），HTTP 200 但响应为空", channel.Id, relayInfo.OriginModelName, reason))
+				}
 				recordRelayErrorLog(c, types.NewErrorWithStatusCode(errors.New(reason), types.ErrorCodeBadResponse, http.StatusOK, types.ErrOptionWithSkipRetry()))
 				recordAutoModelUnusableAnswer(c, relayInfo, reason)
+				if !isAutoModelRequest(c) {
+					// 非 auto 没有"候选组合"可冷却，只能按渠道整体处置。
+					unusableErr := types.NewErrorWithStatusCode(errors.New(reason), types.ErrorCodeBadResponse, http.StatusOK, types.ErrOptionWithSkipRetry())
+					processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), unusableErr)
+				}
 			} else {
 				recordAutoModelFeedback(c, relayInfo, true)
 			}
@@ -1075,6 +1090,12 @@ func autoModelClientAbandoned(c *gin.Context, info *relaycommon.RelayInfo) bool 
 		return true
 	}
 	if autoModelRequestContextError(c) == nil {
+		return false
+	}
+	// stream ended: reason=done means the upstream completed normally. In this
+	// case a zero-byte delivery is an upstream empty response, not a client
+	// disconnect; let ClientAnswerUnusable classify it and cool the auto route.
+	if info != nil && info.UpstreamContentExhausted() {
 		return false
 	}
 	return c.Writer == nil || !c.Writer.Written()

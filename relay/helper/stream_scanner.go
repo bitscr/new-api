@@ -119,6 +119,9 @@ func streamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			// The scanner owns ReceivedResponseCount. Read it only after all
 			// workers finish, including on handler-stop and timeout paths.
 			if info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
+				// 上游正常收尾:即便一个 chunk 都没有也要留痕,供 auto 判定
+				// "200 但输入有值、输出为空"(见 ClientAnswerUnusable)。
+				info.MarkUpstreamContentExhausted()
 				logger.LogInfo(c, fmt.Sprintf("stream ended: %s", info.StreamStatus.Summary()))
 			} else {
 				logger.LogError(c, fmt.Sprintf("stream ended: %s, received=%d", info.StreamStatus.Summary(), info.ReceivedResponseCount))

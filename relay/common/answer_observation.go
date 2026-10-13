@@ -84,7 +84,11 @@ type answerObservation struct {
 	toolsSeen      bool // 见过工具调用
 	undecidable    bool // 截断/过滤、选择索引不明或观察超限：不下结论
 	deliveryBroken bool // 有一批字节没能写完：客户端在交付完成前断开
-	choices        []answerChoiceObservation
+	// exhausted 由 streamScanner 在上游正常收尾(EOF/DONE 且无软错误)时置位。
+	// 它回答的是"上游这条流是不是已经结束",而不是"有没有内容",所以零内容流
+	// 同样会置位,供 ClientAnswerUnusable 区分"结束且为空"和"还没走到这里"。
+	exhausted bool
+	choices   []answerChoiceObservation
 }
 
 // MarkClientDeliveryBroken 记录"有一批写给客户端的字节没能完整送达"。
@@ -112,6 +116,31 @@ func (info *RelayInfo) ClientDeliveryBroken() bool {
 	observation.mu.Lock()
 	defer observation.mu.Unlock()
 	return observation.deliveryBroken
+}
+
+// MarkUpstreamContentExhausted 记录"上游这条流已经正常收尾"(EOF/[DONE],且没有
+// 软错误)。它不表示有内容:整条流一个 chunk 都没有时也会走到这里。
+func (info *RelayInfo) MarkUpstreamContentExhausted() {
+	if info == nil || info.answer == nil {
+		return
+	}
+	observation := info.answer
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	observation.exhausted = true
+}
+
+// UpstreamContentExhausted 报告上游是否已经正常收尾。客户端没有收到任何
+// 字节时，若上游也已经正常结束，应优先判定为"上游空响应"，不能误判成
+// 客户端主动断开；只有上游尚未收尾时，才把零交付视为客户端提前离开。
+func (info *RelayInfo) UpstreamContentExhausted() bool {
+	if info == nil || info.answer == nil {
+		return false
+	}
+	observation := info.answer
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	return observation.exhausted
 }
 
 // ObserveClientAnswer 观察一段即将写给客户端的数据（SSE 行或整包 JSON）。
@@ -186,6 +215,17 @@ func (info *RelayInfo) ClientAnswerUnusable() (bool, string) {
 	defer observation.mu.Unlock()
 	if observation.protocolError {
 		return true, "200 但上游返回了显式协议错误"
+	}
+	// 先于 parsed 这道门判断:上游正常收尾、请求也确实到过上游,却没有任何响应
+	// 内容时,观察器可能压根没收到可解析载荷(整条流只有一个 [DONE],或最后一批
+	// chunk 为空/无 choices),parsed 恒为 false,旧逻辑会把"输入有值、输出为空"
+	// 放行成成功。这里要求正文/思考/工具调用全空且没有保留任何 choice,所以一旦
+	// 有过真实内容就不会命中。exhausted 由 streamScanner 仅在上游正常收尾
+	// (EOF/DONE)且无软错误时标记;client_gone/timeout/scanner_error 各有专门路径。
+	if observation.exhausted && !observation.undecidable &&
+		!observation.textSeen && !observation.reasoningSeen && !observation.toolsSeen &&
+		len(observation.choices) == 0 {
+		return true, "200 但上游未返回任何响应内容(输入有值、输出为空)"
 	}
 	if !observation.parsed || observation.undecidable {
 		return false, ""
