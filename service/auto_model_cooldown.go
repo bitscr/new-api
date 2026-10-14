@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -40,8 +41,32 @@ const (
 	// 非流式量不到首字节,用总耗时兜底(会包含生成长文的时间)。
 	autoModelSlowLatencyMs int64 = 20000
 	autoModelCooldownBase        = 15 * time.Minute
-	autoModelCooldownMax         = 6 * time.Hour
+	// autoModelCooldownMax 是封顶的兜底常量。实际运行值取
+	// operation_setting.AutoModelCooldownMax()(面板可改),这里只是没配置时的下限。
+	autoModelCooldownMax = 6 * time.Hour
+	// autoModelCooldownSecondTier 是阶梯第二档(首档翻倍)。评分衰减窗口必须
+	// 严格大于它,否则第 2 次失败解冻时扣分正好归零(见测试与配置校验)。
+	autoModelCooldownSecondTier = 2 * autoModelCooldownBase
 )
+
+// AutoModelCooldownBaseForValidation 暴露抖动冷却的首档时长,供配置校验使用。
+//
+// 为什么需要它:评分衰减窗口必须长于首档冷却,否则第 1 次失败解冻时扣分几乎
+// 已归零;而窗口等于第 2 档(30 分钟)时,第 2 次失败解冻的瞬间分数正好回到
+// 中立,冷却彻底白做。校验要用同一个来源,不能在校验处再写一个 15 分钟常量,
+// 否则以后调冷却阶梯时会悄悄失配。
+func AutoModelCooldownBaseForValidation() time.Duration {
+	return autoModelCooldownBase
+}
+
+// AutoModelCooldownSecondTierForValidation 暴露抖动冷却的第二档时长(首档翻倍)。
+//
+// 为什么单看首档不够:衰减窗口若正好等于第二档(30 分钟),第 2 次失败解冻的
+// 那一刻分数精确回到中立的 0.5——惩罚"刚好"作废。所以真正的不变式是
+// "窗口 > 第二档",而不是"窗口 > 首档"。
+func AutoModelCooldownSecondTierForValidation() time.Duration {
+	return autoModelCooldownSecondTier
+}
 
 // autoModelPermanentCooldownBase / Max 是"确定性失败"的阶梯:模型不存在、无权、
 // 不支持这类错误重试也不会自愈,所以第一次就冷却一整天,重复犯翻倍、封顶 30 天。
@@ -173,12 +198,25 @@ func autoModelCooldownSnapshot() map[string]autoModelCooldownState {
 	return autoModelCooldowns.ReadAll()
 }
 
-// nextAutoModelCooldown 计算下一次冷却:每犯一次错,窗口翻一倍,封顶 autoModelCooldownMax。
+// nextAutoModelCooldown 计算下一次冷却:每犯一次错,窗口翻一倍,封顶取面板配置。
 func nextAutoModelCooldown(prev autoModelCooldownState, reason string, now time.Time) autoModelCooldownState {
-	return nextAutoModelCooldownIn(prev, reason, now, autoModelCooldownBase, autoModelCooldownMax)
+	// 封顶可由面板改(operation_setting)。取不到或不合法时退回常量兜底,
+	// 且必须 >= 首档,否则阶梯会一开始就"封"到比首档还短。
+	maximum := operation_setting.AutoModelCooldownMax()
+	if maximum < autoModelCooldownBase {
+		maximum = autoModelCooldownMax
+	}
+	return nextAutoModelCooldownIn(prev, reason, now, autoModelCooldownBase, maximum)
 }
 
-// nextAutoModelPermanentCooldown 是确定性失败的阶梯:首犯 24h,之后翻倍、封顶 30d。
+// nextAutoModelPermanentCooldown 是确定性失败的阶梯,只有两档:
+//   - 首犯:冷却 autoModelPermanentCooldownBase()(默认 24 小时);
+//   - 再犯:不再延长冷却,而是直接把该 (分组, 模型, 渠道) 的模型注册删掉
+//     (见 RetireAutoModelCombination)。
+//
+// 为什么不再翻倍到 30 天:确定性失败(模型不存在/无权)重试永远不会好。
+// 挂一个"30 天后还会回来试"的窗口,等于给自己埋一个到期就复发的问题;
+// 而两档处理能让它在第二次就彻底退出候选池,不用等。
 func nextAutoModelPermanentCooldown(prev autoModelCooldownState, reason string, now time.Time) autoModelCooldownState {
 	state := nextAutoModelCooldownIn(prev, reason, now, autoModelPermanentCooldownBase(), autoModelPermanentCooldownMax())
 	state.Permanent = true
@@ -242,10 +280,55 @@ func tripAutoModelCooldown(group, name string, channelID int, reason string, now
 }
 
 // RecordAutoModelPermanentFailure 记一次确定性失败(模型不存在/无权/不支持)。
-// 与抖动失败共用同一条等级计数,但窗口走 24h 起步的长阶梯,且标志位落库。
+//
+// 两档处理:
+//   - 首犯(prev.Level == 0):冷却 autoModelPermanentCooldownBase()(默认 24 小时);
+//   - 再犯(prev.Level >= 1):不再延长冷却,直接摘除该 (分组, 模型, 渠道)
+//     组合,让它永久退出候选池。
+//
+// 第二次之后没必要再挂冷却:一个明确"模型在这条渠道上不存在/无权"的组合,
+// 24 小时后再试一次就已经足够宽容了,继续失败只能说明它就是不该被选。
 func RecordAutoModelPermanentFailure(group, name string, channelID int, reason string) {
-	tripAutoModelCooldownWith(strings.TrimSpace(group), strings.TrimSpace(name), channelID,
-		strings.TrimSpace(reason), time.Now(), true)
+	group = strings.TrimSpace(group)
+	name = strings.TrimSpace(name)
+	reason = strings.TrimSpace(reason)
+	if group == "" || name == "" || channelID <= 0 {
+		return
+	}
+
+	// 先看这个组合是否已经吃过一次确定性失败。要在加锁前读,避免摘除流程
+	// 里去拿 model.DB 时与冷却锁互相等待。
+	if autoModelPermanentStrikeCount(group, name, channelID) >= 1 {
+		if err := RetireAutoModelCombination(group, name, channelID, reason); err != nil {
+			common.SysError(fmt.Sprintf("auto model: retire %s(渠道 %d) failed: %s", name, channelID, err.Error()))
+			// 摘除失败就退回冷却,至少别让它在候选池里裸奔。
+			tripAutoModelCooldownWith(group, name, channelID, reason, time.Now(), true)
+		}
+		return
+	}
+
+	tripAutoModelCooldownWith(group, name, channelID, reason, time.Now(), true)
+}
+
+// autoModelPermanentStrikeCount 返回该组合已经记录过几次确定性失败。
+// 只读:不加写锁副作用,拿到的是一致快照。
+func autoModelPermanentStrikeCount(group, name string, channelID int) int {
+	autoModelCooldownMutex.Lock()
+	defer autoModelCooldownMutex.Unlock()
+	ensureAutoModelCooldownsLoadedLocked()
+
+	state, ok := autoModelCooldowns.Get(autoModelHealthKey(group, name, channelID))
+	if !ok {
+		return 0
+	}
+	if !state.Permanent {
+		return 0
+	}
+	// pending.delete 是"已被成功请求清掉"的墓碑,不算已经吃过失败。
+	if state.pending != nil && state.pending.delete {
+		return 0
+	}
+	return state.Level
 }
 
 func tripAutoModelCooldownWith(group, name string, channelID int, reason string, now time.Time, permanent bool) {
@@ -285,6 +368,85 @@ func tripAutoModelCooldownWith(group, name string, channelID int, reason string,
 }
 
 // clearAutoModelCooldown 正常速度的成功：清掉这个组合的模型级冷却。
+// RetireAutoModelCombination 把一个"确定性失败且已经犯过一次"的 (分组, 模型, 渠道)
+// 组合从候选池里彻底摘掉:从渠道声明的 models 里移除该模型,并同步重建 abilities。
+//
+// 这是"第二次直接删除"——不删除整条渠道(渠道上还有别的模型,凭据与配置都是复用的),
+// 只摘掉这个不可用的模型。摘除后:
+//   - 该模型不再出现在渠道的 models 里,auto 路由不会再挑中它;
+//   - abilities 表同步失效,显式请求也会立刻得到"无可用渠道",不再打到上游;
+//   - 冷却记录同时清除(它已不在候选池里,留着没有意义)。
+//
+// 幂等:模型已经不在 models 里时直接返回 nil,不重复写库。
+func RetireAutoModelCombination(group, name string, channelID int, reason string) error {
+	group = strings.TrimSpace(group)
+	name = strings.TrimSpace(name)
+	if group == "" || name == "" || channelID <= 0 {
+		return nil
+	}
+	if model.DB == nil {
+		return errors.New("database not initialized")
+	}
+
+	channel, err := model.GetChannelById(channelID, false)
+	if err != nil || channel == nil {
+		return fmt.Errorf("load channel %d failed: %w", channelID, err)
+	}
+
+	remaining := make([]string, 0, len(channel.GetModels()))
+	removed := false
+	for _, m := range channel.GetModels() {
+		if strings.TrimSpace(m) == name {
+			removed = true
+			continue
+		}
+		remaining = append(remaining, m)
+	}
+	if !removed {
+		// 已经摘过了:不做任何写入,避免并发请求变成重复更新。
+		common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)已不在渠道模型列表中,跳过摘除", name, channelID))
+		return nil
+	}
+	channel.Models = strings.Join(remaining, ",")
+	if err := channel.Update(); err != nil {
+		return fmt.Errorf("update channel %d models failed: %w", channelID, err)
+	}
+
+	// 摘掉的是最后一个模型时,这条渠道已经没有可服务的模型了。留着它只会:
+	// 每次选通道都白跑一趟(没有可用模型直接失败),面板上也看不出它的状态。
+	// 所以自动禁用它,把状态显式标出来,让禁用原因可查。
+	if len(remaining) == 0 {
+		autoDisableModelEmptiedChannel(channel, name, reason)
+	}
+
+	// 摘除后冷却没有意义;清除以免残留记录干扰面板显示。
+	clearAutoModelCooldown(group, name, channelID, time.Now())
+	common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)确定性失败已达上限,已从渠道模型列表中删除(原因:%s)",
+		name, channelID, reason))
+	return nil
+}
+
+// autoDisableModelEmptiedChannel 在渠道被摘掉最后一个模型后,把它标记为自动禁用。
+//
+// 为什么不是删除:删除不可逆,而且这个渠道的凭据、代理、分组配置都还在,
+// 上游恢复或补新模型后需要能一键启用。禁用保留全部配置、只是不再参与选路,
+// 状态里带原因,面板上能直接看出"为什么它不干活了"。
+func autoDisableModelEmptiedChannel(channel *model.Channel, removedModel, reason string) {
+	if channel == nil || channel.Id <= 0 {
+		return
+	}
+	disableReason := fmt.Sprintf("模型 %s 确定性失败已被移除,渠道已无可用模型", removedModel)
+	if strings.TrimSpace(reason) != "" {
+		disableReason = fmt.Sprintf("%s(最后一次失败:%s)", disableReason, strings.TrimSpace(reason))
+	}
+	if ok := model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusAutoDisabled, disableReason); ok {
+		common.SysLog(fmt.Sprintf("auto model: 渠道 %d(%s)已无任何模型,已自动禁用。原因:%s",
+			channel.Id, channel.Name, disableReason))
+		return
+	}
+	common.SysError(fmt.Sprintf("auto model: 渠道 %d 已无模型,但自动禁用失败", channel.Id))
+}
+
 func clearAutoModelCooldown(group, name string, channelID int, now time.Time) {
 	autoModelCooldownMutex.Lock()
 	defer autoModelCooldownMutex.Unlock()

@@ -107,12 +107,17 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				if streamResponse.Response != nil && streamResponse.Response.Error != nil {
 					failure = fmt.Errorf("upstream response.failed: %v", streamResponse.Response.Error)
 				}
+				// 上游在流里明确报了失败:标记协议错误,让这次尝试按"不可用回答"
+				// 进入 auto 冷却/摘除,而不是被当成成功。
+				info.MarkUpstreamProtocolError()
 				sr.Stop(failure)
 			} else {
 				sr.Done()
 			}
 		case "error", "response.error":
 			terminal = true
+			// 上游以事件形式报错,同样按协议错误处理。
+			info.MarkUpstreamProtocolError()
 			// The native error event was already delivered. Do not append JSON or retry.
 			sr.Stop(fmt.Errorf("upstream Responses error: %s", data))
 		case "response.output_text.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.delta",

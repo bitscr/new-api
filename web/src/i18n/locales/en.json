@@ -4578,7 +4578,6 @@
     "保存 auto 判据设置": "Save auto criteria settings",
     "AutoModelMaxAttempts 必须是大于等于 1 的整数": "Max dispatch attempts must be an integer >= 1",
     "AutoModelPermanentCooldownHours 必须是大于等于 1 的整数": "Cooldown hours must be an integer >= 1",
-    "AutoModelPermanentCooldownMaxDays 必须是大于等于 1 的整数": "Cooldown cap days must be an integer >= 1",
     "AutoModelScoreDecayMinutes 必须是大于等于 1 的整数": "Score decay minutes must be an integer >= 1",
     "关键词过短(少于 2 个字符)会误伤大量无关失败": "Keyword is too short (fewer than 2 characters) and would match many unrelated failures",
     "部分保存失败,请重试": "Some settings failed to save. Please retry.",

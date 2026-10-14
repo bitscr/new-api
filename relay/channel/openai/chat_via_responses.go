@@ -507,6 +507,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			}
 
 		case "response.error", "response.failed":
+			// 上游在流里明确报失败:标记协议错误,使这次尝试被计入 auto
+			// 不可用回答(冷却/摘除),而不是当成成功放行。
+			info.MarkUpstreamProtocolError()
 			if streamResp.Response != nil {
 				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
 					streamErr = types.WithOpenAIError(*oaiErr, http.StatusInternalServerError)

@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/console_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -368,9 +369,10 @@ func UpdateOption(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"success": false, "message": "AutoModelEnabled 必须是 true 或 false"})
 			return
 		}
-	case "AutoModelMaxAttempts", "AutoModelPermanentCooldownHours",
-		"AutoModelPermanentCooldownMaxDays", "AutoModelScoreDecayMinutes":
-		// 这四个都是"至少 1"的正整数;写 0 或负数会直接让 auto 不可用。
+	case "AutoModelMaxAttempts", "AutoModelPermanentCooldownHours", "AutoModelCooldownMaxHours",
+		"AutoModelScoreDecayMinutes":
+		// 这些都是"至少 1"的正整数;写 0 或负数会直接让 auto 不可用。
+		// (确定性失败已无"封顶天数"选项:首犯 24h、再犯直接摘除模型。)
 		parsed, parseErr := strconv.Atoi(strings.TrimSpace(option.Value.(string)))
 		if parseErr != nil || parsed < 1 {
 			c.JSON(http.StatusOK, gin.H{
@@ -379,13 +381,35 @@ func UpdateOption(c *gin.Context) {
 			})
 			return
 		}
-		// 冷却封顶必须不低于首次窗口,否则阶梯首犯就超过封顶,语义自相矛盾。
-		if option.Key == "AutoModelPermanentCooldownMaxDays" {
-			baseHours := operation_setting.AutoModelPermanentCooldownBase()
-			if time.Duration(parsed)*24*time.Hour < baseHours {
+		switch option.Key {
+		case "AutoModelCooldownMaxHours":
+			// 封顶不能低于首档(15 分钟),否则阶梯第一档就超封顶,语义自相矛盾。
+			// 小时为整数,>=1 即满足。
+			//
+			// 不在这里校验"封顶 <= 衰减窗口":抬封顶本身会把衰减窗口一起抬上去
+			// (见 operation_setting.SetAutoModelCooldownMaxHours 的联动)。若改成
+			// 在这里拒绝,前端把两个值放在同一批并发 PUT 里时,先后到达会导致
+			// "其中一个被拒、另一个已生效"的半应用状态。让联动兜底才是幂等的:
+			// 两种到达顺序最终都会收敛到同一个结果。
+		case "AutoModelScoreDecayMinutes":
+			// 1) 衰减窗口太短会让惩罚在冷却解冻的瞬间归零,冷却等于白做:
+			//    第 2 次失败的冷却窗口是 30 分钟,窗口若也是 30 分钟,分数正好
+			//    在这时回到中立 0.5——惩罚精确作废。
+			if time.Duration(parsed)*time.Minute <= service.AutoModelCooldownSecondTierForValidation() {
 				c.JSON(http.StatusOK, gin.H{
 					"success": false,
-					"message": "封顶天数换算后不能小于首次冷却时长",
+					"message": "评分衰减窗口必须大于抖动冷却的第二档(30 分钟),否则第 2 次失败解冻时评分已归零,惩罚作废",
+				})
+				return
+			}
+			// 2) 峰值一致性:窗口至少要覆盖到封顶档,否则最高几档解冻时扣分已是 0,
+			//    冷却只剩"等时间",阶梯越往上越没有额外约束力。
+			maxHours := operation_setting.AutoModelCooldownMaxHours()
+			if parsed < maxHours*60 {
+				c.JSON(http.StatusOK, gin.H{
+					"success": false,
+					"message": fmt.Sprintf("评分衰减窗口不能小于冷却封顶(%d 小时 = %d 分钟),否则最高几档解冻时惩罚已归零。建议跟着封顶走",
+						maxHours, maxHours*60),
 				})
 				return
 			}
@@ -397,6 +421,22 @@ func UpdateOption(c *gin.Context) {
 		for _, line := range strings.Split(option.Value.(string), "\n") {
 			if message := operation_setting.ValidateAutoModelPermanentKeyword(line); message != "" {
 				c.JSON(http.StatusOK, gin.H{"success": false, "message": message})
+				return
+			}
+		}
+	case "AutoModelTransientKeywords":
+		// 这张表是"降级为普通冷却",写宽了不会造成封禁,只会少一次长冷却,
+		// 所以只挡显然无意义的条目(过短、空行),不做额外限制。
+		for _, line := range strings.Split(option.Value.(string), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if len([]rune(trimmed)) < 2 {
+				c.JSON(http.StatusOK, gin.H{
+					"success": false,
+					"message": "关键词过短(少于 2 个字符)会误伤大量无关失败:" + trimmed,
+				})
 				return
 			}
 		}

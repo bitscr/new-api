@@ -158,6 +158,27 @@ func (info *RelayInfo) ObserveClientAnswer(data []byte) {
 	}
 }
 
+// MarkUpstreamProtocolError 标记"上游在流里明确报了失败"。
+//
+// 为什么需要它:有的失败不以 HTTP 状态码体现,而是 200 流里夹一个终止事件
+// (Responses 的 response.failed / response.error,内容里的显式 error 等)。
+// 这类事件被 sr.Stop() 记为软错误后,流就不算"正常收尾",exhausted 不置位;
+// 而 hasExplicitProtocolError 只认顶层 error 键,response.failed 的 error 是
+// 嵌在 response 里的,也认不出来。结果 ClientAnswerUnusable 判不出来,
+// 这次尝试反而被记成成功——实测渠道 #5 的 410(它自己作为中转把候选全试失败,
+// 用 response.failed 回话)就是这样既没冷却也没换候选。
+//
+// 与 deliveryBroken 的区别:那是"客户端没收到",这是"上游明说失败"。
+func (info *RelayInfo) MarkUpstreamProtocolError() {
+	if info == nil || info.answer == nil {
+		return
+	}
+	observation := info.answer
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	observation.protocolError = true
+}
+
 // ObserveUpstreamError only records explicit top-level protocol errors in raw JSON.
 // Call before lossy response conversions; raw choices must never count as a
 // delivered answer. Repeated upstream/client observations are idempotent.

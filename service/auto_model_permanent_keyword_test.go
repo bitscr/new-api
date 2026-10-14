@@ -81,32 +81,77 @@ func TestAutoModelNumericSettingsRejectNonPositive(t *testing.T) {
 	operation_setting.SetAutoModelPermanentCooldownHours(-5)
 	require.Equal(t, time.Hour, operation_setting.AutoModelPermanentCooldownBase())
 
+	// 衰减窗口的下限不是 1,而是"封顶小时数换算的分钟数":低于它时最高几档
+	// 解冻时扣分已归零,冷却只剩"等时间"。写 0 会被抬到封顶,而不是变成 1。
 	operation_setting.SetAutoModelScoreDecayMinutes(0)
-	require.Equal(t, 1, operation_setting.AutoModelScoreDecayMinutes())
+	require.Equal(t, operation_setting.AutoModelCooldownMaxHours()*60,
+		operation_setting.AutoModelScoreDecayMinutes(),
+		"衰减窗口不能低于封顶所换算的分钟数")
 }
 
-// 冷却封顶必须始终 >= 首次窗口,否则阶梯首犯就超过封顶。
-func TestPermanentCooldownMaxNeverBelowBase(t *testing.T) {
+// 封顶与衰减窗口的联动:无论两个键以什么顺序写入,不变式"衰减 >= 封顶*60"
+// 都必须成立。前端把改动项放在同一批并发 PUT 里,到达顺序不确定,所以两种
+// 顺序都要收敛到同一结果。
+func TestCooldownMaxAndScoreDecayStayConsistent(t *testing.T) {
+	t.Cleanup(func() { operation_setting.InitAutoModelSettingsFromEnv() })
+
+	for _, writes := range [][2]string{
+		{"max", "decay"},
+		{"decay", "max"},
+	} {
+		operation_setting.InitAutoModelSettingsFromEnv()
+		for _, key := range writes {
+			switch key {
+			case "max":
+				operation_setting.SetAutoModelCooldownMaxHours(12)
+			case "decay":
+				operation_setting.SetAutoModelScoreDecayMinutes(240)
+			}
+			require.GreaterOrEqual(t,
+				operation_setting.AutoModelScoreDecayMinutes(),
+				operation_setting.AutoModelCooldownMaxHours()*60,
+				"写入顺序 %v:衰减窗口必须不低于封顶", writes)
+		}
+	}
+
+	// 未显式设过衰减时,只改封顶应把衰减一起带过去。
+	operation_setting.InitAutoModelSettingsFromEnv()
+	operation_setting.SetAutoModelCooldownMaxHours(3)
+	require.Equal(t, 180, operation_setting.AutoModelScoreDecayMinutes(),
+		"未显式设置时,衰减随封顶联动(3 小时 = 180 分钟)")
+}
+
+// 确定性失败已改为两档:首犯冷却 = 首次窗口,再犯直接摘除模型。
+// 所以封顶恒等于首次窗口,不再有"封顶不能低于首次窗口"的配置矛盾。
+func TestPermanentCooldownMaxEqualsBase(t *testing.T) {
 	t.Cleanup(func() { operation_setting.InitAutoModelSettingsFromEnv() })
 	operation_setting.InitAutoModelSettingsFromEnv()
 
 	operation_setting.SetAutoModelPermanentCooldownHours(72)
-	operation_setting.SetAutoModelPermanentCooldownMaxDays(1)
 	require.Equal(t, 72*time.Hour, operation_setting.AutoModelPermanentCooldownMax(),
-		"封顶低于首次窗口时按首次窗口兜底")
+		"不再逐级翻倍:封顶恒等于首次窗口")
 }
 
-// 评分衰减窗口必须比抖动冷却窗口长,否则冷却到期时评分已归零回到中立,
-// 惩罚与教训脱节,评分持久化也失去意义。这是这次修正的核心不变式。
+// 评分衰减窗口必须覆盖住抖动冷却阶梯的靠前几档,不能只看首档。
+//
+// 关键反例:窗口 = 30 分钟时,第 2 次失败的冷却窗口恰好也是 30 分钟,
+// 于是解冻那一刻评分精确回到中立 0.5,惩罚"刚好"作废。所以不变式是
+// "窗口 > 第二档",这也是把默认值从 30 改成 180 的原因。
 func TestScoreDecayOutlastsTransientCooldown(t *testing.T) {
 	t.Cleanup(func() { operation_setting.InitAutoModelSettingsFromEnv() })
 	operation_setting.InitAutoModelSettingsFromEnv()
 
 	decay := time.Duration(autoModelHalfLifeMs()) * time.Millisecond
-	require.Greater(t, decay, autoModelCooldownBase,
-		"评分衰减窗口必须长于抖动冷却窗口(15 分钟),否则冷却一到期评分就没记忆了")
+	require.Greater(t, decay, autoModelCooldownSecondTier,
+		"评分衰减窗口必须大于冷却第二档(30 分钟),否则第 2 次失败解冻时扣分已归零")
 
-	// 冷却到期那一刻,记忆必须还剩一部分。
-	ageFactor := 1.0 - float64(autoModelCooldownBase.Milliseconds())/float64(autoModelHalfLifeMs())
-	require.Greater(t, ageFactor, 0.0, "冷却到期时评分不该已经归零")
+	// 逐档验证:前几档解冻时都必须还剩记忆。
+	for _, window := range []time.Duration{
+		autoModelCooldownBase,
+		autoModelCooldownBase * 2,
+		autoModelCooldownBase * 4,
+	} {
+		ageFactor := 1.0 - float64(window.Milliseconds())/float64(autoModelHalfLifeMs())
+		require.Greater(t, ageFactor, 0.0, "冷却 %s 到期时评分不该已经归零", window)
+	}
 }

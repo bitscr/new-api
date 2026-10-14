@@ -1251,7 +1251,8 @@ func flushAutoModelFeedback(c *gin.Context) {
 		case feedback.unusable:
 			service.RecordAutoModelUnusableAnswer(key.group, key.modelName, key.channelID, feedback.reason)
 		case feedback.permanent:
-			// 确定性失败:24h 起步的长冷却,仍然只挡这一个组合。
+			// 确定性失败:首犯冷却 24 小时;再犯直接把这个模型从这条渠道里摘除
+			// (渠道无剩余模型时自动禁用),仍然只挡这一个组合。
 			service.RecordAutoModelPermanentFailure(key.group, key.modelName, key.channelID, feedback.reason)
 		default:
 			service.RecordAutoModelOutcome(key.group, key.modelName, key.channelID, feedback.success, feedback.latencyMS, feedback.elapsedMS)
@@ -1273,7 +1274,12 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 
 // Record diagnostics without changing client delivery, billing or channel health.
 func recordRelayErrorLog(c *gin.Context, err *types.NewAPIError) {
-	if constant.ErrorLogEnabled && types.IsRecordErrorLog(err) {
+	// 无条件记录失败请求:早先这里还有一道 constant.ErrorLogEnabled 门控
+	// (ERROR_LOG_ENABLED,默认 false),后果是"报错的同时进入了冷却",但面板
+	// 「错误日志」里一条都看不到——排查时只看到渠道被冷却,看不到原因。
+	// IsRecordErrorLog 仍保留:少数明确标注"不要记日志"的错误(如预扣费失败、
+	// RPM 限流)依然不写库,避免噪声淹没真正的上游失败。
+	if types.IsRecordErrorLog(err) {
 		// 保存错误日志到mysql中
 		userId := c.GetInt("id")
 		tokenName := c.GetString("token_name")

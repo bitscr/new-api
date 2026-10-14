@@ -4547,7 +4547,6 @@
     "保存 auto 判据设置": "保存 auto 判据设置",
     "AutoModelMaxAttempts 必须是大于等于 1 的整数": "auto 单请求最大尝试次数必须是大于等于 1 的整数",
     "AutoModelPermanentCooldownHours 必须是大于等于 1 的整数": "确定性失败冷却时长必须是大于等于 1 的整数",
-    "AutoModelPermanentCooldownMaxDays 必须是大于等于 1 的整数": "确定性失败冷却封顶必须是大于等于 1 的整数",
     "AutoModelScoreDecayMinutes 必须是大于等于 1 的整数": "评分衰减窗口必须是大于等于 1 的整数",
     "关键词过短(少于 2 个字符)会误伤大量无关失败": "关键词过短(少于 2 个字符)会误伤大量无关失败",
     "部分保存失败,请重试": "部分保存失败,请重试",

@@ -193,9 +193,10 @@ func InitOptionMap() {
 	common.OptionMap["AutoModelWeights"] = operation_setting.AutoModelWeightsToJSONString()
 	common.OptionMap["AutoModelMaxAttempts"] = strconv.Itoa(operation_setting.AutoModelMaxAttempts())
 	common.OptionMap["AutoModelPermanentCooldownHours"] = strconv.Itoa(int(operation_setting.AutoModelPermanentCooldownBase() / time.Hour))
-	common.OptionMap["AutoModelPermanentCooldownMaxDays"] = strconv.Itoa(int(operation_setting.AutoModelPermanentCooldownMax() / (24 * time.Hour)))
+	common.OptionMap["AutoModelCooldownMaxHours"] = strconv.Itoa(operation_setting.AutoModelCooldownMaxHours())
 	common.OptionMap["AutoModelScoreDecayMinutes"] = strconv.Itoa(operation_setting.AutoModelScoreDecayMinutes())
 	common.OptionMap["AutoModelPermanentKeywords"] = operation_setting.AutoModelPermanentKeywordsToString()
+	common.OptionMap["AutoModelTransientKeywords"] = operation_setting.AutoModelTransientKeywordsToString()
 	common.OptionMap["ExposeRatioEnabled"] = strconv.FormatBool(ratio_setting.IsExposeRatioEnabled())
 
 	// 自动添加所有注册的模型配置
@@ -602,12 +603,14 @@ func updateOptionMap(key string, value string) (err error) {
 		autoModelSetIntOption(value, operation_setting.SetAutoModelMaxAttempts)
 	case "AutoModelPermanentCooldownHours":
 		autoModelSetIntOption(value, operation_setting.SetAutoModelPermanentCooldownHours)
-	case "AutoModelPermanentCooldownMaxDays":
-		autoModelSetIntOption(value, operation_setting.SetAutoModelPermanentCooldownMaxDays)
+	case "AutoModelCooldownMaxHours":
+		autoModelSetIntOption(value, operation_setting.SetAutoModelCooldownMaxHours)
 	case "AutoModelScoreDecayMinutes":
 		autoModelSetIntOption(value, operation_setting.SetAutoModelScoreDecayMinutes)
 	case "AutoModelPermanentKeywords":
 		operation_setting.SetAutoModelPermanentKeywords(value)
+	case "AutoModelTransientKeywords":
+		operation_setting.SetAutoModelTransientKeywords(value)
 	case "StreamCacheQueueLength":
 		setting.StreamCacheQueueLength, _ = strconv.Atoi(value)
 	case "PayMethods":

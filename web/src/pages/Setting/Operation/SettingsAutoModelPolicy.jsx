@@ -35,9 +35,10 @@ const { Text } = Typography;
 const AUTO_MODEL_OPTION_KEYS = [
   'AutoModelMaxAttempts',
   'AutoModelPermanentCooldownHours',
-  'AutoModelPermanentCooldownMaxDays',
+  'AutoModelCooldownMaxHours',
   'AutoModelScoreDecayMinutes',
   'AutoModelPermanentKeywords',
+  'AutoModelTransientKeywords',
 ];
 
 // 数值项的中文名。报错信息里要用人能看懂的名字,否则管理员看到的是一串
@@ -45,9 +46,38 @@ const AUTO_MODEL_OPTION_KEYS = [
 const NUMERIC_LABELS = {
   AutoModelMaxAttempts: 'auto 单请求最大尝试次数',
   AutoModelPermanentCooldownHours: '确定性失败冷却时长(小时)',
-  AutoModelPermanentCooldownMaxDays: '确定性失败冷却封顶(天)',
+  AutoModelCooldownMaxHours: '普通冷却封顶(小时)',
   AutoModelScoreDecayMinutes: '评分衰减窗口(分钟)',
 };
+
+// 本机在用的"普通冷却"关键词:命中后强制只走抖动冷却(15m 起步的阶梯),
+// 绝不升级为确定性失败。用于把其实会自愈、却被确定性判据误伤的错误钉回来。
+const DEFAULT_TRANSIENT_KEYWORDS = [
+  // 上游 520/524 这类网关抖动:虽然看起来像"这条上游不行",但它是 Cloudflare
+  // 层的临时故障,过一会儿就恢复,不该按 24 小时确定性失败处理。
+  'status code: 520',
+  'status code: 524',
+  // 限流是明确的临时状态,冷却窗口本来就有更合适的阶梯。
+  'rpm exhausted',
+  'token plan entitlement exhausted',
+  // 上游自己的容量/健康问题,不是模型不存在。
+  'all candidates failed',
+  'upstream_response_timeout',
+];
+const DEFAULT_PERMANENT_KEYWORDS = [
+  // 上游明说"这个模型我不提供"——结构化 code 缺失时的自然语言兜底
+  '模型不可用',
+  '模型不存在',
+  'model not found',
+  'community model not found',
+  // 已实证会复发:某个上游确实不支持的确定性能力
+  'function calling is not supported',
+  // 账号/密钥级确定性失败:换了模型也一样,重试没有意义
+  'invalid_api_key',
+  'invalid_authentication',
+  // 明确的状态码(可写数字,判定用子串匹配 “status code: 404” 这类文本)
+  'status code: 404',
+];
 
 /**
  * auto 的失败判据与时长。
@@ -64,9 +94,10 @@ export default function SettingsAutoModelPolicy(props) {
   const [inputs, setInputs] = useState({
     AutoModelMaxAttempts: '4',
     AutoModelPermanentCooldownHours: '24',
-    AutoModelPermanentCooldownMaxDays: '30',
-    AutoModelScoreDecayMinutes: '30',
-    AutoModelPermanentKeywords: '',
+    AutoModelCooldownMaxHours: '6',
+    AutoModelScoreDecayMinutes: '360',
+    AutoModelPermanentKeywords: DEFAULT_PERMANENT_KEYWORDS.join('\n'),
+    AutoModelTransientKeywords: DEFAULT_TRANSIENT_KEYWORDS.join('\n'),
   });
   const refForm = useRef();
   const [inputsRow, setInputsRow] = useState(inputs);
@@ -76,7 +107,7 @@ export default function SettingsAutoModelPolicy(props) {
     if (!updateArray.length) return showWarning(t('你似乎并没有修改什么'));
 
     // 四个数值都必须是 >= 1 的整数:写 0 会让 auto 直接不可用。
-    for (const key of AUTO_MODEL_OPTION_KEYS.slice(0, 4)) {
+    for (const key of AUTO_MODEL_OPTION_KEYS.filter((k) => k !== 'AutoModelPermanentKeywords')) {
       const raw = String(inputs[key] ?? '').trim();
       const value = Number(raw);
       if (!Number.isInteger(value) || value < 1) {
@@ -165,28 +196,38 @@ export default function SettingsAutoModelPolicy(props) {
             </Col>
             <Col xs={24} sm={12} md={8} lg={8} xl={8}>
               <Form.InputNumber
-                field={'AutoModelPermanentCooldownHours'}
-                label={t('确定性失败冷却时长(小时)')}
+                field={'AutoModelCooldownMaxHours'}
+                label={t('普通冷却封顶(小时)')}
                 min={1}
-                extraText={t('默认 24;抖动失败(限流/超时/5xx)仍是 15 分钟起')}
-                onChange={(value) =>
-                  setInputs({
-                    ...inputs,
-                    AutoModelPermanentCooldownHours: String(value),
-                  })
-                }
+                extraText={t(
+                  '默认 6。普通(抖动)失败的冷却阶梯是 15 分钟起、每犯一次翻倍:15m→30m→1h→2h→4h→封顶。这里改的就是封顶。抬得太低会让反复出错的组合很快解冻、又回候选池;太高则会长期放弃一条只是暂时抖动的渠道。',
+                )}
+                onChange={(value) => {
+                  const next = { ...inputs, AutoModelCooldownMaxHours: String(value) };
+                  // 衰减窗口若从没被单独填过(即还等于封顶分钟数),就跟着封顶走,
+                  // 与后端的联动保持一致,避免"改了封顶却忘了改记忆窗口"。
+                  if (
+                    Number(inputs.AutoModelScoreDecayMinutes) ===
+                    Number(inputsRows.AutoModelCooldownMaxHours || 6) * 60
+                  ) {
+                    next.AutoModelScoreDecayMinutes = String(Number(value) * 60);
+                  }
+                  setInputs(next);
+                }}
               />
             </Col>
             <Col xs={24} sm={12} md={8} lg={8} xl={8}>
               <Form.InputNumber
-                field={'AutoModelPermanentCooldownMaxDays'}
-                label={t('确定性失败冷却封顶(天)')}
+                field={'AutoModelPermanentCooldownHours'}
+                label={t('确定性失败冷却时长(小时)')}
                 min={1}
-                extraText={t('默认 30;每犯一次翻倍,不超过此值')}
+                extraText={t(
+                  '默认 24。确定性失败(模型不存在/无权/不支持)首犯冷却这么久,再犯直接把该模型从渠道里删除,不再逐级延长',
+                )}
                 onChange={(value) =>
                   setInputs({
                     ...inputs,
-                    AutoModelPermanentCooldownMaxDays: String(value),
+                    AutoModelPermanentCooldownHours: String(value),
                   })
                 }
               />
@@ -197,9 +238,9 @@ export default function SettingsAutoModelPolicy(props) {
               <Form.InputNumber
                 field={'AutoModelScoreDecayMinutes'}
                 label={t('评分衰减窗口(分钟)')}
-                min={1}
+                min={16}
                 extraText={t(
-                  '默认 30;必须长于抖动冷却窗口(15 分钟),否则冷却到期时评分已归零',
+                  '默认 360,与"普通冷却封顶"联动(封顶 6 小时 = 360 分钟)。含义:一次失败把健康分从 0.5 压到 0.35,这个扣分会在本窗口内线性爬回中立 0.5。两条硬性关系:①必须大于冷却第二档(30 分钟),否则第 2 次失败解冻时分数正好归零、惩罚作废;②不能小于封顶,否则最高几档解冻时扣分已是 0,冷却只剩"等时间"。改封顶会自动同步本值;一旦你单独填过,就以你填的为准。',
                 )}
                 onChange={(value) =>
                   setInputs({
@@ -214,19 +255,40 @@ export default function SettingsAutoModelPolicy(props) {
             <Col xs={24} sm={16}>
               <Form.TextArea
                 field={'AutoModelPermanentKeywords'}
-                label={t('确定性失败关键词(补充判据)')}
-                placeholder={t('一行一个,不区分大小写')}
+                label={t('确定性失败关键词(自动删除判据)')}
+                placeholder={t('一行一个,不区分大小写;中文文案、英文词语、状态码都可以')}
                 extraText={t(
-                  '把日志里看到的永久性报错填进来(例如「function calling is not supported」)。命中后该组合进入长冷却,不再被反复重试。上下文超长永远按抖动处理,不受此处影响。',
+                  '在错误正文、错误码、错误类型里做子串匹配。命中后:首犯冷却 24 小时,再犯直接把该模型从这条渠道里删除(不删渠道)。上文已预填本机在用的判据。上下文超长永远按抖动处理,不受此处影响。',
                 )}
-                autosize={{ minRows: 6, maxRows: 12 }}
+                autosize={{ minRows: 8, maxRows: 16 }}
                 onChange={(value) =>
                   setInputs({ ...inputs, AutoModelPermanentKeywords: value })
                 }
               />
               <Text type='tertiary'>
                 {t(
-                  '不建议加入:预扣费额度失败 / insufficient_user_quota(余额问题)、ReasoningEffort invalid(请求参数写错)。',
+                  '三种写法都支持:中文文案(模型不可用)、英文词语(model not found)、状态码(status code: 404)。不建议加入:insufficient_user_quota(余额问题)、ReasoningEffort invalid(请求参数写错,不是模型不可用)。',
+                )}
+              </Text>
+            </Col>
+          </Row>
+          <Row gutter={16}>
+            <Col xs={24} sm={16}>
+              <Form.TextArea
+                field={'AutoModelTransientKeywords'}
+                label={t('普通冷却关键词(强制降级为抖动失败)')}
+                placeholder={t('一行一个,不区分大小写;中文文案、英文词语、状态码都可以')}
+                extraText={t(
+                  '优先级最高:命中后这次失败只按普通抖动冷却处理(15 分钟起步的阶梯),绝不升级成 24 小时冷却、也不会删除模型。用来把其实会自愈的错误钉在这一档,防止被上面的确定性判据误伤。上文已预填本机在用的判据。',
+                )}
+                autosize={{ minRows: 6, maxRows: 14 }}
+                onChange={(value) =>
+                  setInputs({ ...inputs, AutoModelTransientKeywords: value })
+                }
+              />
+              <Text type='tertiary'>
+                {t(
+                  '本机预填:520/524(上游 Cloudflare 抖动)、rpm exhausted、token plan entitlement exhausted、all candidates failed、upstream_response_timeout。',
                 )}
               </Text>
             </Col>

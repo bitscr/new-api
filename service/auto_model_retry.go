@@ -95,8 +95,19 @@ func AutoModelPermanentFailure(err *types.NewAPIError) bool {
 		// 不是"这个模型不存在"。管理员加错关键词也不能把它们变成永久封禁。
 		return false
 	}
+	if autoModelMatchesTransientKeyword(err) {
+		// 管理员显式指定"这属于会自愈的普通失败":它优先于下面所有确定性判据。
+		// 作用是防止某个其实会恢复的错误(或过宽的固定文案)被误升级成 24 小时
+		// 冷却乃至摘除模型。
+		return false
+	}
 	switch err.StatusCode {
 	case http.StatusUnauthorized, http.StatusForbidden:
+		return true
+	case http.StatusNotFound, http.StatusBadGateway, http.StatusServiceUnavailable:
+		// 404 / 502 / 503 都是"这条上游根本给不出这个模型的回答":前者是端点或
+		// 模型不存在,后两者是上游网关本身挂了。重试同一个组合不会变好。
+		// 502/503 也可能短暂,但首犯只冷却 24 小时、再犯才摘除,代价可控。
 		return true
 	}
 	detail := err.ToOpenAIError()
@@ -117,7 +128,55 @@ func AutoModelPermanentFailure(err *types.NewAPIError) bool {
 			}
 		}
 	}
+	if autoModelMatchesModelUnavailableText(err) {
+		return true
+	}
 	return autoModelMatchesPermanentKeyword(err)
+}
+
+// autoModelBuiltinPermanentTexts 是"上游明说这个模型它不提供"的固定文案判据。
+//
+// 为什么需要它:很多中转上游只回一句自然语言(中文/英文),既不给结构化 code,
+// 也不带 param=model。早先这类失败只能落到"抖动失败"的 15 分钟冷却,于是
+// 同一个不可用的组合每 15 分钟被选中一次、再失败一次,循环一整天
+// (实测 ch11 的 tr-alpha-channel 就是这样被反复选中)。
+//
+// 这里只收"明确说模型不可用/不存在"的措辞。刻意不收泛化的 400 文案
+// (如 invalid_request、Bad Request):那些可能是请求体自己写坏了,不该算到模型头上。
+var autoModelBuiltinPermanentTexts = []string{
+	"模型不可用",
+	"模型不存在",
+	"模型未找到",
+	"model not found",
+	"model is not available",
+	"model unavailable",
+	"community model not found",
+	"no such model",
+	"unsupported model",
+	"model_not_found",
+	"model_not_supported",
+}
+
+// autoModelMatchesModelUnavailableText 在错误正文里找"模型不可用"类固定文案。
+func autoModelMatchesModelUnavailableText(err *types.NewAPIError) bool {
+	if err == nil {
+		return false
+	}
+	detail := err.ToOpenAIError()
+	haystacks := []string{
+		strings.ToLower(err.Error()),
+		strings.ToLower(detail.Message),
+		strings.ToLower(string(err.GetErrorCode())),
+		strings.ToLower(detail.Type),
+	}
+	for _, text := range autoModelBuiltinPermanentTexts {
+		for _, haystack := range haystacks {
+			if haystack != "" && strings.Contains(haystack, text) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // autoModelProtectedTransient 列出永远按抖动处理的失败,即使管理员关键词命中。
@@ -134,6 +193,33 @@ func autoModelProtectedTransient(err *types.NewAPIError) bool {
 	} {
 		if code == "context_length_exceeded" {
 			return true
+		}
+	}
+	return false
+}
+
+// autoModelMatchesTransientKeyword 在错误正文与 code 里找"按普通冷却处理"关键词。
+// 命中即强制降级为抖动失败(15m 起步的阶梯冷却),不升级为确定性失败。
+func autoModelMatchesTransientKeyword(err *types.NewAPIError) bool {
+	keywords := operation_setting.AutoModelTransientKeywords()
+	if len(keywords) == 0 {
+		return false
+	}
+	detail := err.ToOpenAIError()
+	haystacks := []string{
+		strings.ToLower(err.Error()),
+		strings.ToLower(detail.Message),
+		strings.ToLower(string(err.GetErrorCode())),
+		strings.ToLower(detail.Type),
+	}
+	for _, keyword := range keywords {
+		if keyword == "" {
+			continue
+		}
+		for _, haystack := range haystacks {
+			if haystack != "" && strings.Contains(haystack, keyword) {
+				return true
+			}
 		}
 	}
 	return false
