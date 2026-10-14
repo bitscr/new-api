@@ -43,6 +43,48 @@ const (
 	autoModelDefaultScoreDecayMinutes = 360
 )
 
+// autoModelBuiltinPermanentKeywords 是"确定性失败"判据的内置初值(本机在用的条目)。
+//
+// 为什么要有内置初值:这些条目都来自本机日志里实际出现过、且重试永远不会好的失败。
+// 没有初值时面板是空的,GET /api/option/ 回显空串,前端再拿空串覆盖自己的预填,
+// 管理员看到的就是空框;或者前端与后端各写一份,时间一长两边不一致。
+// 所以以这里为唯一来源:未配置时即用初值,GET 回显也就是初值。
+//
+// 判定方式是在"错误正文 + 错误码 + 错误类型"里做大小写不敏感的子串匹配,
+// 所以中文文案、英文词语、状态码三种写法都可写。
+var autoModelBuiltinPermanentKeywords = []string{
+	// 上游明说"这个模型我不提供"——结构化 code 缺失时的自然语言兜底。
+	// 实测 ch11 的 tr-alpha-channel 就是反复撞这一类,却只能吃 15 分钟抖动冷却。
+	"模型不可用",
+	"模型不存在",
+	"model not found",
+	"community model not found",
+	// 已实证会复发:某个上游确实不支持的确定性能力。
+	"function calling is not supported",
+	// 账号/密钥级确定性失败:换模型也一样,重试没有意义。
+	"invalid_api_key",
+	"invalid_authentication",
+	// 明确的状态码(判定用子串匹配 "status code: 404" 这类文本)。
+	"status code: 404",
+}
+
+// autoModelBuiltinTransientKeywords 是"按普通冷却处理"判据的内置初值(本机在用)。
+//
+// 命中即强制降级为抖动冷却(15m 起步的阶梯),不升级为确定性失败。它优先级最高,
+// 用来把其实会自愈、却被上面那张表或结构化判据误伤的错误钉回普通档。
+var autoModelBuiltinTransientKeywords = []string{
+	// 上游 520/524 是 Cloudflare 层的临时故障,过一会儿就恢复,不该按
+	// 24 小时确定性失败处理。
+	"status code: 520",
+	"status code: 524",
+	// 限流是明确的临时状态,冷却阶梯本来就更适合它。
+	"rpm exhausted",
+	"token plan entitlement exhausted",
+	// 上游自己的容量/健康问题,不是模型不存在。
+	"all candidates failed",
+	"upstream_response_timeout",
+}
+
 var (
 	autoModelMaxAttempts            = autoModelDefaultMaxAttempts
 	autoModelPermanentCooldownHours = autoModelDefaultPermanentCooldownHours
@@ -58,16 +100,14 @@ var (
 	//
 	// 为什么不复用 AutomaticDisableKeywords:那个会禁用整条渠道、需要开启主动
 	// 测活,而这里既要"只挡这个组合",也绝不能引入任何主动探测。
+	//
+	// 初始值见 autoModelBuiltinPermanentKeywords:面板没有配置时,GET /api/option/
+	// 会把这些内置判据回显到输入框,管理员不用手抄。
 	autoModelPermanentKeywords []string
-	// autoModelTransientKeywords 是管理员指定的"按普通抖动失败处理"关键词(一行一个)。
+	// autoModelTransientKeywords 是"按普通抖动失败处理"的关键词(一行一个)。
 	//
-	// 与上面那张表的分工:
-	//   - 确定性表:命中 → 首犯 24h、再犯摘除模型;
-	//   - 普通表:命中 → 永远只走抖动冷却(15m 起步的阶梯),绝不升级为确定性失败。
-	//
-	// 它存在的理由:确定性判据里既有结构化错误码也有固定文案,还可能被管理员写宽。
-	// 有了这张表,就能把某个其实会自愈的错误钉在"普通冷却"这一档,防止它被
-	// 误升级成 24 小时冷却甚至摘除。
+	// 命中即强制降级为抖动冷却(15m 起步的阶梯),不升级为确定性失败。
+	// 初始值见 autoModelBuiltinTransientKeywords。
 	autoModelTransientKeywords []string
 	autoModelSettingsMutex     sync.RWMutex
 )
@@ -187,11 +227,14 @@ func SetAutoModelScoreDecayMinutes(value int) {
 }
 
 // AutoModelTransientKeywords 返回"按普通冷却处理"判据的副本。
+//
+// 未配置过时返回内置初值:面板回显与判定用同一份数据,管理员打开就能看到
+// 本机在用的条目,不用手抄。
 func AutoModelTransientKeywords() []string {
 	autoModelSettingsMutex.RLock()
 	defer autoModelSettingsMutex.RUnlock()
 	if len(autoModelTransientKeywords) == 0 {
-		return nil
+		return append([]string(nil), autoModelBuiltinTransientKeywords...)
 	}
 	return append([]string(nil), autoModelTransientKeywords...)
 }
@@ -209,11 +252,13 @@ func AutoModelTransientKeywordsToString() string {
 }
 
 // AutoModelPermanentKeywords 返回管理员补充判据的副本。
+//
+// 未配置过时返回内置初值(理由同 AutoModelTransientKeywords)。
 func AutoModelPermanentKeywords() []string {
 	autoModelSettingsMutex.RLock()
 	defer autoModelSettingsMutex.RUnlock()
 	if len(autoModelPermanentKeywords) == 0 {
-		return nil
+		return append([]string(nil), autoModelBuiltinPermanentKeywords...)
 	}
 	return append([]string(nil), autoModelPermanentKeywords...)
 }

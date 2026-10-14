@@ -41,6 +41,22 @@ const AUTO_MODEL_OPTION_KEYS = [
   'AutoModelTransientKeywords',
 ];
 
+// 需要做"至少 1 的整数"校验的键。用白名单而不是"从上面 filter 掉关键词":
+// 后者每加一个文本项就要记得补一次排除,漏一个就报错(实测漏过 Transient)。
+const AUTO_MODEL_NUMERIC_KEYS = [
+  'AutoModelMaxAttempts',
+  'AutoModelPermanentCooldownHours',
+  'AutoModelCooldownMaxHours',
+  'AutoModelScoreDecayMinutes',
+];
+
+// 关键词键与数值键必须正好构成上面那张总表,漏一个就会出现"存了但不校验"
+// 或"校验了但没存"的错配。改这张表时这里会立刻报出来。
+const AUTO_MODEL_KEYWORD_KEYS = [
+  'AutoModelPermanentKeywords',
+  'AutoModelTransientKeywords',
+];
+
 // 数值项的中文名。报错信息里要用人能看懂的名字,否则管理员看到的是一串
 // OptionMap key。这里的每一项都必须也在语言包里,漏一个就会显示原文。
 const NUMERIC_LABELS = {
@@ -52,6 +68,10 @@ const NUMERIC_LABELS = {
 
 // 本机在用的"普通冷却"关键词:命中后强制只走抖动冷却(15m 起步的阶梯),
 // 绝不升级为确定性失败。用于把其实会自愈、却被确定性判据误伤的错误钉回来。
+//
+// 内容与后端 setting/operation_setting 的 autoModelBuiltinTransientKeywords 一致。
+// 后端才是权威来源(未配置时 GET /api/option/ 会回显后端内置值,直接覆盖这里);
+// 这里保留一份是为了在接口返回前/失败时输入框不为空。
 const DEFAULT_TRANSIENT_KEYWORDS = [
   // 上游 520/524 这类网关抖动:虽然看起来像"这条上游不行",但它是 Cloudflare
   // 层的临时故障,过一会儿就恢复,不该按 24 小时确定性失败处理。
@@ -64,6 +84,7 @@ const DEFAULT_TRANSIENT_KEYWORDS = [
   'all candidates failed',
   'upstream_response_timeout',
 ];
+// 内容与后端 autoModelBuiltinPermanentKeywords 一致(后端为权威来源,理由同上)。
 const DEFAULT_PERMANENT_KEYWORDS = [
   // 上游明说"这个模型我不提供"——结构化 code 缺失时的自然语言兜底
   '模型不可用',
@@ -106,8 +127,10 @@ export default function SettingsAutoModelPolicy(props) {
     const updateArray = compareObjects(inputs, inputsRow);
     if (!updateArray.length) return showWarning(t('你似乎并没有修改什么'));
 
-    // 四个数值都必须是 >= 1 的整数:写 0 会让 auto 直接不可用。
-    for (const key of AUTO_MODEL_OPTION_KEYS.filter((k) => k !== 'AutoModelPermanentKeywords')) {
+    // 只有数值项才做"至少 1 的整数"校验:两张关键词表是自由文本,
+// Number('模型不可用') === NaN,漏排除它们就会在改任何数值时报
+// "AutoModelTransientKeywords 必须是大于等于 1 的整数"。
+    for (const key of AUTO_MODEL_NUMERIC_KEYS) {
       const raw = String(inputs[key] ?? '').trim();
       const value = Number(raw);
       if (!Number.isInteger(value) || value < 1) {
@@ -155,11 +178,18 @@ export default function SettingsAutoModelPolicy(props) {
   useEffect(() => {
     const currentInputs = {};
     for (const key of AUTO_MODEL_OPTION_KEYS) {
-      if (props.options && props.options[key] !== undefined) {
-        currentInputs[key] = String(props.options[key]);
-      } else {
+      const fromApi = props.options ? props.options[key] : undefined;
+      if (fromApi === undefined) {
         currentInputs[key] = inputs[key];
+        continue;
       }
+      // 关键词表是文本:后端未配置时回显空串,直接采用会把前端预填清掉,
+      // 管理员打开看到空框、以为没有内置判据。空串一律保留预填值。
+      if (AUTO_MODEL_KEYWORD_KEYS.includes(key) && String(fromApi).trim() === '') {
+        currentInputs[key] = inputs[key];
+        continue;
+      }
+      currentInputs[key] = String(fromApi);
     }
     setInputs(currentInputs);
     setInputsRow(structuredClone(currentInputs));
@@ -208,7 +238,7 @@ export default function SettingsAutoModelPolicy(props) {
                   // 与后端的联动保持一致,避免"改了封顶却忘了改记忆窗口"。
                   if (
                     Number(inputs.AutoModelScoreDecayMinutes) ===
-                    Number(inputsRows.AutoModelCooldownMaxHours || 6) * 60
+                    Number(inputsRow.AutoModelCooldownMaxHours || 6) * 60
                   ) {
                     next.AutoModelScoreDecayMinutes = String(Number(value) * 60);
                   }
