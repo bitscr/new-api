@@ -90,11 +90,6 @@ var (
 	autoModelPermanentCooldownHours = autoModelDefaultPermanentCooldownHours
 	autoModelCooldownMaxHours       = autoModelDefaultCooldownMaxHours
 	autoModelScoreDecayMinutes      = autoModelDefaultScoreDecayMinutes
-	// autoModelScoreDecayExplicit 记录"衰减窗口是否被显式设过"。
-	//
-	// 没被显式设过时,它跟着封顶走(改封顶 → 衰减同步跟着改);一旦管理员在面板
-	// 单独填过,就以他填的为准,不再被改封顶时的联动覆盖。
-	autoModelScoreDecayExplicit bool
 	// autoModelPermanentKeywords 是管理员补充的确定性失败关键词(一行一个)。
 	// 命中即把该失败升级为长冷却,作用域仍是单个 (group, model, channel)。
 	//
@@ -179,22 +174,13 @@ func AutoModelCooldownMax() time.Duration {
 
 // SetAutoModelCooldownMaxHours 面板写入路径(单位小时,至少 1)。
 //
-// 联动规则(与 SetAutoModelScoreDecayMinutes 配合,保证不变式"衰减 >= 封顶"
-// 在任何到达顺序下都成立):
-//   - 衰减窗口从未被显式设过 → 跟着封顶走,保持"封顶多久就记多久";
-//   - 已被显式设过 → 保留他填的值,但若小于新封顶则抬到封顶。
-//
-// 为什么必须在这里兜底、而不是配套校验拒绝:前端把改动项放在同一批并发 PUT 里,
-// 两个键的到达顺序不确定。若只是拒绝,会出现"一个被拒、另一个已生效"的半应用;
-// 让联动兜底则两种顺序都收敛到同一结果。
+// 只存值,不做任何联动改写:封顶与衰减窗口都是可自定义的,管理员想看什么组合
+// 就存什么组合。不合逻辑(衰减 < 封顶)时由写入方返回"建议值"提示,而不是
+// 悄悄把用户填的值改掉——改掉会让人以为自己填的生效了,反而更迷惑。
 func SetAutoModelCooldownMaxHours(value int) {
 	autoModelSettingsMutex.Lock()
 	defer autoModelSettingsMutex.Unlock()
 	autoModelCooldownMaxHours = sanitizePositive(value, 1)
-	target := autoModelCooldownMaxHours * 60
-	if !autoModelScoreDecayExplicit || autoModelScoreDecayMinutes < target {
-		autoModelScoreDecayMinutes = target
-	}
 }
 
 // AutoModelCooldownMaxHours 返回封顶的小时数,供面板与校验使用。
@@ -202,6 +188,34 @@ func AutoModelCooldownMaxHours() int {
 	autoModelSettingsMutex.RLock()
 	defer autoModelSettingsMutex.RUnlock()
 	return autoModelCooldownMaxHours
+}
+
+// AutoModelRecommendedCooldownMaxHours 给出"与当前衰减窗口相配"的封顶建议值(小时)。
+//
+// 取衰减窗口换算的小时数:封顶不该超过记忆窗口,否则最高几档解冻时扣分已是 0,
+// 冷却只剩"等时间"。至少 1 小时。
+func AutoModelRecommendedCooldownMaxHours() int {
+	autoModelSettingsMutex.RLock()
+	defer autoModelSettingsMutex.RUnlock()
+	hours := autoModelScoreDecayMinutes / 60
+	if hours < 1 {
+		return 1
+	}
+	return hours
+}
+
+// AutoModelRecommendedScoreDecayMinutes 给出"与当前封顶相配"的衰减窗口建议值(分钟)。
+//
+// 取封顶换算的分钟数,并保证大于冷却第二档(30 分钟):窗口若等于第二档,
+// 第 2 次失败解冻时分数正好归零,惩罚精确作废。
+func AutoModelRecommendedScoreDecayMinutes() int {
+	autoModelSettingsMutex.RLock()
+	defer autoModelSettingsMutex.RUnlock()
+	minutes := autoModelCooldownMaxHours * 60
+	if minutes <= 30 {
+		return 31
+	}
+	return minutes
 }
 
 // AutoModelScoreDecayMinutes 是评分线性衰减到中立的窗口(分钟)。
@@ -213,17 +227,12 @@ func AutoModelScoreDecayMinutes() int {
 
 // SetAutoModelScoreDecayMinutes 面板写入路径(分钟,至少 1)。
 //
-// 显式设置后置位 autoModelScoreDecayExplicit:此后改封顶不再联动覆盖它。
-// 但"记忆窗口小于封顶"这条不变式永远成立:小则抬到封顶,避免最高几档解冻时
-// 扣分已是 0、冷却只剩"等时间"。
+// 只存值,不做任何联动改写(理由同 SetAutoModelCooldownMaxHours):
+// 不合逻辑时由写入方给建议,不替用户改值。
 func SetAutoModelScoreDecayMinutes(value int) {
 	autoModelSettingsMutex.Lock()
 	defer autoModelSettingsMutex.Unlock()
 	autoModelScoreDecayMinutes = sanitizePositive(value, 1)
-	autoModelScoreDecayExplicit = true
-	if autoModelScoreDecayMinutes < autoModelCooldownMaxHours*60 {
-		autoModelScoreDecayMinutes = autoModelCooldownMaxHours * 60
-	}
 }
 
 // AutoModelTransientKeywords 返回"按普通冷却处理"判据的副本。

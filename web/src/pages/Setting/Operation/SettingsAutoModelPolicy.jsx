@@ -164,7 +164,18 @@ export default function SettingsAutoModelPolicy(props) {
               : t('保存失败，请重试');
           return showError(message);
         }
-        showSuccess(t('保存成功'));
+        // 后端允许保存"不合逻辑"的组合,但会在成功响应里附带建议值
+        // (如"保存成功,但建议封顶值为 6")。这类提示不能当成失败,也不能吞掉——
+        // 直接显示后端给的整句,用户就知道值已保存、只是建议改。
+        const advised = res.find(
+          (item) =>
+            item && item.data && typeof item.data.message === 'string' && item.data.message,
+        );
+        if (advised) {
+          showWarning(advised.data.message);
+        } else {
+          showSuccess(t('保存成功'));
+        }
         props.refresh();
       })
       .catch(() => {
@@ -232,18 +243,9 @@ export default function SettingsAutoModelPolicy(props) {
                 extraText={t(
                   '默认 6。普通(抖动)失败的冷却阶梯是 15 分钟起、每犯一次翻倍:15m→30m→1h→2h→4h→封顶。这里改的就是封顶。抬得太低会让反复出错的组合很快解冻、又回候选池;太高则会长期放弃一条只是暂时抖动的渠道。',
                 )}
-                onChange={(value) => {
-                  const next = { ...inputs, AutoModelCooldownMaxHours: String(value) };
-                  // 衰减窗口若从没被单独填过(即还等于封顶分钟数),就跟着封顶走,
-                  // 与后端的联动保持一致,避免"改了封顶却忘了改记忆窗口"。
-                  if (
-                    Number(inputs.AutoModelScoreDecayMinutes) ===
-                    Number(inputsRow.AutoModelCooldownMaxHours || 6) * 60
-                  ) {
-                    next.AutoModelScoreDecayMinutes = String(Number(value) * 60);
-                  }
-                  setInputs(next);
-                }}
+                onChange={(value) =>
+                  setInputs({ ...inputs, AutoModelCooldownMaxHours: String(value) })
+                }
               />
             </Col>
             <Col xs={24} sm={12} md={8} lg={8} xl={8}>

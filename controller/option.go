@@ -118,6 +118,9 @@ type OptionUpdateRequest struct {
 
 func UpdateOption(c *gin.Context) {
 	var option OptionUpdateRequest
+	// suggestion 在"值已保存、但组合不合逻辑"时带上建议值,随成功响应返回,
+	// 前端显示成"保存成功,但建议……"。它不阻止保存。
+	var suggestion string
 	err := common.DecodeJson(c.Request.Body, &option)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -386,32 +389,23 @@ func UpdateOption(c *gin.Context) {
 			// 封顶不能低于首档(15 分钟),否则阶梯第一档就超封顶,语义自相矛盾。
 			// 小时为整数,>=1 即满足。
 			//
-			// 不在这里校验"封顶 <= 衰减窗口":抬封顶本身会把衰减窗口一起抬上去
-			// (见 operation_setting.SetAutoModelCooldownMaxHours 的联动)。若改成
-			// 在这里拒绝,前端把两个值放在同一批并发 PUT 里时,先后到达会导致
-			// "其中一个被拒、另一个已生效"的半应用状态。让联动兜底才是幂等的:
-			// 两种到达顺序最终都会收敛到同一个结果。
-		case "AutoModelScoreDecayMinutes":
-			// 1) 衰减窗口太短会让惩罚在冷却解冻的瞬间归零,冷却等于白做:
-			//    第 2 次失败的冷却窗口是 30 分钟,窗口若也是 30 分钟,分数正好
-			//    在这时回到中立 0.5——惩罚精确作废。
-			if time.Duration(parsed)*time.Minute <= service.AutoModelCooldownSecondTierForValidation() {
-				c.JSON(http.StatusOK, gin.H{
-					"success": false,
-					"message": "评分衰减窗口必须大于抖动冷却的第二档(30 分钟),否则第 2 次失败解冻时评分已归零,惩罚作废",
-				})
-				return
+			// 这里只记建议、不拒绝:封顶与衰减窗口都是可自定义的,不合逻辑的组合也
+			// 允许保存,只在响应里附带建议值提示(前端显示"保存成功,但建议……")。
+			// 之所以不拒绝、也不替用户改值:前端把两个键放在同一批并发 PUT 里,
+			// 拒绝会造成"一个被拒、另一个已生效"的半应用;而悄悄改值会让用户以为
+			// 自己填的生效了。给建议既幂等又不骗人。
+			if advise := operation_setting.AutoModelRecommendedCooldownMaxHours(); parsed != advise {
+				suggestion = fmt.Sprintf("保存成功,但建议封顶值为 %d", advise)
 			}
-			// 2) 峰值一致性:窗口至少要覆盖到封顶档,否则最高几档解冻时扣分已是 0,
-			//    冷却只剩"等时间",阶梯越往上越没有额外约束力。
-			maxHours := operation_setting.AutoModelCooldownMaxHours()
-			if parsed < maxHours*60 {
-				c.JSON(http.StatusOK, gin.H{
-					"success": false,
-					"message": fmt.Sprintf("评分衰减窗口不能小于冷却封顶(%d 小时 = %d 分钟),否则最高几档解冻时惩罚已归零。建议跟着封顶走",
-						maxHours, maxHours*60),
-				})
-				return
+		case "AutoModelScoreDecayMinutes":
+			// 衰减窗口不足时同样只建议、不拒绝(理由同上)。
+			// 两种不合逻辑都提示:小于冷却第二档(惩罚在第 2 次解冻时归零),
+			// 或小于封顶(最高几档解冻时惩罚归零)。
+			recommended := operation_setting.AutoModelRecommendedScoreDecayMinutes()
+			tooShort := time.Duration(parsed)*time.Minute <= service.AutoModelCooldownSecondTierForValidation()
+			belowMax := parsed < operation_setting.AutoModelCooldownMaxHours()*60
+			if tooShort || belowMax || parsed != recommended {
+				suggestion = fmt.Sprintf("保存成功,但建议评分衰减值为 %d", recommended)
 			}
 		}
 	case "AutoModelPermanentKeywords":
@@ -493,7 +487,7 @@ func UpdateOption(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"message": "",
+		"message": suggestion,
 	})
 	return
 }
