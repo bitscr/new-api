@@ -434,6 +434,22 @@ func UpdateOption(c *gin.Context) {
 				return
 			}
 		}
+	case "AutoModelPriorityOverrideMargin":
+		// 反超阈值是浮点数,不能走上面那个"至少 1 的整数"分支。
+		// 只拒绝负数与 NaN/Inf:0 和 >= 1 都是合法且有意义的选择
+		// (分别代表"健康分完全接管顺序"和"关闭反超,回到旧行为")。
+		parsed, parseErr := strconv.ParseFloat(strings.TrimSpace(option.Value.(string)), 64)
+		if parseErr != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "该选项必须是数字",
+			})
+			return
+		}
+		if message := operation_setting.ValidateAutoModelPriorityOverrideMargin(parsed); message != "" {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": message})
+			return
+		}
 	case "console_setting.api_info":
 		err = console_setting.ValidateConsoleSettings(option.Value.(string), "ApiInfo")
 		if err != nil {

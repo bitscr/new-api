@@ -85,14 +85,16 @@ const DEFAULT_TRANSIENT_KEYWORDS = [
   'upstream_response_timeout',
 ];
 // 内容与后端 autoModelBuiltinPermanentKeywords 一致(后端为权威来源,理由同上)。
+//
+// 这里刻意不再收 'function calling is not supported' 一类的能力措辞:后端已把它们
+// 交给内置能力判据接管,处理方式完全不同(换模型 + 不记冷却,而不是长冷却 + 摘除
+// 模型)。留在预填里会让管理员以为它还在起作用,而后端会直接拒绝保存这种条目。
 const DEFAULT_PERMANENT_KEYWORDS = [
   // 上游明说"这个模型我不提供"——结构化 code 缺失时的自然语言兜底
   '模型不可用',
   '模型不存在',
   'model not found',
   'community model not found',
-  // 已实证会复发:某个上游确实不支持的确定性能力
-  'function calling is not supported',
   // 账号/密钥级确定性失败:换了模型也一样,重试没有意义
   'invalid_api_key',
   'invalid_authentication',

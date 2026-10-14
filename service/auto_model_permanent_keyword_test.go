@@ -12,17 +12,49 @@ import (
 )
 
 // 管理员补的关键词必须能把"内置判据认不出的确定性失败"升级为长冷却。
-// 日志里的真实样本:`tools / function calling is not supported by the upstream anonymous backend`。
 func TestPermanentKeywordUpgradesUnknownFailure(t *testing.T) {
 	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
-	operation_setting.SetAutoModelPermanentKeywords("function calling is not supported")
+	operation_setting.SetAutoModelPermanentKeywords("anonymous backend retired")
 
 	err := types.NewErrorWithStatusCode(
-		errors.New("tools / function calling is not supported by the upstream anonymous backend; remove `tools`"),
+		errors.New("the anonymous backend retired this route for your key"),
 		types.ErrorCode("invalid_request_error"), http.StatusBadRequest)
 
 	require.True(t, AutoModelPermanentFailure(err),
 		"关键词命中就该升级为永久级,否则这种失败只会拿 15 分钟冷却并被反复重试")
+}
+
+// 能力不匹配是"这次请求要的东西这个模型给不了",不是"这个组合坏了"。
+//
+// 日志里的真实样本:`tools / function calling is not supported by the upstream
+// anonymous backend`。旧判据把它当确定性失败:首犯冷却 24 小时(连不需要 tools 的
+// 请求一起挡),再犯直接把模型从渠道的 models 列表里永久删掉——一个带 tools 的请求
+// 就足以摘掉一个对普通对话完全健康的模型。现在它由能力判据接管:换模型 + 不记冷却。
+//
+// 关键词在这里刻意设置成同一句话:能力判据必须排在永久关键词之前,否则管理员
+// 抄一次日志就能把这个坑重新踩回来。
+func TestCapabilityFailureNeverBecomesPermanent(t *testing.T) {
+	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
+	operation_setting.SetAutoModelPermanentKeywords("function calling is not supported")
+
+	err := types.NewOpenAIError(
+		errors.New("tools / function calling is not supported by the upstream anonymous backend; remove `tools`"),
+		types.ErrorCode("invalid_request_error"), http.StatusBadRequest)
+
+	require.Equal(t, "tools", AutoModelCapabilityFailure(err))
+	require.False(t, AutoModelPermanentFailure(err),
+		"能力不匹配永远不算确定性失败:它不该冷却 24 小时,更不该摘除模型")
+	require.Equal(t, AutoModelRetryNextModel, ClassifyAutoModelRetry(err),
+		"上游对这类失败常回 400,而 400 默认不在重试状态码里,必须提前判成换模型")
+}
+
+// 面板校验要挡住"永远轮不到"的能力措辞,理由与 context_length_exceeded 一样:
+// 接受它只会让管理员以为自己配好了。
+func TestPermanentKeywordValidationRejectsCapabilityPhrases(t *testing.T) {
+	require.NotEmpty(t, operation_setting.ValidateAutoModelPermanentKeyword("function calling is not supported"))
+	require.NotEmpty(t, operation_setting.ValidateAutoModelPermanentKeyword("不支持图片输入"))
+	// 具体错误串仍然放行,这正是这个功能存在的理由。
+	require.Empty(t, operation_setting.ValidateAutoModelPermanentKeyword("anonymous backend retired"))
 }
 
 // 关键词不区分大小写,并且要能在 error code 上命中(很多上游只在结构化字段给原因)。

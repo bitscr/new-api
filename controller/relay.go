@@ -407,6 +407,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			// (group, model, channel) 冷却挡住,而真正的病根是调用方发来的 body。
 			// 只跳过冷却/记分,重试与换候选的既有策略不动。
 			logger.LogInfo(c, fmt.Sprintf("auto model: %s 请求自身非法(HTTP %d),不计入渠道/模型冷却", relayInfo.OriginModelName, newAPIError.StatusCode))
+		} else if feature := service.AutoModelCapabilityFailure(newAPIError); feature != "" {
+			// 能力不匹配:模型给不了这次请求要的东西(如 tools),但组合本身没坏。
+			// 旧逻辑把这类措辞当"确定性失败",于是首犯冷却 24 小时(连不需要该能力的
+			// 请求一起挡),再犯直接把模型从渠道的 models 列表里永久删掉——一个带 tools
+			// 的请求不该有这种后果。这里只跳过冷却/记分,重试换成"下一个模型"。
+			logger.LogInfo(c, fmt.Sprintf("auto model: %s 不支持本次请求需要的能力(%s),只换模型,不计入渠道/模型冷却", relayInfo.OriginModelName, feature))
 		} else {
 			recordAutoModelUpstreamFailure(c, relayInfo, newAPIError)
 		}
@@ -723,13 +729,23 @@ func prepareAutoModelRetry(c *gin.Context, info *relaycommon.RelayInfo, err *typ
 
 const autoModelAttemptedRoutesKey = "auto_model_attempted_routes"
 
+// attemptedAutoModelRoutes 返回本次请求已经打过的路由集合。返回的是活跃的 map,
+// 调用方只读;要写入请走 markCurrentAutoModelRouteAttempted。
+func attemptedAutoModelRoutes(c *gin.Context) map[service.AutoModelRoute]bool {
+	if c == nil {
+		return nil
+	}
+	value, _ := c.Get(autoModelAttemptedRoutesKey)
+	attempted, _ := value.(map[service.AutoModelRoute]bool)
+	return attempted
+}
+
 func markCurrentAutoModelRouteAttempted(c *gin.Context) {
 	route, ok := service.GetCurrentAutoModelRoute(c)
 	if !ok {
 		return
 	}
-	value, _ := c.Get(autoModelAttemptedRoutesKey)
-	attempted, _ := value.(map[service.AutoModelRoute]bool)
+	attempted := attemptedAutoModelRoutes(c)
 	if attempted == nil {
 		attempted = make(map[service.AutoModelRoute]bool)
 	}
@@ -795,9 +811,7 @@ func getFixedAutoModelChannel(c *gin.Context, info *relaycommon.RelayInfo, route
 		}
 		return nil, newAutoModelRouteError("auto model channel excluded after upstream failure")
 	}
-	value, _ := c.Get(autoModelAttemptedRoutesKey)
-	attempted, _ := value.(map[service.AutoModelRoute]bool)
-	if attempted[route] {
+	if attemptedAutoModelRoutes(c)[route] {
 		return nil, newAutoModelRouteError("auto model route was already attempted")
 	}
 	targets, err := model.GetAutoModelRoutingTargets(route.Group)
@@ -831,6 +845,11 @@ func getFixedAutoModelChannel(c *gin.Context, info *relaycommon.RelayInfo, route
 
 // trySwitchAutoModel advances a route, not a model-only list. Consecutive entries
 // may have the same ChannelID or the same ModelName. Neither is grounds to skip.
+//
+// 重排后再前进,而不是在 middleware 那次的冻结计划上 index+1:计划里的候选集是
+// 固定的(每个可用的 模型×渠道 各出现一次),重排只改变顺序,不会丢路。于是
+// "还没试过的最优路"会自然落到队首;而冻结计划可能把它排在这 4 次预算之外,
+// 让 auto 一路撞着已知很差的组合把预算用光。
 func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam, tokens int, meta *types.TokenCountMeta) bool {
 	if !canRetryAutoModelRequest(c, info) || info == nil || meta == nil {
 		return false
@@ -839,8 +858,14 @@ func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam 
 	if !ok {
 		return false
 	}
-	channel, err := prepareAutoModelRouteFromIndex(c, info, retryParam, tokens, meta,
-		common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex)+1, true)
+	next := common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex) + 1
+	if routes := service.RebuildAutoModelRoutePlanForRetry(c,
+		common.GetContextKeyString(c, constant.ContextKeyAutoModelRequestGroup),
+		attemptedAutoModelRoutes(c)); len(routes) > 0 {
+		service.ReplaceAutoModelRoutePlan(c, routes)
+		next = 0
+	}
+	channel, err := prepareAutoModelRouteFromIndex(c, info, retryParam, tokens, meta, next, true)
 	if err != nil {
 		return false
 	}

@@ -75,6 +75,9 @@ func Distribute() func(c *gin.Context) {
 						autoGroup = playgroundRequest.Group
 					}
 				}
+				// 记住这次解析出的请求分组。重试要按同一批候选重排,而
+				// ContextKeyUsingGroup 会被每次绑定的具体路由改写,不能拿它当依据。
+				common.SetContextKey(c, constant.ContextKeyAutoModelRequestGroup, autoGroup)
 				routes, routeErr := service.BuildAutoModelRoutesForRequest(c, autoGroup)
 				if routeErr != nil {
 					if errors.Is(routeErr, service.ErrAutoModelNoAuthorizedCandidates) {

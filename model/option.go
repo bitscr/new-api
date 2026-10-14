@@ -32,6 +32,8 @@ func InitOptionMap() {
 
 	// auto 的四个数值先由环境变量打底,再由数据库里的面板值覆盖(见 loadOptionsFromDatabase)。
 	operation_setting.InitAutoModelSettingsFromEnv()
+	// 选路设置同理,但它管的是"下一次该先打谁",与上面的失败处理分开。
+	operation_setting.InitAutoModelRoutingSettingsFromEnv()
 
 	// 添加原有的系统配置
 	common.OptionMap["FileUploadPermission"] = strconv.Itoa(common.FileUploadPermission)
@@ -197,6 +199,8 @@ func InitOptionMap() {
 	common.OptionMap["AutoModelScoreDecayMinutes"] = strconv.Itoa(operation_setting.AutoModelScoreDecayMinutes())
 	common.OptionMap["AutoModelPermanentKeywords"] = operation_setting.AutoModelPermanentKeywordsToString()
 	common.OptionMap["AutoModelTransientKeywords"] = operation_setting.AutoModelTransientKeywordsToString()
+	common.OptionMap["AutoModelPriorityOverrideMargin"] = strconv.FormatFloat(
+		operation_setting.AutoModelPriorityOverrideMargin(), 'f', -1, 64)
 	common.OptionMap["ExposeRatioEnabled"] = strconv.FormatBool(ratio_setting.IsExposeRatioEnabled())
 
 	// 自动添加所有注册的模型配置
@@ -252,6 +256,16 @@ func UpdateOption(key string, value string) error {
 // 解析失败保持原值不动,不把 0 或负数写进运行时配置。
 func autoModelSetIntOption(value string, set func(int)) {
 	parsed, parseErr := strconv.Atoi(strings.TrimSpace(value))
+	if parseErr != nil {
+		return
+	}
+	set(parsed)
+}
+
+// autoModelSetFloatOption 与上面的整数版同语义:解析失败就不动内存值,
+// 保留上一次可用的配置,而不是把它重置成零值。
+func autoModelSetFloatOption(value string, set func(float64)) {
+	parsed, parseErr := strconv.ParseFloat(strings.TrimSpace(value), 64)
 	if parseErr != nil {
 		return
 	}
@@ -611,6 +625,8 @@ func updateOptionMap(key string, value string) (err error) {
 		operation_setting.SetAutoModelPermanentKeywords(value)
 	case "AutoModelTransientKeywords":
 		operation_setting.SetAutoModelTransientKeywords(value)
+	case "AutoModelPriorityOverrideMargin":
+		autoModelSetFloatOption(value, operation_setting.SetAutoModelPriorityOverrideMargin)
 	case "StreamCacheQueueLength":
 		setting.StreamCacheQueueLength, _ = strconv.Atoi(value)
 	case "PayMethods":

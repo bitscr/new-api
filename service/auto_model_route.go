@@ -116,7 +116,12 @@ type autoModelRouteSnapshot struct {
 	Cooldowns        map[string]autoModelCooldownState
 	ModelWeights     map[string]map[string]float64
 	ExcludedChannels map[int]bool
-	Now              time.Time
+	// ExcludedRoutes drops concrete (分组, 模型, 渠道) 三元组,粒度比
+	// ExcludedChannels 细:渠道级排除是"这条渠道整个不能用了",这里排除的是
+	// "本次请求已经打过的那一条路"。重试时用它,让新计划天然从"还没试过的最优路"开头。
+	// nil 表示不额外排除任何路由。
+	ExcludedRoutes map[AutoModelRoute]bool
+	Now            time.Time
 }
 
 func newAutoModelRouteSnapshot(excluded map[int]bool) autoModelRouteSnapshot {
@@ -131,15 +136,82 @@ func newAutoModelRouteSnapshot(excluded map[int]bool) autoModelRouteSnapshot {
 }
 
 // BuildAutoModelRoutesForRequest takes fresh snapshots for every request. The
-// order is group order, channel priority, channel score band, channel weight,
-// then (inside that channel) model score band and model weight. Cooldown and hard
-// exclusions remove routes before any tier is selected; they never fail open.
+// order is group order, then channel health band, channel priority, channel score
+// band and channel weight, then (inside that channel) model score band and model
+// weight. Channels whose health differs by less than
+// AutoModelPriorityOverrideMargin share a health band, so priority decides among
+// them; a wider gap makes health decide on its own. Cooldown and hard exclusions
+// remove routes before any tier is selected; they never fail open.
 //
 // For an auto token group, existing group authorization determines the ordered
 // concrete groups. With cross-group retry disabled only the first nonempty
 // group's plan is retained. A concrete group has already been authorized by
 // middleware, including a permitted playground group override.
 func BuildAutoModelRoutesForRequest(c *gin.Context, group string) ([]AutoModelRoute, error) {
+	return buildAutoModelRoutesForRequest(c, group, nil)
+}
+
+// RebuildAutoModelRoutePlanForRetry re-derives the ordered plan for the same
+// request group from a fresh health snapshot, dropping every route in attempted.
+//
+// Why a retry must re-plan rather than advance the plan it was given: the plan is
+// ordered from the health visible when middleware ran. Any feedback produced by
+// other requests since then is invisible to that frozen list, so index+1 can walk
+// straight into a route that is currently the worst one available while the best
+// one sits further down — and with AutoModelMaxAttempts at 4, "further down" is
+// often unreachable.
+//
+// This is a pure re-ordering, never a loss: the plan is a permutation of the whole
+// candidate route set (every eligible 模型×渠道 pair appears exactly once), so the
+// rebuilt list contains every route the old one had, minus what is now attempted,
+// cooling or hard-excluded. Those are exactly the routes a retry must not reuse.
+//
+// It returns nil when the plan cannot be rebuilt — auto disabled, no request group
+// recorded, nothing attempted yet, or nothing left to try — and callers must then
+// keep the existing plan. ErrAutoModelNoAuthorizedCandidates is reported the same
+// way: an empty rebuild is a signal to fall back, not a failure to surface to the
+// client.
+//
+// 空 attempted 直接返回 nil,不做"纯重排"。两个理由:
+//  1. 没有已试路由时,冻结计划是几毫秒前刚按同一份健康快照排出来的,重排只会得到
+//     同一批候选的另一次随机抽取,没有信息增量。
+//  2. 更要紧的是终止性。重排后调用方要从队首(index 0)重新走,而调用方在
+//     "渠道在派发前就不可用"这条路径上不会标记 attempted;若空集也重排,那个循环
+//     就失去了"索引单调递增"这个原有的上界保证。空集返回 nil 让调用方退回
+//     index+1,把这条路径的终止性原样保留。
+func RebuildAutoModelRoutePlanForRetry(c *gin.Context, group string, attempted map[AutoModelRoute]bool) []AutoModelRoute {
+	if c == nil || len(attempted) == 0 {
+		return nil
+	}
+	routes, err := buildAutoModelRoutesForRequest(c, group, attempted)
+	if err != nil && !errors.Is(err, ErrAutoModelNoAuthorizedCandidates) {
+		common.SysError("failed to rebuild auto model routes for retry: " + err.Error())
+		return nil
+	}
+	return routes
+}
+
+// ReplaceAutoModelRoutePlan swaps the plan in place without activating a route.
+//
+// The active index is invalidated so no caller can report the replaced plan's head
+// as "current" before a bind actually committed. Group bookkeeping is deliberately
+// left alone: only a successful bind may move the request to another group, and a
+// rebuild that turns out unusable must not have moved it already.
+func ReplaceAutoModelRoutePlan(c *gin.Context, routes []AutoModelRoute) {
+	if c == nil {
+		return
+	}
+	plan := append([]AutoModelRoute(nil), routes...)
+	c.Set(autoModelRoutePlanContextKey, plan)
+	names := make([]string, len(plan))
+	for i, route := range plan {
+		names[i] = route.ModelName
+	}
+	common.SetContextKey(c, constant.ContextKeyAutoModelCandidates, names)
+	common.SetContextKey(c, constant.ContextKeyAutoModelIndex, -1)
+}
+
+func buildAutoModelRoutesForRequest(c *gin.Context, group string, exclude map[AutoModelRoute]bool) ([]AutoModelRoute, error) {
 	group = strings.TrimSpace(group)
 	if c == nil || !operation_setting.AutoModelEnabled || group == "" {
 		return nil, nil
@@ -152,6 +224,7 @@ func BuildAutoModelRoutesForRequest(c *gin.Context, group string) ([]AutoModelRo
 		crossGroupRetry = common.GetContextKeyBool(c, constant.ContextKeyTokenCrossGroupRetry)
 	}
 	snapshot := newAutoModelRouteSnapshot(GetAutoModelHardExcludedChannelIDs(c))
+	snapshot.ExcludedRoutes = exclude
 	var routes []AutoModelRoute
 	hasCandidates, hasAuthorizedCandidates := false, false
 	seenGroups := make(map[string]bool, len(groups))
@@ -255,6 +328,13 @@ func autoModelSupportsChat(endpoints []constant.EndpointType) bool {
 type autoModelRouteChannel struct {
 	ID       int
 	Priority int64
+	// Band 是健康分分档,0 最好。档宽 = AutoModelPriorityOverrideMargin:
+	// 健康分差距小于档宽的渠道视为"一样健康",这时才由 Priority 说话;
+	// 差距超过档宽,健康分自己分出档来。排序与分层都先读 Band 再读 Priority。
+	Band int
+	// Observed 表示这个渠道有近期证据(内存或库里的健康摘要)。没有证据的渠道不参与
+	// 分档,见 assignAutoModelHealthBands:它既不是健康也不是不健康,而是"不知道"。
+	Observed bool
 	Score    float64
 	Weight   float64
 	Models   []autoModelRouteModel
@@ -287,6 +367,11 @@ func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapsho
 				continue
 			}
 			seenTargets[target.ChannelID] = true
+			// 本次请求已经打过的那条路不再进计划。放在去重之后:重复的 ability 行
+			// 仍按一次计,不会被这里改变语义。
+			if snapshot.ExcludedRoutes[AutoModelRoute{Group: group, ModelName: name, ChannelID: target.ChannelID}] {
+				continue
+			}
 			key := autoModelHealthKey(group, name, target.ChannelID)
 			if snapshot.Cooldowns[key].Until.After(snapshot.Now) {
 				continue
@@ -295,10 +380,12 @@ func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapsho
 			if channel == nil {
 				// The target snapshot supplies actual channel metadata, identical
 				// across its models. Never derive this priority/score from a model.
+				channelHealth, observed := snapshot.ChannelHealth[autoModelChannelHealthKey(group, target.ChannelID)]
 				channel = &autoModelRouteChannel{
 					ID:       target.ChannelID,
 					Priority: target.Priority,
-					Score:    effectiveScore(snapshot.ChannelHealth[autoModelChannelHealthKey(group, target.ChannelID)], snapshot.Now),
+					Observed: observed,
+					Score:    effectiveScore(channelHealth, snapshot.Now),
 					Weight:   target.Weight,
 				}
 				channelsByID[target.ChannelID] = channel
@@ -314,16 +401,25 @@ func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapsho
 	for _, channel := range channelsByID {
 		channels = append(channels, channel)
 	}
+	assignAutoModelHealthBands(channels, operation_setting.AutoModelPriorityOverrideMargin())
 	sort.Slice(channels, func(i, j int) bool {
+		// 先比健康分档,再比 priority。档内 priority 说了算,跨档健康分说了算。
+		if channels[i].Band != channels[j].Band {
+			return channels[i].Band < channels[j].Band
+		}
 		if channels[i].Priority != channels[j].Priority {
 			return channels[i].Priority > channels[j].Priority
 		}
+		// 同档同 priority 内先按 ID,给档内挑选一个稳定起点:
+		// orderAutoModelScoreBands 是稳定排序,同分渠道会保持这里的先后。
 		return channels[i].ID < channels[j].ID
 	})
 	var routes []AutoModelRoute
 	for start := 0; start < len(channels); {
 		end := start + 1
-		for end < len(channels) && channels[end].Priority == channels[start].Priority {
+		for end < len(channels) &&
+			channels[end].Band == channels[start].Band &&
+			channels[end].Priority == channels[start].Priority {
 			end++
 		}
 		items := make([]autoModelScoreItem, 0, end-start)
@@ -343,6 +439,66 @@ func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapsho
 		start = end
 	}
 	return routes
+}
+
+// assignAutoModelHealthBands 把渠道按健康分分档,0 是最好的档。
+//
+// 档宽就是 AutoModelPriorityOverrideMargin,分档规则与 orderAutoModelScoreBands
+// 同源:每一档锚定在"还没分档的渠道里的最高分",而不是上一条渠道的分数。锚在相邻项上
+// 会让一串接近但不等的分数被串成一档,把真正不同的健康度混在一起——那正是既有
+// 渠道分档刻意避开的坑。
+//
+// 为什么用"档"而不是"逐条越级判定":健康分是连续量,真正可调的只有一个阈值。
+// 分档让"健康分差距小于阈值时由 priority 说话,超过阈值时健康分自己说话"这句话
+// 对任意多层同时成立。逐条比较则必须回答"越过谁",而多层场景下这个问题没有好
+// 答案:比相邻的会漏掉更上面的渠道,比最高的又会把已经被越过的渠道算进参照物,
+// 结果是"越级了但没排上去",规则看着生效、实际白做。
+//
+// 两个端点都自然落位,不需要额外的开关:
+//   - margin <= 0:每个不同的分数各占一档,档序 = 分数序,priority 只用于同分,
+//     即"健康分完全接管顺序";
+//   - margin >= 1(健康分上限是 1.0):所有渠道同档,priority 完全决定顺序,
+//     即"关闭分档、回到旧行为"。
+//
+// 两个端点都有一处共同的例外:从未观测过的渠道始终留在 0 档,不参与分档
+// (理由见循环里的注释)。所以更准确的说法是"健康分在有证据的渠道之间决定顺序"。
+//
+// 输入顺序无所谓:函数自己按分数降序复制一份来分档,不改动入参顺序。
+func assignAutoModelHealthBands(channels []*autoModelRouteChannel, margin float64) {
+	if len(channels) == 0 || math.IsNaN(margin) {
+		// NaN 档宽下所有比较都为假,留在 0 档等价于"关闭分档",是安全的一侧。
+		return
+	}
+	byScore := append([]*autoModelRouteChannel(nil), channels...)
+	sort.SliceStable(byScore, func(i, j int) bool {
+		if byScore[i].Score != byScore[j].Score {
+			return byScore[i].Score > byScore[j].Score
+		}
+		return byScore[i].ID < byScore[j].ID
+	})
+	// anchor 只取"观测到的最高分":未观测渠道的 0.5 是占位值而不是测量值,
+	// 拿它当档锚会把真正的测量值按一个虚构的参照物分档。列表已按分数降序,
+	// 所以遇到的第一个已观测渠道就是观测值里的最高分。
+	band, started, anchor := 0, false, 0.0
+	for _, channel := range byScore {
+		// 从未观测过的渠道不参与分档,留在最好的档里由 priority 决定先后。
+		//
+		// 它既不是"健康"也不是"不健康",而是"不知道":按中性 0.5 分档会让一条刚
+		// 加进来、管理员特意给了高 priority 的渠道,永远排在已证明健康的渠道后面。
+		// 而本系统不做任何主动探测,证据只能来自真实流量——排不上队就永远拿不到证据,
+		// 也就永远证明不了自己。让它按 priority 参与竞争,正是引入分档规则之前的行为。
+		if !channel.Observed {
+			channel.Band = 0
+			continue
+		}
+		if !started {
+			started, anchor = true, channel.Score
+		} else if channel.Score < anchor-margin {
+			band++
+			anchor = channel.Score
+		}
+		channel.Band = band
+	}
 }
 
 func autoModelRouteWeight(group, name string, weights map[string]map[string]float64) float64 {

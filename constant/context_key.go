@@ -46,6 +46,10 @@ const (
 	ContextKeyAutoModelCandidates ContextKey = "auto_model_candidates"
 	ContextKeyAutoModelIndex      ContextKey = "auto_model_index"
 	ContextKeyAutoModelClientName ContextKey = "auto_model_client_name"
+	// ContextKeyAutoModelRequestGroup 记住 middleware 阶段解析出的 auto 请求分组。
+	// 必须单独存一份:ContextKeyUsingGroup 会被每次绑定的具体路由改写(跨分组重试
+	// 时它一直在变),拿它重排会算出与首次不同的候选集,而不是同一批候选的新顺序。
+	ContextKeyAutoModelRequestGroup ContextKey = "auto_model_request_group"
 
 	/* user related keys */
 	ContextKeyUserId      ContextKey = "id"

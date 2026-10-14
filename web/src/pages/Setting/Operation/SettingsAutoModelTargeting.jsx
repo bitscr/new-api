@@ -33,12 +33,17 @@ import { useTranslation } from 'react-i18next';
 
 const { Text } = Typography;
 
-const OPTION_KEYS = ['AutoModelEnabled', 'AutoModelCandidates', 'AutoModelWeights'];
+const OPTION_KEYS = [
+  'AutoModelEnabled',
+  'AutoModelCandidates',
+  'AutoModelWeights',
+  'AutoModelPriorityOverrideMargin',
+];
 
 /**
- * auto 的候选范围与组内权重。
+ * auto 的候选范围、组内权重与渠道排序。
  *
- * 这两个值决定 auto「可以选谁」,比冷却和重试预算更靠前:配错就是直接改变选路结果。
+ * 前两个值决定 auto「可以选谁」,比冷却和重试预算更靠前:配错就是直接改变选路结果。
  * 所以这里不提供可视化点选,而是 JSON 文本 + 保存前逐条校验,与分组倍率设置的手动
  * 编辑保持一致——半成品的选择器比一个校验良好的文本框更容易出错。
  *
@@ -46,6 +51,11 @@ const OPTION_KEYS = ['AutoModelEnabled', 'AutoModelCandidates', 'AutoModelWeight
  *   分组名**不出现**在 JSON 里 = 该分组不限制,用它的全部启用模型;
  *   分组名出现但值是空数组 = 该分组一个模型都不选,auto 在该分组下无路可走。
  * 两者在原始 JSON 里看起来很像,后果完全相反。
+ *
+ * 「渠道健康分同档宽度」管的是渠道顺序而不是候选范围:健康分差距小于它的渠道算
+ * 一样健康,这时由渠道 priority 说话;差距超过它,健康分自己分出档来。没有这条规则
+ * 时 priority 是硬分层,一条 priority 高的慢渠道会永远排在健康的低优先级渠道前面,
+ * 每 15 分钟冷却到期就回来撞一次。
  */
 export default function SettingsAutoModelTargeting(props) {
   const { t } = useTranslation();
@@ -54,6 +64,7 @@ export default function SettingsAutoModelTargeting(props) {
     AutoModelEnabled: 'true',
     AutoModelCandidates: '',
     AutoModelWeights: '',
+    AutoModelPriorityOverrideMargin: '0.25',
   });
   const refForm = useRef();
   const [inputsRow, setInputsRow] = useState(inputs);
@@ -107,7 +118,26 @@ export default function SettingsAutoModelTargeting(props) {
     return parsed;
   };
 
-  const validators = { AutoModelCandidates: parseCandidates, AutoModelWeights: parseWeights };
+  // 反超阈值是浮点数,不能套用失败判据面板那套"至少 1 的整数"校验。
+  // 只挡空值、非数字与负数:0 和 >= 1 都是合法且有意义的选择。
+  const parseMargin = (value) => {
+    const raw = String(value ?? '').trim();
+    if (!raw) throw new Error(t('不能为空;默认值是 0.25'));
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) throw new Error(t('必须是数字'));
+    if (parsed < 0) {
+      throw new Error(
+        t('不能为负数:负值会让健康分更高的渠道反而落到更差的档,顺序被反转'),
+      );
+    }
+    return parsed;
+  };
+
+  const validators = {
+    AutoModelCandidates: parseCandidates,
+    AutoModelWeights: parseWeights,
+    AutoModelPriorityOverrideMargin: parseMargin,
+  };
 
   const validate = (key, value) => {
     // 没有校验器的键(如 AutoModelEnabled 这种开关)一律放行。
@@ -198,11 +228,11 @@ export default function SettingsAutoModelTargeting(props) {
         getFormApi={(formAPI) => (refForm.current = formAPI)}
         style={{ marginBottom: 15 }}
       >
-        <Form.Section text={t('auto 候选范围与权重')}>
+        <Form.Section text={t('auto 候选范围、权重与渠道排序')}>
           <Banner
             type='warning'
             description={t(
-              '这两个值直接决定 auto 能选哪些模型。改错会立刻改变选路结果,请先确认分组与模型名确实存在。',
+              '这里每一项都会直接改变 auto 的选路结果。改错会立刻生效,请先确认分组与模型名确实存在。',
             )}
             style={{ marginBottom: 16 }}
           />
@@ -268,6 +298,32 @@ export default function SettingsAutoModelTargeting(props) {
                   '示例:{"default": {"gpt-4o": 2}} 让 default 分组里 gpt-4o 的选中概率是其它同级模型的两倍。',
                 )}
               </Text>
+            </Col>
+          </Row>
+          <Row gutter={16} style={{ marginTop: 16 }}>
+            <Col xs={24} sm={12}>
+              <Form.Input
+                field={'AutoModelPriorityOverrideMargin'}
+                label={t('渠道健康分同档宽度')}
+                extraText={t(
+                  '默认 0.25。健康分差距小于这个宽度的渠道算「一样健康」,由 priority 决定先后;差距超过它,健康分自己分出档来,priority 压不住。从未被观测过的渠道始终留在最好的档里由 priority 排——本系统不做主动探测,新渠道只有被真实请求用过才能证明自己。健康分量程 1.0、中立点 0.5,所以 0.25 是半个量程的差距,足以区分「明显更好」和「只是抖动」。档宽本身就是迟滞:要跨过一整档才会改变顺序,不会在临界处来回跳。填 0 = 顺序完全等于健康分顺序(priority 只用于同分);填 1 或更大 = 所有渠道永远同档,回到「priority 完全决定顺序」的旧行为。',
+                )}
+                rules={[
+                  {
+                    validator: (rule, value) => {
+                      try {
+                        parseMargin(value);
+                        return true;
+                      } catch {
+                        return false;
+                      }
+                    },
+                  },
+                ]}
+                onChange={(value) =>
+                  setInputs({ ...inputs, AutoModelPriorityOverrideMargin: value })
+                }
+              />
             </Col>
           </Row>
           <Row style={{ marginTop: 12 }}>

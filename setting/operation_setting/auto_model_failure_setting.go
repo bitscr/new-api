@@ -1,6 +1,7 @@
 package operation_setting
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,104 @@ const (
 	autoModelDefaultScoreDecayMinutes = 360
 )
 
+// AutoModelCapabilityText 是一条"上游明说这个模型不提供某种能力"的判据。
+// Feature 是能力名(会出现在日志里,也是将来"按模型记录不支持什么"的键),
+// Texts 是大小写不敏感的子串。
+type AutoModelCapabilityText struct {
+	Feature string
+	Texts   []string
+}
+
+// autoModelCapabilityTexts 是能力不匹配的措辞表。
+//
+// 为什么单独一张表,而不是继续塞进 autoModelBuiltinPermanentKeywords:
+// 两者的正确处理完全相反。
+//   - "模型不存在/无权"       → 这个组合不该被选,值得长冷却乃至摘除;
+//   - "模型不支持本次要的能力" → 组合本身没坏,只是这次请求要的东西它给不了。
+//
+// 按前者处理会连带惩罚所有不需要该能力的请求(24 小时冷却),第二次还会把模型从
+// 渠道里永久删掉——一个带 tools 的请求就足以摘掉一个对普通对话完全健康的模型。
+// 本机内置永久关键词里那条 "function calling is not supported" 正是踩了这个坑:
+// 它想表达的确实是"这个模型不支持 function calling",但用了错误的机制。
+//
+// 所以命中这张表 = 换模型 + 不记任何冷却,而不是升级成长冷却。
+//
+// 表里刻意只收"能力名 + 不支持"连写的措辞。泛化的 unsupported_parameter /
+// invalid_request 不收:那些可能是请求体别的字段写错,算到模型头上会误伤。
+// 上游冒出新的措辞时,管理员仍可用 AutoModelTransientKeywords 把它钉在抖动档,
+// 那里不会被升级成长冷却。
+var autoModelCapabilityTexts = []AutoModelCapabilityText{
+	{Feature: "tools", Texts: []string{
+		"function calling is not supported",
+		"function calling not supported",
+		"tool calling is not supported",
+		"tools are not supported",
+		"tool use is not supported",
+		"does not support function calling",
+		"does not support tool calling",
+		"does not support tools",
+		"不支持 function calling",
+		"不支持工具调用",
+		"不支持函数调用",
+	}},
+	{Feature: "vision", Texts: []string{
+		"image input is not supported",
+		"image url is not supported",
+		"images are not supported",
+		"vision is not supported",
+		"does not support image",
+		"does not support vision",
+		"不支持图片输入",
+		"不支持图像",
+	}},
+	{Feature: "json_schema", Texts: []string{
+		"json_schema is not supported",
+		"json schema is not supported",
+		"structured output is not supported",
+		"response_format is not supported",
+		"不支持 json_schema",
+		"不支持结构化输出",
+	}},
+	{Feature: "reasoning", Texts: []string{
+		"reasoning is not supported",
+		"thinking is not supported",
+		"does not support reasoning",
+		"does not support thinking",
+		"不支持推理",
+	}},
+	{Feature: "audio", Texts: []string{
+		"audio input is not supported",
+		"audio is not supported",
+		"does not support audio",
+		"不支持音频",
+	}},
+}
+
+// AutoModelCapabilityTexts 返回内置措辞表。
+//
+// 表是只读的常量数据,调用方不得修改;这里返回共享切片而不是深拷贝,
+// 因为它不随面板配置变化,复制一份只会让判定与校验各自持有一份可能漂移的副本。
+func AutoModelCapabilityTexts() []AutoModelCapabilityText {
+	return autoModelCapabilityTexts
+}
+
+// MatchAutoModelCapabilityText 在给定文本里找能力不匹配措辞,返回命中的能力名。
+// 未命中返回空串。判定与面板校验共用,避免两处各写一份措辞而悄悄失配。
+func MatchAutoModelCapabilityText(haystack string) string {
+	haystack = strings.ToLower(haystack)
+	if haystack == "" {
+		return ""
+	}
+	for _, entry := range autoModelCapabilityTexts {
+		for _, text := range entry.Texts {
+			if strings.Contains(haystack, text) {
+				return entry.Feature
+			}
+		}
+	}
+	return ""
+}
+
 // autoModelBuiltinPermanentKeywords 是"确定性失败"判据的内置初值(本机在用的条目)。
 //
 // 为什么要有内置初值:这些条目都来自本机日志里实际出现过、且重试永远不会好的失败。
@@ -52,6 +151,10 @@ const (
 //
 // 判定方式是在"错误正文 + 错误码 + 错误类型"里做大小写不敏感的子串匹配,
 // 所以中文文案、英文词语、状态码三种写法都可写。
+//
+// 这里不再收 "function calling is not supported" 一类的能力措辞:它们现在由
+// autoModelCapabilityTexts 接管,处理方式完全不同(换模型 + 不记冷却,
+// 而不是长冷却 + 摘除模型)。留在表里只会是一条永远轮不到的僵尸条目。
 var autoModelBuiltinPermanentKeywords = []string{
 	// 上游明说"这个模型我不提供"——结构化 code 缺失时的自然语言兜底。
 	// 实测 ch11 的 tr-alpha-channel 就是反复撞这一类,却只能吃 15 分钟抖动冷却。
@@ -59,8 +162,6 @@ var autoModelBuiltinPermanentKeywords = []string{
 	"模型不存在",
 	"model not found",
 	"community model not found",
-	// 已实证会复发:某个上游确实不支持的确定性能力。
-	"function calling is not supported",
 	// 账号/密钥级确定性失败:换模型也一样,重试没有意义。
 	"invalid_api_key",
 	"invalid_authentication",
@@ -287,12 +388,14 @@ func AutoModelPermanentKeywordsToString() string {
 // ValidateAutoModelPermanentKeyword 在写库前挡住"注定不会生效或被严重滥用"的关键词。
 // 返回空字符串表示接受。
 //
-// 三类必须拒绝:
+// 四类必须拒绝:
 //  1. 过短(少于 2 个字符):子串匹配下会命中大量无关失败。
 //  2. 只描述受保护抖动失败的词(如 context_length_exceeded)。判定里保护项优先于
 //     关键词,这种条目永远不生效——接受它只会让管理员以为配好了。
 //  3. 泛化到吃掉大半失败文本的词(如 error)。命中即 24h 冷却,这种条目会把几乎
 //     任何失败都升级成长冷却,等于把所有组合轮着封一遍。
+//  4. 能力不匹配措辞(如 function calling is not supported)。判定里能力判据优先于
+//     关键词,同样永远不生效;而且它本该走"换模型 + 不记冷却",不是长冷却。
 //
 // 只挡这些显然无意义/会误伤的条目,不猜测管理员的意图:具体错误串一律放行,
 // 这正是这个功能存在的理由。
@@ -308,6 +411,10 @@ func ValidateAutoModelPermanentKeyword(raw string) string {
 		if strings.Contains(keyword, protected) {
 			return "该关键词只描述受保护的抖动失败,判定里保护项优先,它永远不会生效:" + keyword
 		}
+	}
+	if feature := MatchAutoModelCapabilityText(keyword); feature != "" {
+		return fmt.Sprintf("该关键词描述的是「模型不支持 %s」这类能力不匹配,已由内置能力判据接管"+
+			"(换模型 + 不记冷却,而不是长冷却或摘除模型),写成永久关键词永远不会生效:%s", feature, keyword)
 	}
 	for _, overbroad := range []string{"error", "failed", "失败", "错误"} {
 		if keyword == overbroad {

@@ -53,6 +53,18 @@ func ClassifyAutoModelRetry(err *types.NewAPIError) AutoModelRetryScope {
 			return AutoModelRetryStop
 		}
 	}
+	// 能力不匹配优先于状态码白名单:上游对这类失败常回 400,而 400 默认不在
+	// ShouldRetryByStatusCode 里(默认区间是 1xx 与 3xx-5xx),不提前判就根本不会
+	// 重试,用户直接吃一个 400。
+	//
+	// 位置刻意排在前面两个分支之后:它们表达的是"网关自己判定这次请求不成立"
+	// (本地请求体构造失败、渠道配置错误、全局 skip 标记),那种情况下没有上游可换,
+	// 换模型也没有意义。上游返回的能力错误不会落到 ErrorTypeNewAPIError 上。
+	//
+	// 作用域固定是"换模型":同一条上游的同名模型通常一样不支持,换渠道是白跑一趟。
+	if AutoModelCapabilityFailure(err) != "" {
+		return AutoModelRetryNextModel
+	}
 	modelScoped, incompatible := autoModelRetryModelEvidence(err)
 	// Only the former model-switch statuses get a compatibility exception.
 	// Model-level permission, rate limit and overload still require opt-in.
@@ -75,6 +87,38 @@ func autoModelCompatibilityStatus(status int) bool {
 	return false
 }
 
+// AutoModelCapabilityFailure 判定一次失败是不是"这个模型不支持本次请求需要的能力",
+// 返回命中的能力名(tools / vision / json_schema / reasoning / audio),未命中返回空串。
+//
+// 为什么必须与"模型不存在"分开:两者的正确处理完全相反,而旧判据把它们混在一起
+// ——内置永久关键词里那条 "function calling is not supported" 就是能力措辞,命中后
+// 走的是"24 小时冷却 + 再犯摘除模型"。后果:一个带 tools 的请求会让该
+// (分组, 模型, 渠道) 在 24 小时内对所有请求不可用(包括普通对话),第二次还会把
+// 模型从渠道的 models 列表里永久删掉。而组合本身并没有坏,它只是给不了 tools。
+//
+// 所以这条判据的作用是"改道":命中即换模型(同一上游的同名模型通常一样不支持,
+// 换渠道是白跑),并且不记任何冷却——能力不匹配不是健康问题,记冷却会把不需要
+// 该能力的请求一起误伤。
+//
+// 判据范围与其它关键词一致:错误正文、错误码、错误类型三处都看。
+func AutoModelCapabilityFailure(err *types.NewAPIError) string {
+	if err == nil {
+		return ""
+	}
+	detail := err.ToOpenAIError()
+	for _, haystack := range []string{
+		err.Error(),
+		detail.Message,
+		string(err.GetErrorCode()),
+		detail.Type,
+	} {
+		if feature := operation_setting.MatchAutoModelCapabilityText(haystack); feature != "" {
+			return feature
+		}
+	}
+	return ""
+}
+
 // AutoModelPermanentFailure 判定一次上游失败是不是"确定性"的:这类失败重试也
 // 不会好(鉴权/权限、模型不存在、模型不支持、param=model 的非法请求),应该给
 // 永久级长冷却,而不是和限流/超时/5xx 一样只冷却 15 分钟。
@@ -86,8 +130,17 @@ func autoModelCompatibilityStatus(status int) bool {
 // 内置判据之外,管理员可以在面板补关键词(一行一个),覆盖上游冒出的新错误串,
 // 否则那些失败只会拿到 15 分钟冷却并被反复重试。关键词只升级冷却时长,
 // 作用域仍是单个 (group, model, channel)。
+//
+// "模型不支持本次要的能力"永远不算确定性失败,见 AutoModelCapabilityFailure:
+// 那是这次请求与模型的匹配问题,不是这个组合坏了。
 func AutoModelPermanentFailure(err *types.NewAPIError) bool {
 	if err == nil {
+		return false
+	}
+	if AutoModelCapabilityFailure(err) != "" {
+		// 必须排在内置永久关键词之前。能力措辞(如 "function calling is not supported")
+		// 既在能力表里、也曾出现在永久关键词表里,谁先判决定结果完全不同:
+		// 先判永久会冷却 24 小时并在再犯时摘除模型,先判能力则只是换一个模型重试。
 		return false
 	}
 	if autoModelProtectedTransient(err) {
