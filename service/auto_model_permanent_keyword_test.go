@@ -24,37 +24,24 @@ func TestPermanentKeywordUpgradesUnknownFailure(t *testing.T) {
 		"关键词命中就该升级为永久级,否则这种失败只会拿 15 分钟冷却并被反复重试")
 }
 
-// 能力不匹配是"这次请求要的东西这个模型给不了",不是"这个组合坏了"。
+// 能力不匹配必须按确定性失败处理,内置关键词表里那条 "function calling is not
+// supported" 就是干这个的:本网关的 auto 主要用于工具调用,一个给不了 tools 的
+// 模型对这个用途就是废的,留着只会被反复选中、每次白费一次尝试。
 //
 // 日志里的真实样本:`tools / function calling is not supported by the upstream
-// anonymous backend`。旧判据把它当确定性失败:首犯冷却 24 小时(连不需要 tools 的
-// 请求一起挡),再犯直接把模型从渠道的 models 列表里永久删掉——一个带 tools 的请求
-// 就足以摘掉一个对普通对话完全健康的模型。现在它由能力判据接管:换模型 + 不记冷却。
-//
-// 关键词在这里刻意设置成同一句话:能力判据必须排在永久关键词之前,否则管理员
-// 抄一次日志就能把这个坑重新踩回来。
-func TestCapabilityFailureNeverBecomesPermanent(t *testing.T) {
+// anonymous backend`。
+func TestCapabilityFailureBecomesPermanent(t *testing.T) {
 	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
-	operation_setting.SetAutoModelPermanentKeywords("function calling is not supported")
 
 	err := types.NewOpenAIError(
 		errors.New("tools / function calling is not supported by the upstream anonymous backend; remove `tools`"),
 		types.ErrorCode("invalid_request_error"), http.StatusBadRequest)
 
 	require.Equal(t, "tools", AutoModelCapabilityFailure(err))
-	require.False(t, AutoModelPermanentFailure(err),
-		"能力不匹配永远不算确定性失败:它不该冷却 24 小时,更不该摘除模型")
+	require.True(t, AutoModelPermanentFailure(err),
+		"内置判据就该认出来:首犯冷却 24 小时,再犯摘除这个组合")
 	require.Equal(t, AutoModelRetryNextModel, ClassifyAutoModelRetry(err),
-		"上游对这类失败常回 400,而 400 默认不在重试状态码里,必须提前判成换模型")
-}
-
-// 面板校验要挡住"永远轮不到"的能力措辞,理由与 context_length_exceeded 一样:
-// 接受它只会让管理员以为自己配好了。
-func TestPermanentKeywordValidationRejectsCapabilityPhrases(t *testing.T) {
-	require.NotEmpty(t, operation_setting.ValidateAutoModelPermanentKeyword("function calling is not supported"))
-	require.NotEmpty(t, operation_setting.ValidateAutoModelPermanentKeyword("不支持图片输入"))
-	// 具体错误串仍然放行,这正是这个功能存在的理由。
-	require.Empty(t, operation_setting.ValidateAutoModelPermanentKeyword("anonymous backend retired"))
+		"这次请求仍然要换个模型继续跑,不能直接甩一个 400 给调用方")
 }
 
 // 关键词不区分大小写,并且要能在 error code 上命中(很多上游只在结构化字段给原因)。
@@ -85,9 +72,12 @@ func TestUnmatchedFailureStaysTransientWithKeywordsConfigured(t *testing.T) {
 	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
 	operation_setting.SetAutoModelPermanentKeywords("some specific upstream string")
 
-	err := types.NewErrorWithStatusCode(errors.New("Upstream unavailable"),
-		types.ErrorCode("server_error"), http.StatusServiceUnavailable)
-	require.False(t, AutoModelPermanentFailure(err))
+	// 用一个既不在内置判据、也不在关键词表里的 400。
+	// 不能拿 5xx 当例子:502/503/504 与 CF 的 520-527 现在由状态码直接判永久,
+	// 用它们就测不到"关键词不命中"这件事了。
+	err := types.NewErrorWithStatusCode(errors.New("Upstream hiccup"),
+		types.ErrorCode("server_error"), http.StatusBadRequest)
+	require.False(t, AutoModelPermanentFailure(err), "关键词不命中就不能扩大打击面")
 }
 
 // 关键词解析:按行切、去空白、去重、转小写,忽略空行。
@@ -113,18 +103,21 @@ func TestAutoModelNumericSettingsRejectNonPositive(t *testing.T) {
 	operation_setting.SetAutoModelPermanentCooldownHours(-5)
 	require.Equal(t, time.Hour, operation_setting.AutoModelPermanentCooldownBase())
 
-	// 衰减窗口的下限不是 1,而是"封顶小时数换算的分钟数":低于它时最高几档
-	// 解冻时扣分已归零,冷却只剩"等时间"。写 0 会被抬到封顶,而不是变成 1。
+	// 衰减窗口的下限只有 1:封顶与衰减窗口之间**没有**联动改写。
+	// 不合逻辑的组合(衰减 < 封顶)允许保存,面板会附带建议值提示,
+	// 而不是悄悄替管理员改值——改掉会让人以为自己填的生效了,反而更迷惑。
 	operation_setting.SetAutoModelScoreDecayMinutes(0)
-	require.Equal(t, operation_setting.AutoModelCooldownMaxHours()*60,
-		operation_setting.AutoModelScoreDecayMinutes(),
-		"衰减窗口不能低于封顶所换算的分钟数")
+	require.Equal(t, 1, operation_setting.AutoModelScoreDecayMinutes(),
+		"低于下限时收敛到 1,而不是被抬到封顶所换算的分钟数")
 }
 
-// 封顶与衰减窗口的联动:无论两个键以什么顺序写入,不变式"衰减 >= 封顶*60"
-// 都必须成立。前端把改动项放在同一批并发 PUT 里,到达顺序不确定,所以两种
-// 顺序都要收敛到同一结果。
-func TestCooldownMaxAndScoreDecayStayConsistent(t *testing.T) {
+// 封顶与衰减窗口之间没有联动改写:两个 setter 都只存值(各自收敛到下限 1),
+// 无论以什么顺序写入,读回的都是写入值本身。
+//
+// 不合逻辑的组合由面板给建议值提示(controller/option.go 的 suggestion 机制),
+// 不在 setter 里静默改值——前端把两个键放在同一批并发 PUT 里,静默改值会造成
+// "一个被改、另一个没改"的半应用,而且管理员不知道自己填的没生效。
+func TestCooldownMaxAndScoreDecayAreStoredVerbatim(t *testing.T) {
 	t.Cleanup(func() { operation_setting.InitAutoModelSettingsFromEnv() })
 
 	for _, writes := range [][2]string{
@@ -136,21 +129,27 @@ func TestCooldownMaxAndScoreDecayStayConsistent(t *testing.T) {
 			switch key {
 			case "max":
 				operation_setting.SetAutoModelCooldownMaxHours(12)
+				require.Equal(t, 12, operation_setting.AutoModelCooldownMaxHours(),
+					"写入顺序 %v:封顶按写入值保存", writes)
 			case "decay":
 				operation_setting.SetAutoModelScoreDecayMinutes(240)
+				require.Equal(t, 240, operation_setting.AutoModelScoreDecayMinutes(),
+					"写入顺序 %v:衰减窗口按写入值保存", writes)
 			}
-			require.GreaterOrEqual(t,
-				operation_setting.AutoModelScoreDecayMinutes(),
-				operation_setting.AutoModelCooldownMaxHours()*60,
-				"写入顺序 %v:衰减窗口必须不低于封顶", writes)
 		}
+		// 两个键互不联动:两个都写完之后,读回的仍是各自写入的值。
+		require.Equal(t, 12, operation_setting.AutoModelCooldownMaxHours())
+		require.Equal(t, 240, operation_setting.AutoModelScoreDecayMinutes())
 	}
 
-	// 未显式设过衰减时,只改封顶应把衰减一起带过去。
+	// 不合逻辑的组合也照样保存,只是面板会给出建议值。
 	operation_setting.InitAutoModelSettingsFromEnv()
-	operation_setting.SetAutoModelCooldownMaxHours(3)
-	require.Equal(t, 180, operation_setting.AutoModelScoreDecayMinutes(),
-		"未显式设置时,衰减随封顶联动(3 小时 = 180 分钟)")
+	operation_setting.SetAutoModelCooldownMaxHours(12)
+	operation_setting.SetAutoModelScoreDecayMinutes(60)
+	require.Equal(t, 60, operation_setting.AutoModelScoreDecayMinutes(),
+		"衰减窗口小于封顶时只给建议,不替管理员改值")
+	require.Equal(t, 720, operation_setting.AutoModelRecommendedScoreDecayMinutes(),
+		"建议值 = 封顶换算的分钟数(12 小时 = 720 分钟)")
 }
 
 // 确定性失败已改为两档:首犯冷却 = 首次窗口,再犯直接摘除模型。

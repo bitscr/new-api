@@ -57,13 +57,16 @@ func TestAutoModelKeywordUpgradesOnlyWhenConfigured(t *testing.T) {
 	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords(original) })
 	_ = common.OptionMap
 
+	// 错误串必须既不在内置判据、也不在能力措辞表里,否则"只有关键词能升级它"
+	// 这个前提就不成立。早先用的是 "function calling is not supported",它现在
+	// 既在内置永久关键词里、也在能力措辞表里,未配置关键词时就已经是永久了。
 	err := types.NewErrorWithStatusCode(
-		errors.New("tools / function calling is not supported by the upstream anonymous backend"),
+		errors.New("upstream anonymous backend retired this route"),
 		types.ErrorCode("unsupported_feature"), http.StatusBadRequest)
 
 	operation_setting.SetAutoModelPermanentKeywords("")
 	require.False(t, service.AutoModelPermanentFailure(err), "未配置关键词时这类失败只是抖动")
 
-	operation_setting.SetAutoModelPermanentKeywords("function calling is not supported")
+	operation_setting.SetAutoModelPermanentKeywords("anonymous backend retired")
 	require.True(t, service.AutoModelPermanentFailure(err), "配置关键词后同一失败升级为确定性")
 }

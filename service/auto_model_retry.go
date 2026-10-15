@@ -90,15 +90,14 @@ func autoModelCompatibilityStatus(status int) bool {
 // AutoModelCapabilityFailure 判定一次失败是不是"这个模型不支持本次请求需要的能力",
 // 返回命中的能力名(tools / vision / json_schema / reasoning / audio),未命中返回空串。
 //
-// 为什么必须与"模型不存在"分开:两者的正确处理完全相反,而旧判据把它们混在一起
-// ——内置永久关键词里那条 "function calling is not supported" 就是能力措辞,命中后
-// 走的是"24 小时冷却 + 再犯摘除模型"。后果:一个带 tools 的请求会让该
-// (分组, 模型, 渠道) 在 24 小时内对所有请求不可用(包括普通对话),第二次还会把
-// 模型从渠道的 models 列表里永久删掉。而组合本身并没有坏,它只是给不了 tools。
+// 它同时决定两件事:
 //
-// 所以这条判据的作用是"改道":命中即换模型(同一上游的同名模型通常一样不支持,
-// 换渠道是白跑),并且不记任何冷却——能力不匹配不是健康问题,记冷却会把不需要
-// 该能力的请求一起误伤。
+//   - 冷却档位:命中即按确定性失败处理(首犯 24 小时,再犯摘除该组合)。本网关的
+//     auto 主要用于工具调用,一个给不了 tools 的模型对这个用途就是废的;不摘掉它
+//     会被反复选中、每次白费一次尝试,也就是"不适配的一直重复运行"。
+//   - 重试作用域:换模型而不是换渠道。同一条上游的同名模型通常一样不支持,换渠道
+//     是白跑;而 400 默认不在重试状态码区间里,不提前判用户会直接拿到一个 400,
+//     连换模型的机会都没有。
 //
 // 判据范围与其它关键词一致:错误正文、错误码、错误类型三处都看。
 func AutoModelCapabilityFailure(err *types.NewAPIError) string {
@@ -120,8 +119,8 @@ func AutoModelCapabilityFailure(err *types.NewAPIError) string {
 }
 
 // AutoModelPermanentFailure 判定一次上游失败是不是"确定性"的:这类失败重试也
-// 不会好(鉴权/权限、模型不存在、模型不支持、param=model 的非法请求),应该给
-// 永久级长冷却,而不是和限流/超时/5xx 一样只冷却 15 分钟。
+// 不会好(鉴权/权限、模型不存在、模型不支持、上游网关/CF 层挂掉),应该给
+// 永久级长冷却,而不是和限流一样只冷却 15 分钟。
 //
 // 判据是正面枚举,不做"认不出就当永久":认不出的失败按抖动处理,宁可多试几次,
 // 也不误杀一个只是暂时出问题的模型。上下文超长(context_length_exceeded)与请求
@@ -131,16 +130,11 @@ func AutoModelCapabilityFailure(err *types.NewAPIError) string {
 // 否则那些失败只会拿到 15 分钟冷却并被反复重试。关键词只升级冷却时长,
 // 作用域仍是单个 (group, model, channel)。
 //
-// "模型不支持本次要的能力"永远不算确定性失败,见 AutoModelCapabilityFailure:
-// 那是这次请求与模型的匹配问题,不是这个组合坏了。
+// "模型不支持本次要的能力"(如 function calling)同样算确定性失败,见下面那条
+// AutoModelCapabilityFailure 判据:一个给不了 tools 的模型对本网关的用途就是废的,
+// 留着只会被反复选中、反复失败。
 func AutoModelPermanentFailure(err *types.NewAPIError) bool {
 	if err == nil {
-		return false
-	}
-	if AutoModelCapabilityFailure(err) != "" {
-		// 必须排在内置永久关键词之前。能力措辞(如 "function calling is not supported")
-		// 既在能力表里、也曾出现在永久关键词表里,谁先判决定结果完全不同:
-		// 先判永久会冷却 24 小时并在再犯时摘除模型,先判能力则只是换一个模型重试。
 		return false
 	}
 	if autoModelProtectedTransient(err) {
@@ -154,13 +148,38 @@ func AutoModelPermanentFailure(err *types.NewAPIError) bool {
 		// 冷却乃至摘除模型。
 		return false
 	}
+	if AutoModelCapabilityFailure(err) != "" {
+		// 能力不匹配按确定性失败处理:本网关的 auto 主要用于工具调用,一个给不了
+		// tools 的模型对这个用途就是废的,留着只会被反复选中、每次白费一次尝试。
+		//
+		// 判据用措辞表而不是单条内置关键词,是因为上游表达同一件事的写法太多:
+		// "function calling is not supported" / "tool calling is not supported" /
+		// "does not support tools" / "不支持工具调用"……单条字符串只能覆盖其中一种,
+		// 其余写法会漏进抖动档,于是这个废组合永远删不掉。
+		//
+		// 位置在抖动关键词之后:管理员把某个能力措辞写进 AutoModelTransientKeywords
+		// 就等于明确要求"这一条别删",那是他的判断,应当生效。
+		return true
+	}
 	switch err.StatusCode {
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return true
-	case http.StatusNotFound, http.StatusBadGateway, http.StatusServiceUnavailable:
-		// 404 / 502 / 503 都是"这条上游根本给不出这个模型的回答":前者是端点或
-		// 模型不存在,后两者是上游网关本身挂了。重试同一个组合不会变好。
-		// 502/503 也可能短暂,但首犯只冷却 24 小时、再犯才摘除,代价可控。
+	case http.StatusNotFound, http.StatusBadGateway, http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		// 404 / 502 / 503 / 504 都是"这条上游根本给不出这个模型的回答":404 是端点或
+		// 模型不存在,后三者是上游网关本身挂了、或者根本答不上来。重试同一个组合
+		// 不会变好。它们也可能短暂,但首犯只冷却 24 小时、再犯才摘除,代价可控。
+		return true
+	case 520, 521, 522, 523, 524, 525, 526, 527:
+		// Cloudflare 自有的 5xx:源站返回空/非法响应(520)、连不上(521/522/523)、
+		// 超时(524)、SSL 握手失败(525/526)、非法请求(527)。全部是上游侧的问题,
+		// 本网关改不了,也不该靠"每 15 分钟再撞一次"等它自愈——那只会让这个组合
+		// 反复被选中、反复失败。按确定性失败处理:冷却,再犯摘除,上游修好了再由
+		// 管理员加回来。
+		//
+		// 判状态码而不是关键词:RelayErrorHandler 把这类失败渲染成
+		// "bad response status code 524" 这类文案,匹配 "status code: 524" 那种
+		// 带冒号的写法永远命中不了。
 		return true
 	}
 	detail := err.ToOpenAIError()

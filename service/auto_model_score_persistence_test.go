@@ -48,6 +48,22 @@ func setupAutoModelScorePersistenceTestDB(t *testing.T, paths ...string) *gorm.D
 	return db
 }
 
+// waitAutoModelScoreClockTick 等到墙钟刻度前进,让之后发生的观测拿到严格更大的
+// observed_at。
+//
+// 为什么需要它:评分行的 upsert 以 observed_at 为**严格递增**的排序键
+// (见 model.SaveAutoModelScores 的 OnConflict.Where),时间戳相等时写入会被保守地
+// 拒绝——这是刻意的,用来防止延迟到达的旧快照覆盖新快照。但 Windows 上
+// time.Now() 的墙钟刻度很粗(实测连续两次调用约 98% 落在同一刻度),于是
+// "先记一次、再记一次、断言库里是新值"这种写法会随机失败。
+// 测试断言的是库里的确切数值,所以必须让两次观测落在不同刻度上。
+func waitAutoModelScoreClockTick() {
+	start := time.Now().UnixNano()
+	for time.Now().UnixNano() <= start {
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func assertAutoModelScoreRow(t *testing.T, db *gorm.DB, scope, group, name string, channelID int, want autoModelOutcome) {
 	t.Helper()
 	var row model.AutoModelScore
@@ -204,6 +220,8 @@ func TestAutoModelScoreLoadRetryPreservesFeedbackAcceptedDuringSQL(t *testing.T)
 			case <-time.After(time.Second):
 				t.Fatal("retry must issue an actual SQL load")
 			}
+			// 第二次观测必须拿到严格更大的 observed_at,否则 upsert 会拒绝更新。
+			waitAutoModelScoreClockTick()
 			feedbackDone := make(chan struct{})
 			go func() { RecordAutoModelOutcome("g", "alpha", 1, true, 200, 0); close(feedbackDone) }()
 			defer func() { unblock(); <-feedbackDone }()
@@ -327,6 +345,8 @@ func TestAutoModelScoreFlushRetainsFeedbackDuringSQLAndAfterFailure(t *testing.T
 			case <-time.After(time.Second):
 				t.Fatal("flush must reach real SQL")
 			}
+			// 第二次观测必须拿到严格更大的 observed_at,否则 upsert 会拒绝更新。
+			waitAutoModelScoreClockTick()
 			feedbackDone := make(chan struct{})
 			go func() {
 				RecordAutoModelOutcome("g", "alpha", 1, true, 200, 0)
@@ -428,7 +448,11 @@ func TestAutoModelScoreLifecycleUsesCapturedDBAndBoundsSQLWaits(t *testing.T) {
 
 func TestAutoModelScorePruneFailureIsRetried(t *testing.T) {
 	db := setupAutoModelScorePersistenceTestDB(t)
-	old := model.AutoModelScore{Scope: "model", Group: "g", Model: "old", ChannelID: 1, Score: 0.7, Observations: 3, ObservedAt: time.Now().Add(-time.Hour).UnixNano(), Version: 1}
+	// 行必须老过保留窗口(默认 = 衰减窗口 6 小时),否则 prune 的 cutoff 够不到它:
+	// DELETE 匹配零行、触发器不触发,restore 也就不会返回错误。
+	// 写死一小时只在保留窗口还是十几分钟时成立。
+	old := model.AutoModelScore{Scope: "model", Group: "g", Model: "old", ChannelID: 1, Score: 0.7, Observations: 3,
+		ObservedAt: time.Now().Add(-autoModelScoreRetention() - time.Minute).UnixNano(), Version: 1}
 	require.NoError(t, db.Create(&old).Error)
 	require.NoError(t, db.Exec(`CREATE TRIGGER fail_score_prune BEFORE DELETE ON auto_model_scores BEGIN SELECT RAISE(ABORT, 'prune unavailable'); END`).Error)
 	p := &autoModelScorePersistence{db: db}

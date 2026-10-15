@@ -369,12 +369,17 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				} else {
 					logger.LogError(c, fmt.Sprintf("渠道 #%d 的 %s 没有给出有效回答（%s），HTTP 200 但响应为空", channel.Id, relayInfo.OriginModelName, reason))
 				}
-				recordRelayErrorLog(c, types.NewErrorWithStatusCode(errors.New(reason), types.ErrorCodeBadResponse, http.StatusOK, types.ErrOptionWithSkipRetry()))
 				recordAutoModelUnusableAnswer(c, relayInfo, reason)
 				if !isAutoModelRequest(c) {
 					// 非 auto 没有"候选组合"可冷却，只能按渠道整体处置。
+					// 错误日志由 processChannelError 内部负责写(它末尾会调 recordRelayErrorLog)，
+					// 这里不能再写一次:早先两处都写,同一次失败在「错误日志」里会出现
+					// 两条一模一样、连 request_id 都相同的记录。
 					unusableErr := types.NewErrorWithStatusCode(errors.New(reason), types.ErrorCodeBadResponse, http.StatusOK, types.ErrOptionWithSkipRetry())
 					processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), unusableErr)
+				} else {
+					// auto 不走 processChannelError(它会把整条渠道判死),所以这里自己记。
+					recordRelayErrorLog(c, types.NewErrorWithStatusCode(errors.New(reason), types.ErrorCodeBadResponse, http.StatusOK, types.ErrOptionWithSkipRetry()))
 				}
 			} else {
 				recordAutoModelFeedback(c, relayInfo, true)

@@ -94,11 +94,17 @@ func TestRelayUsageLogControls(t *testing.T) {
 	for _, test := range []struct {
 		name, payload    string
 		disabled, broken bool
+		// wantErrorLogs 是「错误日志」表里应有的条数。同一次失败只能留一条记录。
+		wantErrorLogs int64
 	}{
 		{name: "healthy", payload: "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"},
 		{name: "null_error", payload: "data: {\"error\":null,\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"},
 		{name: "unknown_error", payload: "data: {\"error\":{\"metadata\":\"info\"},\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"},
-		{name: "disabled_logging", payload: usageLogErrorStream, disabled: true},
+		// ErrorLogEnabled 已经不是错误日志的开关了:recordRelayErrorLog 里那道门控
+		// 被刻意移除(早先会出现"渠道进了冷却,但面板错误日志里一条都看不到"的情况,
+		// 排查时只能看到冷却、看不到原因)。所以关掉开关后,失败请求仍然必须留下
+		// 恰好一条记录——这里的期望值就是那条不变式。
+		{name: "disabled_logging", payload: usageLogErrorStream, disabled: true, wantErrorLogs: 1},
 		{name: "broken_delivery", payload: usageLogErrorStream, broken: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -127,7 +133,8 @@ func TestRelayUsageLogControls(t *testing.T) {
 			require.EqualValues(t, 1, calls.Load())
 			var count int64
 			require.NoError(t, db.Model(&model.Log{}).Where("type = ?", model.LogTypeError).Count(&count).Error)
-			require.Zero(t, count)
+			require.Equal(t, test.wantErrorLogs, count,
+				"同一次失败只能留一条错误日志记录")
 		})
 	}
 }

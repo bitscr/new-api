@@ -72,11 +72,10 @@ const NUMERIC_LABELS = {
 // 内容与后端 setting/operation_setting 的 autoModelBuiltinTransientKeywords 一致。
 // 后端才是权威来源(未配置时 GET /api/option/ 会回显后端内置值,直接覆盖这里);
 // 这里保留一份是为了在接口返回前/失败时输入框不为空。
+//
+// 这里不再收 520/524:它们是上游/CF 侧的问题,后端已按确定性失败处理
+// (冷却 → 再犯摘除),留在这里反而会把它们钉回抖动档、永远删不掉。
 const DEFAULT_TRANSIENT_KEYWORDS = [
-  // 上游 520/524 这类网关抖动:虽然看起来像"这条上游不行",但它是 Cloudflare
-  // 层的临时故障,过一会儿就恢复,不该按 24 小时确定性失败处理。
-  'status code: 520',
-  'status code: 524',
   // 限流是明确的临时状态,冷却窗口本来就有更合适的阶梯。
   'rpm exhausted',
   'token plan entitlement exhausted',
@@ -85,16 +84,16 @@ const DEFAULT_TRANSIENT_KEYWORDS = [
   'upstream_response_timeout',
 ];
 // 内容与后端 autoModelBuiltinPermanentKeywords 一致(后端为权威来源,理由同上)。
-//
-// 这里刻意不再收 'function calling is not supported' 一类的能力措辞:后端已把它们
-// 交给内置能力判据接管,处理方式完全不同(换模型 + 不记冷却,而不是长冷却 + 摘除
-// 模型)。留在预填里会让管理员以为它还在起作用,而后端会直接拒绝保存这种条目。
 const DEFAULT_PERMANENT_KEYWORDS = [
   // 上游明说"这个模型我不提供"——结构化 code 缺失时的自然语言兜底
   '模型不可用',
   '模型不存在',
   'model not found',
   'community model not found',
+  // 已实证会复发:某个上游确实不支持的确定性能力。
+  // 本网关的 auto 主要用于工具调用,给不了 tools 的模型对这个用途就是废的,
+  // 应当冷却并在再犯时摘除,而不是留着被反复选中、每次白费一次尝试。
+  'function calling is not supported',
   // 账号/密钥级确定性失败:换了模型也一样,重试没有意义
   'invalid_api_key',
   'invalid_authentication',
@@ -322,7 +321,12 @@ export default function SettingsAutoModelPolicy(props) {
               />
               <Text type='tertiary'>
                 {t(
-                  '本机预填:520/524(上游 Cloudflare 抖动)、rpm exhausted、token plan entitlement exhausted、all candidates failed、upstream_response_timeout。',
+                  '本机预填:rpm exhausted、token plan entitlement exhausted、all candidates failed、upstream_response_timeout。',
+                )}
+              </Text>
+              <Text type='tertiary' size='small' style={{ display: 'block', marginTop: 4 }}>
+                {t(
+                  '520/524 等上游网关故障已由后端按状态码直接判为确定性失败(冷却 → 再犯摘除),不要写在这里:那会把它们钉回抖动档,永远删不掉。',
                 )}
               </Text>
             </Col>

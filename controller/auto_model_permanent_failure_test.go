@@ -89,7 +89,11 @@ func TestAutoModelFeedbackFreezesFailureClassAtQueueTime(t *testing.T) {
 	require.False(t, outcome.success)
 }
 
-// 抖动失败(限流/5xx)入队时不能被标成永久。
+// 抖动失败(限流/超时)入队时不能被标成永久。
+//
+// 这里刻意用 429 而不是 5xx:502/503/504 与 CF 的 520-527 现在由状态码直接判永久
+// (上游网关挂掉本网关改不了,靠反复重试等它自愈只会让同一个组合反复失败)。
+// 拿 5xx 当"抖动"的例子会测错东西。
 func TestAutoModelFeedbackKeepsTransientFailureTransient(t *testing.T) {
 	c := newAutoModelFeedbackTestContext()
 	start := time.Unix(1700000000, 0)
@@ -102,9 +106,9 @@ func TestAutoModelFeedbackKeepsTransientFailureTransient(t *testing.T) {
 	}
 	info.MarkUpstreamDispatch()
 	recordAutoModelUpstreamFailure(c, info, types.NewErrorWithStatusCode(
-		errors.New("Upstream unavailable"), types.ErrorCode("server_error"), http.StatusServiceUnavailable))
+		errors.New("Account rate limit exceeded"), types.ErrorCode("rate_limit_exceeded"), http.StatusTooManyRequests))
 
 	pending := takeAutoModelFeedback(c)
 	outcome := pending[autoModelFeedbackKey{group: "default", modelName: "busy-model", channelID: 2}]
-	require.False(t, outcome.permanent, "5xx 是抖动失败,不能永久封禁")
+	require.False(t, outcome.permanent, "限流是抖动失败,不能永久封禁")
 }

@@ -259,8 +259,12 @@ func TestAutoModelChannelHealthAggregatesModelsAndDecaysIndependently(t *testing
 	require.True(t, exists)
 	require.InDelta(t, 0.65, otherGroup.Score, 0.001)
 	now := time.Now()
+	// 衰减窗口是可配置的(默认 6 小时),断言必须跟着窗口走而不是写死一小时:
+	// 不变式是"超过窗口即完全中立"。写死 1 小时会在默认窗口下只衰减 1/6,
+	// 分数远不是 0.5。
+	window := time.Duration(autoModelHalfLifeMs()) * time.Millisecond
 	autoModelChannelHealth.Set(autoModelChannelHealthKey("g", 7), autoModelOutcome{
-		Score:1, Observations:1000, LatencyMS:75000, UpdatedAt:now.Add(-time.Hour),
+		Score:1, Observations:1000, LatencyMS:75000, UpdatedAt:now.Add(-window),
 	})
 	stale, _ := autoModelChannelHealth.Get(autoModelChannelHealthKey("g", 7))
 	require.Equal(t, 0.5, effectiveScore(stale, now), "channel cold start uses the same neutral decay as models")

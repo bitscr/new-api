@@ -8,7 +8,6 @@ import (
 	"net/http/httptrace"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -153,7 +152,12 @@ func TestAutoModelRealUpstreamFailuresKeepFeedback(t *testing.T) {
 				require.Equal(t, types.ErrorCodeDoRequestFailed, apiErr.GetErrorCode())
 				select {
 				case connectErr := <-connectErrors:
-					require.ErrorIs(t, connectErr, syscall.ECONNREFUSED)
+					// 按措辞判定而不是 errors.Is(syscall.ECONNREFUSED):Windows 上
+					// syscall.ECONNREFUSED 是 POSIX 风格的 errno 常量,而 net 包返回的是
+					// WSAECONNREFUSED(0x274D),两者不相等,errors.Is 永远匹配不到。
+					// 两种平台的措辞都含 "refused",足以把它和别的网络错误区分开。
+					require.ErrorContains(t, connectErr, "refused",
+						"期望是连接被拒绝,而不是别的网络错误")
 				default:
 					t.Fatal("expected an observed failed connection, not a local validation error")
 				}

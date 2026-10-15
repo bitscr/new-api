@@ -1,7 +1,6 @@
 package operation_setting
 
 import (
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -54,22 +53,17 @@ type AutoModelCapabilityText struct {
 
 // autoModelCapabilityTexts 是能力不匹配的措辞表。
 //
-// 为什么单独一张表,而不是继续塞进 autoModelBuiltinPermanentKeywords:
-// 两者的正确处理完全相反。
-//   - "模型不存在/无权"       → 这个组合不该被选,值得长冷却乃至摘除;
-//   - "模型不支持本次要的能力" → 组合本身没坏,只是这次请求要的东西它给不了。
-//
-// 按前者处理会连带惩罚所有不需要该能力的请求(24 小时冷却),第二次还会把模型从
-// 渠道里永久删掉——一个带 tools 的请求就足以摘掉一个对普通对话完全健康的模型。
-// 本机内置永久关键词里那条 "function calling is not supported" 正是踩了这个坑:
-// 它想表达的确实是"这个模型不支持 function calling",但用了错误的机制。
-//
-// 所以命中这张表 = 换模型 + 不记任何冷却,而不是升级成长冷却。
+// 命中后由 service.AutoModelCapabilityFailure 同时决定两件事:按确定性失败处理
+// (冷却 → 再犯摘除),以及这次重试换模型而不是换渠道。为什么用一张表而不是往
+// 永久关键词里加几条字符串:上游表达同一件事的写法太多
+// ("function calling is not supported" / "tool calling is not supported" /
+// "does not support tools" / "不支持工具调用"),靠人一条条补必然漏,漏掉的那些
+// 会落进抖动档,于是那个废组合永远删不掉。
 //
 // 表里刻意只收"能力名 + 不支持"连写的措辞。泛化的 unsupported_parameter /
 // invalid_request 不收:那些可能是请求体别的字段写错,算到模型头上会误伤。
-// 上游冒出新的措辞时,管理员仍可用 AutoModelTransientKeywords 把它钉在抖动档,
-// 那里不会被升级成长冷却。
+// 管理员仍可用 AutoModelTransientKeywords 把某个措辞钉回抖动档——那条判据在
+// AutoModelPermanentFailure 里排在本表之前,是明确的"这一条别删"。
 var autoModelCapabilityTexts = []AutoModelCapabilityText{
 	{Feature: "tools", Texts: []string{
 		"function calling is not supported",
@@ -152,9 +146,11 @@ func MatchAutoModelCapabilityText(haystack string) string {
 // 判定方式是在"错误正文 + 错误码 + 错误类型"里做大小写不敏感的子串匹配,
 // 所以中文文案、英文词语、状态码三种写法都可写。
 //
-// 这里不再收 "function calling is not supported" 一类的能力措辞:它们现在由
-// autoModelCapabilityTexts 接管,处理方式完全不同(换模型 + 不记冷却,
-// 而不是长冷却 + 摘除模型)。留在表里只会是一条永远轮不到的僵尸条目。
+// 这里收 "function calling is not supported" 一类的能力措辞:本网关的 auto 主要
+// 用于工具调用,一个给不了 tools 的模型对这个用途就是废的,应当按确定性失败处理
+// (冷却 → 再犯摘除),而不是留着被反复选中、每次白费一次尝试。
+// AutoModelCapabilityFailure 另有一份更宽的能力措辞表,但它只影响重试换哪个候选,
+// 不参与这里的冷却档位判定。
 var autoModelBuiltinPermanentKeywords = []string{
 	// 上游明说"这个模型我不提供"——结构化 code 缺失时的自然语言兜底。
 	// 实测 ch11 的 tr-alpha-channel 就是反复撞这一类,却只能吃 15 分钟抖动冷却。
@@ -162,6 +158,8 @@ var autoModelBuiltinPermanentKeywords = []string{
 	"模型不存在",
 	"model not found",
 	"community model not found",
+	// 已实证会复发:某个上游确实不支持的确定性能力。
+	"function calling is not supported",
 	// 账号/密钥级确定性失败:换模型也一样,重试没有意义。
 	"invalid_api_key",
 	"invalid_authentication",
@@ -173,11 +171,15 @@ var autoModelBuiltinPermanentKeywords = []string{
 //
 // 命中即强制降级为抖动冷却(15m 起步的阶梯),不升级为确定性失败。它优先级最高,
 // 用来把其实会自愈、却被上面那张表或结构化判据误伤的错误钉回普通档。
+//
+// 520/524 不在这里:它们是上游/CF 侧的问题,本网关改不了,靠"每 15 分钟再撞一次"
+// 等它自愈只会让同一个组合反复失败。现在由 AutoModelPermanentFailure 的状态码
+// 分支直接判成确定性失败(冷却 → 再犯摘除)。
+//
+// 早先这里写的是 "status code: 520" 这样的字符串,但那串**从来没生效过**:
+// RelayErrorHandler 把这类失败渲染成 "bad response status code 520",没有冒号,
+// 子串匹配不上。它们之所以表现成抖动冷却,只是因为认不出的失败本来就默认走抖动档。
 var autoModelBuiltinTransientKeywords = []string{
-	// 上游 520/524 是 Cloudflare 层的临时故障,过一会儿就恢复,不该按
-	// 24 小时确定性失败处理。
-	"status code: 520",
-	"status code: 524",
 	// 限流是明确的临时状态,冷却阶梯本来就更适合它。
 	"rpm exhausted",
 	"token plan entitlement exhausted",
@@ -388,14 +390,12 @@ func AutoModelPermanentKeywordsToString() string {
 // ValidateAutoModelPermanentKeyword 在写库前挡住"注定不会生效或被严重滥用"的关键词。
 // 返回空字符串表示接受。
 //
-// 四类必须拒绝:
+// 三类必须拒绝:
 //  1. 过短(少于 2 个字符):子串匹配下会命中大量无关失败。
 //  2. 只描述受保护抖动失败的词(如 context_length_exceeded)。判定里保护项优先于
 //     关键词,这种条目永远不生效——接受它只会让管理员以为配好了。
 //  3. 泛化到吃掉大半失败文本的词(如 error)。命中即 24h 冷却,这种条目会把几乎
 //     任何失败都升级成长冷却,等于把所有组合轮着封一遍。
-//  4. 能力不匹配措辞(如 function calling is not supported)。判定里能力判据优先于
-//     关键词,同样永远不生效;而且它本该走"换模型 + 不记冷却",不是长冷却。
 //
 // 只挡这些显然无意义/会误伤的条目,不猜测管理员的意图:具体错误串一律放行,
 // 这正是这个功能存在的理由。
@@ -411,10 +411,6 @@ func ValidateAutoModelPermanentKeyword(raw string) string {
 		if strings.Contains(keyword, protected) {
 			return "该关键词只描述受保护的抖动失败,判定里保护项优先,它永远不会生效:" + keyword
 		}
-	}
-	if feature := MatchAutoModelCapabilityText(keyword); feature != "" {
-		return fmt.Sprintf("该关键词描述的是「模型不支持 %s」这类能力不匹配,已由内置能力判据接管"+
-			"(换模型 + 不记冷却,而不是长冷却或摘除模型),写成永久关键词永远不会生效:%s", feature, keyword)
 	}
 	for _, overbroad := range []string{"error", "failed", "失败", "错误"} {
 		if keyword == overbroad {
