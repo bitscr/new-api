@@ -105,6 +105,9 @@ func ChannelType2APIType(channelType int) (int, bool) {
 		apiType = constant.APITypeMiMo
 	case constant.ChannelTypeModal, constant.ChannelTypeKilo, constant.ChannelTypeCline:
 		apiType = constant.APITypeOpenAI
+	case constant.ChannelTypeNewAPI:
+		// 上游是另一个 new-api 网关:路径透传 + 按入站格式分派响应处理。
+		apiType = constant.APITypeNewAPI
 	}
 	if apiType == -1 {
 		return constant.APITypeOpenAI, false

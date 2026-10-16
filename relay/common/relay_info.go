@@ -351,6 +351,7 @@ var streamSupportedChannels = map[int]bool{
 	constant.ChannelTypeMoonshot:    true,
 	constant.ChannelTypeMiniMax:     true,
 	constant.ChannelTypeSiliconFlow: true,
+	constant.ChannelTypeNewAPI:      true, // 上游是 new-api 网关,支持 stream_options.include_usage
 	constant.ChannelTypePoe:         true,
 	constant.ChannelTypeOpenAILocal: true,
 	constant.ChannelTypeCerebras:    true,

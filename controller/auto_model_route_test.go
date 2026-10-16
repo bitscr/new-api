@@ -38,6 +38,7 @@ func openAutoModelRouteControllerTestDB(t *testing.T) *gorm.DB {
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.AutoModelCooldown{}, &model.User{}))
 	model.DB, model.LOG_DB = db, db
+	model.InvalidateAutoModelRoutingTargetsCache()
 	common.UsingSQLite, common.UsingMySQL, common.UsingPostgreSQL = true, false, false
 	common.MemoryCacheEnabled, common.RedisEnabled, operation_setting.AutoModelEnabled = false, false, true
 	t.Cleanup(func() {

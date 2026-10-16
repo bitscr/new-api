@@ -386,11 +386,16 @@ func (channel *Channel) AddAbilities(tx *gorm.DB) error {
 			return err
 		}
 	}
+	InvalidateAutoModelRoutingTargetsCache()
 	return nil
 }
 
 func (channel *Channel) DeleteAbilities() error {
-	return DB.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
+	if err := DB.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error; err != nil {
+		return err
+	}
+	InvalidateAutoModelRoutingTargetsCache()
+	return nil
 }
 
 // UpdateAbilities updates abilities of this channel.
@@ -459,18 +464,31 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 
 	// 如果是新创建的事务，需要提交
 	if isNewTx {
-		return tx.Commit().Error
+		if err := tx.Commit().Error; err != nil {
+			return err
+		}
+		InvalidateAutoModelRoutingTargetsCache()
+		return nil
 	}
 
+	InvalidateAutoModelRoutingTargetsCache()
 	return nil
 }
 
 func UpdateAbilityStatus(channelId int, status bool) error {
-	return DB.Model(&Ability{}).Where("channel_id = ?", channelId).Select("enabled").Update("enabled", status).Error
+	if err := DB.Model(&Ability{}).Where("channel_id = ?", channelId).Select("enabled").Update("enabled", status).Error; err != nil {
+		return err
+	}
+	InvalidateAutoModelRoutingTargetsCache()
+	return nil
 }
 
 func UpdateAbilityStatusByTag(tag string, status bool) error {
-	return DB.Model(&Ability{}).Where("tag = ?", tag).Select("enabled").Update("enabled", status).Error
+	if err := DB.Model(&Ability{}).Where("tag = ?", tag).Select("enabled").Update("enabled", status).Error; err != nil {
+		return err
+	}
+	InvalidateAutoModelRoutingTargetsCache()
+	return nil
 }
 
 func UpdateAbilityByTag(tag string, newTag *string, priority *int64, weight *uint) error {
@@ -484,7 +502,11 @@ func UpdateAbilityByTag(tag string, newTag *string, priority *int64, weight *uin
 	if weight != nil {
 		ability.Weight = *weight
 	}
-	return DB.Model(&Ability{}).Where("tag = ?", tag).Updates(ability).Error
+	if err := DB.Model(&Ability{}).Where("tag = ?", tag).Updates(ability).Error; err != nil {
+		return err
+	}
+	InvalidateAutoModelRoutingTargetsCache()
+	return nil
 }
 
 var fixLock = sync.Mutex{}
@@ -542,5 +564,6 @@ func FixAbility() (int, int, error) {
 		}
 	}
 	InitChannelCache()
+	InvalidateAutoModelRoutingTargetsCache()
 	return successCount, failCount, nil
 }

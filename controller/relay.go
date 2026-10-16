@@ -412,13 +412,14 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			// (group, model, channel) 冷却挡住,而真正的病根是调用方发来的 body。
 			// 只跳过冷却/记分,重试与换候选的既有策略不动。
 			logger.LogInfo(c, fmt.Sprintf("auto model: %s 请求自身非法(HTTP %d),不计入渠道/模型冷却", relayInfo.OriginModelName, newAPIError.StatusCode))
-		} else if feature := service.AutoModelCapabilityFailure(newAPIError); feature != "" {
-			// 能力不匹配:模型给不了这次请求要的东西(如 tools),但组合本身没坏。
-			// 旧逻辑把这类措辞当"确定性失败",于是首犯冷却 24 小时(连不需要该能力的
-			// 请求一起挡),再犯直接把模型从渠道的 models 列表里永久删掉——一个带 tools
-			// 的请求不该有这种后果。这里只跳过冷却/记分,重试换成"下一个模型"。
-			logger.LogInfo(c, fmt.Sprintf("auto model: %s 不支持本次请求需要的能力(%s),只换模型,不计入渠道/模型冷却", relayInfo.OriginModelName, feature))
 		} else {
+			// 能力不匹配(模型给不了本次请求要的能力,如 tools)必须照常记录:
+			// AutoModelPermanentFailure 把它判成确定性失败(首犯冷却 24 小时,再犯由
+			// RetireAutoModelCombination 摘除)。这里绝不能提前拦截——早先有一版在
+			// recordAutoModelUpstreamFailure 之前把这类错误整个吞掉(不冷却、不记分),
+			// 结果 service 层的"冷却 → 摘除"在真实链路上永远走不到,废组合被反复选中、
+			// 反复白费一次尝试。本网关的 auto 主要用于工具调用,给不了 tools 的组合
+			// 就该按确定性失败退场;重试作用域仍是"换模型"(见 ClassifyAutoModelRetry)。
 			recordAutoModelUpstreamFailure(c, relayInfo, newAPIError)
 		}
 
@@ -819,7 +820,9 @@ func getFixedAutoModelChannel(c *gin.Context, info *relaycommon.RelayInfo, route
 	if attemptedAutoModelRoutes(c)[route] {
 		return nil, newAutoModelRouteError("auto model route was already attempted")
 	}
-	targets, err := model.GetAutoModelRoutingTargets(route.Group)
+	// 授权复验必须用绕过缓存的强新鲜查询:这里是"该渠道还挂着这个模型吗"的
+	// 逐次尝试正确性边界,规划路径的 TTL 快照不承担这个职责。
+	targets, err := model.GetAutoModelRoutingTargetsFresh(route.Group)
 	if err != nil {
 		return nil, newAutoModelRouteError(fmt.Sprintf("cannot revalidate auto model route: %s", err))
 	}

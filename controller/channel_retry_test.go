@@ -35,6 +35,7 @@ func openChannelRetryControllerTestDB(t *testing.T) *gorm.DB {
 	model.DB = db
 	model.LOG_DB = db
 	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.ConversationLog{}))
+	model.InvalidateAutoModelRoutingTargetsCache()
 
 	t.Cleanup(func() {
 		sqlDB, err := db.DB()

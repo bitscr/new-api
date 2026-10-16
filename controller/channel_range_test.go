@@ -32,6 +32,7 @@ func setupChannelRangeTestDB(t *testing.T) *gorm.DB {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}))
+	model.InvalidateAutoModelRoutingTargetsCache()
 	model.DB = db
 	common.MemoryCacheEnabled, common.RedisEnabled = false, false
 	gin.SetMode(gin.TestMode)

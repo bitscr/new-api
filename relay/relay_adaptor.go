@@ -28,6 +28,7 @@ import (
 	mistralconsole "github.com/QuantumNous/new-api/relay/channel/mistral_console"
 	"github.com/QuantumNous/new-api/relay/channel/mokaai"
 	"github.com/QuantumNous/new-api/relay/channel/moonshot"
+	"github.com/QuantumNous/new-api/relay/channel/newapi"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	"github.com/QuantumNous/new-api/relay/channel/opencode"
@@ -109,6 +110,8 @@ func GetAdaptor(apiType int) channel.Adaptor {
 		return &siliconflow.Adaptor{}
 	case constant.APITypeVertexAi:
 		return &vertex.Adaptor{}
+	case constant.APITypeNewAPI:
+		return &newapi.Adaptor{}
 	case constant.APITypeMistral:
 		return &mistral.Adaptor{}
 	case constant.APITypeDeepSeek:

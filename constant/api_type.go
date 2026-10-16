@@ -47,5 +47,6 @@ const (
 	APITypeTypeSafe
 	APITypeMiMo
 	APITypeXunfeiMaas
+	APITypeNewAPI
 	APITypeDummy // this one is only for count, do not add any channel after this
 )

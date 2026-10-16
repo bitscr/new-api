@@ -72,7 +72,8 @@ const (
 	ChannelTypeMiMo           = 72
 	ChannelTypeCline          = 73
 	ChannelTypeXunfeiMaas     = 74
-	ChannelTypeDummy          = ChannelTypeXunfeiMaas + 1 // this one is only for count, do not add any channel after this
+	ChannelTypeNewAPI         = 75                    // 上游也是 new-api 网关:所有入口路径 1:1 透传(chat/responses/claude/gemini)
+	ChannelTypeDummy          = ChannelTypeNewAPI + 1 // this one is only for count, do not add any channel after this
 
 )
 
@@ -152,6 +153,7 @@ var ChannelBaseURLs = []string{
 	"https://api.xiaomimimo.com",                //72
 	"https://api.cline.bot/api",                 //73
 	"https://maas-api.cn-huabei-1.xf-yun.com",   //74
+	"", //75 New API 网关由管理员填自己的地址
 }
 
 var ChannelTypeNames = map[int]string{
@@ -226,6 +228,7 @@ var ChannelTypeNames = map[int]string{
 	ChannelTypeMiMo:           "MiMo",
 	ChannelTypeCline:          "Cline",
 	ChannelTypeXunfeiMaas:     "Xunfei MaaS",
+	ChannelTypeNewAPI:         "New API",
 }
 
 func GetChannelTypeName(channelType int) string {

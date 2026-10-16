@@ -21,6 +21,9 @@ func setupAutoModelRoutingSnapshotTestDB(t *testing.T) *gorm.DB {
 	sqlDB.SetMaxOpenConns(1)
 	oldDB, oldEnabled := DB, common.MemoryCacheEnabled
 	DB = db
+	// 缓存是包级全局,必须在每个用例开始前丢弃,否则上一个用例(或上一个
+	// memory 模式子测试)的快照会串到本次断言里。
+	InvalidateAutoModelRoutingTargetsCache()
 	t.Cleanup(func() {
 		DB, common.MemoryCacheEnabled = oldDB, oldEnabled
 		require.NoError(t, sqlDB.Close())
@@ -103,12 +106,14 @@ func TestAutoModelRoutingTargetsSnapshot(t *testing.T) {
 			delete(targets, "other")
 			next, err := GetAutoModelRoutingTargets("g")
 			require.NoError(t, err)
-			require.Equal(t, want, next, "mutating a returned snapshot must not modify channel state")
-			require.Equal(t, 2, queries)
+			require.Equal(t, want, next, "mutating a returned snapshot must not modify channel state or the cache")
+			// 第二次调用命中 TTL 缓存:不再产生查询,并且不受上面对返回副本
+			// 的修改影响(深拷贝契约)。
+			require.Equal(t, 1, queries)
 			missing, err := GetAutoModelRoutingTargets("missing")
 			require.NoError(t, err)
-			require.Empty(t, missing)
-			require.Equal(t, 3, queries)
+			require.Empty(t, missing, "空结果同样进入缓存,避免对不存在分组反复查询")
+			require.Equal(t, 2, queries)
 		})
 	}
 }
@@ -170,6 +175,9 @@ func TestAutoModelRoutingTargetsDatabaseDialects(t *testing.T) {
 			const group = "g' OR 1=1 --"
 			for _, memory := range []bool{true, false} {
 				common.MemoryCacheEnabled = memory
+				// 权重平滑系数随模式不同而不同,缓存键不含模式,生产上模式
+				// 固定,这里显式失效以观察两种模式各自的查询。
+				InvalidateAutoModelRoutingTargetsCache()
 				_, err := GetAutoModelRoutingTargets(group)
 				require.NoError(t, err)
 			}

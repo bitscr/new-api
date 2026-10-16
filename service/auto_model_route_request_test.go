@@ -31,6 +31,9 @@ func setupAutoModelRouteRequestTest(t *testing.T) *gorm.DB {
 	sqlDB.SetMaxOpenConns(1)
 	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.AutoModelCooldown{}))
 	model.DB, common.MemoryCacheEnabled, common.UsingSQLite = db, false, true
+	// 路由目标缓存是 model 包级全局,换库后必须丢弃,否则上一个用例的快照
+	// 会串进本次断言。
+	model.InvalidateAutoModelRoutingTargetsCache()
 	operation_setting.AutoModelEnabled, operation_setting.SelfUseModeEnabled = true, false
 	autoModelTestReset()
 	autoModelCooldownLoadOnce = sync.Once{}
