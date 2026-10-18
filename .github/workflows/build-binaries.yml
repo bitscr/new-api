@@ -1,13 +1,19 @@
 name: Build release binaries
 
-# 只允许手动触发：Actions 页面「Run workflow」，或本机有凭据时 gh workflow run。
-# 刻意不配置 push / schedule：打 tag 或推送都不会自动构建 Release。
+# 触发方式:推送 v* 标签自动构建并发布 Release;也可以在 Actions 页面手动
+# Run workflow(可指定任意 tag)。Docker 镜像见 docker-ghcr-fork.yml(仅手动)。
 on:
+  # 推送 v* 标签时自动构建并发布 Release(二进制含 amd64/arm64/386/armv7)。
+  # Docker 镜像工作流保持手动触发,不在这里联动。
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
         description: "Release tag (e.g. v1.0.0)"
-        required: true
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -47,12 +53,19 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          for arch in amd64 arm64; do
-            GOOS=linux GOARCH="$arch" go build -trimpath \
+          # 四个目标:amd64 / arm64 / 386(32 位 x86) / armv7(GOARCH=arm + GOARM=7)。
+          # sqlite 驱动是纯 Go(glebarez),CGO 关闭后交叉编译无额外依赖;
+          # 32 位产物命名与 Docker 镜像的 slug 保持一致(armv7 而非 arm)。
+          for spec in amd64 arm64 386 armv7; do
+            case "$spec" in
+              armv7) goarch=arm; goarm=7 ;;
+              *)     goarch="$spec"; goarm="" ;;
+            esac
+            GOOS=linux GOARCH="$goarch" ${goarm:+GOARM=$goarm} go build -trimpath \
               -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" \
-              -o "release/new-api-linux-$arch" .
-            tar -C release -czf "release/new-api-linux-$arch.tar.gz" "new-api-linux-$arch"
-            sha256sum "release/new-api-linux-$arch.tar.gz" > "release/new-api-linux-$arch.tar.gz.sha256"
+              -o "release/new-api-linux-$spec" .
+            tar -C release -czf "release/new-api-linux-$spec.tar.gz" "new-api-linux-$spec"
+            sha256sum "release/new-api-linux-$spec.tar.gz" > "release/new-api-linux-$spec.tar.gz.sha256"
           done
           ls -lh release/
 

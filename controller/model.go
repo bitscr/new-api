@@ -133,6 +133,12 @@ func ListModels(c *gin.Context, modelType int) {
 	}
 
 	modelLimitEnable := common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled)
+
+	// 分组内虚拟模型 auto:置顶展示(客户端模型选择器默认取列表头部)。
+	if autoEntry, ok := autoModelListEntry(c); ok {
+		userOpenAiModels = append(userOpenAiModels, autoEntry)
+	}
+
 	if modelLimitEnable {
 		s, ok := common.GetContextKey(c, constant.ContextKeyTokenModelLimit)
 		var tokenModelLimit map[string]bool
@@ -142,6 +148,10 @@ func ListModels(c *gin.Context, modelType int) {
 			tokenModelLimit = map[string]bool{}
 		}
 		for allowModel, _ := range tokenModelLimit {
+			if allowModel == "auto" {
+				// auto 已置顶展示，避免重复
+				continue
+			}
 			if !acceptUnsetRatioModel {
 				if !helper.HasModelBillingConfig(allowModel) {
 					continue
@@ -207,17 +217,6 @@ func ListModels(c *gin.Context, modelType int) {
 				})
 			}
 		}
-		// 分组内虚拟模型 auto：普通（无 token 模型限制）场景下，
-		// 分组存在可用候选时向用户展示 auto。
-		if operation_setting.AutoModelEnabled && len(service.GetAutoModelCandidates(group)) > 0 {
-			userOpenAiModels = append(userOpenAiModels, dto.OpenAIModels{
-				Id:                     "auto",
-				Object:                 "model",
-				Created:                1626777600,
-				OwnedBy:                "system",
-				SupportedEndpointTypes: []constant.EndpointType{constant.EndpointTypeOpenAI},
-			})
-		}
 	}
 
 	switch modelType {
@@ -277,6 +276,36 @@ func EnabledListModels(c *gin.Context) {
 		"success": true,
 		"data":    model.GetEnabledModels(),
 	})
+}
+
+// autoModelListEntry 构造 /v1/models 列表置顶的 auto 条目；不应展示时 ok=false。
+// 展示条件按令牌形态分派：
+//   - 令牌带模型限制：限制名单放行 auto 即展示（候选存在性由调度时校验）；
+//   - 普通令牌：分组存在可用候选即展示（原有语义）。
+func autoModelListEntry(c *gin.Context) (dto.OpenAIModels, bool) {
+	entry := dto.OpenAIModels{
+		Id:                     "auto",
+		Object:                 "model",
+		Created:                1626777600,
+		OwnedBy:                "system",
+		SupportedEndpointTypes: []constant.EndpointType{constant.EndpointTypeOpenAI},
+	}
+	if !operation_setting.AutoModelEnabled {
+		return dto.OpenAIModels{}, false
+	}
+	tokenGroup := common.GetContextKeyString(c, constant.ContextKeyTokenGroup)
+	if common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled) {
+		return entry, service.IsAutoModelCandidateAuthorized(c, "auto")
+	}
+	if tokenGroup == "" {
+		userId := c.GetInt("id")
+		userGroup, err := model.GetUserGroup(userId, false)
+		if err != nil {
+			return dto.OpenAIModels{}, false
+		}
+		tokenGroup = userGroup
+	}
+	return entry, len(service.GetAutoModelCandidates(tokenGroup)) > 0
 }
 
 func RetrieveModel(c *gin.Context, modelType int) {

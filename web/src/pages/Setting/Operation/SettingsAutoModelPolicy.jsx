@@ -36,6 +36,7 @@ const AUTO_MODEL_OPTION_KEYS = [
   'AutoModelMaxAttempts',
   'AutoModelPermanentCooldownHours',
   'AutoModelCooldownMaxHours',
+  'AutoModelCooldownBaseMinutes',
   'AutoModelScoreDecayMinutes',
   'AutoModelPermanentKeywords',
   'AutoModelTransientKeywords',
@@ -47,6 +48,7 @@ const AUTO_MODEL_NUMERIC_KEYS = [
   'AutoModelMaxAttempts',
   'AutoModelPermanentCooldownHours',
   'AutoModelCooldownMaxHours',
+  'AutoModelCooldownBaseMinutes',
   'AutoModelScoreDecayMinutes',
 ];
 
@@ -63,6 +65,7 @@ const NUMERIC_LABELS = {
   AutoModelMaxAttempts: 'auto 单请求最大尝试次数',
   AutoModelPermanentCooldownHours: '确定性失败冷却时长(小时)',
   AutoModelCooldownMaxHours: '普通冷却封顶(小时)',
+  AutoModelCooldownBaseMinutes: '普通冷却起始时间(分钟)',
   AutoModelScoreDecayMinutes: '评分衰减窗口(分钟)',
 };
 
@@ -117,6 +120,7 @@ export default function SettingsAutoModelPolicy(props) {
     AutoModelMaxAttempts: '4',
     AutoModelPermanentCooldownHours: '24',
     AutoModelCooldownMaxHours: '6',
+    AutoModelCooldownBaseMinutes: '15',
     AutoModelScoreDecayMinutes: '360',
     AutoModelPermanentKeywords: DEFAULT_PERMANENT_KEYWORDS.join('\n'),
     AutoModelTransientKeywords: DEFAULT_TRANSIENT_KEYWORDS.join('\n'),
@@ -238,11 +242,24 @@ export default function SettingsAutoModelPolicy(props) {
             </Col>
             <Col xs={24} sm={12} md={8} lg={8} xl={8}>
               <Form.InputNumber
+                field={'AutoModelCooldownBaseMinutes'}
+                label={t('普通冷却起始时间(分钟)')}
+                min={1}
+                extraText={t(
+                  '默认 15。普通(抖动)失败的冷却阶梯从这里起步,每犯一次在上一次的基础上翻倍;某次翻倍超出封顶时,以封顶为准。',
+                )}
+                onChange={(value) =>
+                  setInputs({ ...inputs, AutoModelCooldownBaseMinutes: String(value) })
+                }
+              />
+            </Col>
+            <Col xs={24} sm={12} md={8} lg={8} xl={8}>
+              <Form.InputNumber
                 field={'AutoModelCooldownMaxHours'}
                 label={t('普通冷却封顶(小时)')}
                 min={1}
                 extraText={t(
-                  '默认 6。普通(抖动)失败的冷却阶梯是 15 分钟起、每犯一次翻倍:15m→30m→1h→2h→4h→封顶。这里改的就是封顶。抬得太低会让反复出错的组合很快解冻、又回候选池;太高则会长期放弃一条只是暂时抖动的渠道。',
+                  '默认 6。普通(抖动)失败的冷却阶梯从「普通冷却起始时间」起步、每犯一次翻倍,翻倍超出封顶时以封顶为准。这里改的就是封顶。抬得太低会让反复出错的组合很快解冻、又回候选池;太高则会长期放弃一条只是暂时抖动的渠道。',
                 )}
                 onChange={(value) =>
                   setInputs({ ...inputs, AutoModelCooldownMaxHours: String(value) })
@@ -291,7 +308,7 @@ export default function SettingsAutoModelPolicy(props) {
                 label={t('确定性失败关键词(自动删除判据)')}
                 placeholder={t('一行一个,不区分大小写;中文文案、英文词语、状态码都可以')}
                 extraText={t(
-                  '在错误正文、错误码、错误类型里做子串匹配。命中后:首犯冷却 24 小时,再犯直接把该模型从这条渠道里删除(不删渠道)。上文已预填本机在用的判据。上下文超长永远按抖动处理,不受此处影响。',
+                  '在错误正文、错误码、错误类型里做子串匹配。命中后:首犯按「确定性失败冷却时长」冷却(默认 24 小时),再犯直接把该模型从这条渠道里删除(不删渠道)。上文已预填本机在用的判据。上下文超长永远按抖动处理,不受此处影响。',
                 )}
                 autosize={{ minRows: 8, maxRows: 16 }}
                 onChange={(value) =>
@@ -312,7 +329,7 @@ export default function SettingsAutoModelPolicy(props) {
                 label={t('普通冷却关键词(强制降级为抖动失败)')}
                 placeholder={t('一行一个,不区分大小写;中文文案、英文词语、状态码都可以')}
                 extraText={t(
-                  '优先级最高:命中后这次失败只按普通抖动冷却处理(15 分钟起步的阶梯),绝不升级成 24 小时冷却、也不会删除模型。用来把其实会自愈的错误钉在这一档,防止被上面的确定性判据误伤。上文已预填本机在用的判据。',
+                  '优先级最高:命中后这次失败只按普通抖动冷却处理(以「普通冷却起始时间」起步的阶梯),绝不升级成确定性冷却档、也不会删除模型。用来把其实会自愈的错误钉在这一档,防止被上面的确定性判据误伤。上文已预填本机在用的判据。',
                 )}
                 autosize={{ minRows: 6, maxRows: 14 }}
                 onChange={(value) =>

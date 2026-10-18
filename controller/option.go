@@ -373,7 +373,7 @@ func UpdateOption(c *gin.Context) {
 			return
 		}
 	case "AutoModelMaxAttempts", "AutoModelPermanentCooldownHours", "AutoModelCooldownMaxHours",
-		"AutoModelScoreDecayMinutes":
+		"AutoModelCooldownBaseMinutes", "AutoModelScoreDecayMinutes":
 		// 这些都是"至少 1"的正整数;写 0 或负数会直接让 auto 不可用。
 		// (确定性失败已无"封顶天数"选项:首犯 24h、再犯直接摘除模型。)
 		parsed, parseErr := strconv.Atoi(strings.TrimSpace(option.Value.(string)))
@@ -386,8 +386,8 @@ func UpdateOption(c *gin.Context) {
 		}
 		switch option.Key {
 		case "AutoModelCooldownMaxHours":
-			// 封顶不能低于首档(15 分钟),否则阶梯第一档就超封顶,语义自相矛盾。
-			// 小时为整数,>=1 即满足。
+			// 封顶不能低于首档(首档可配,默认 15 分钟),否则阶梯第一档就超封顶,
+			// 语义自相矛盾。小时为整数,>=1 即满足。
 			//
 			// 这里只记建议、不拒绝:封顶与衰减窗口都是可自定义的,不合逻辑的组合也
 			// 允许保存,只在响应里附带建议值提示(前端显示"保存成功,但建议……")。

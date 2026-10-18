@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -78,6 +79,40 @@ func RecordAutoModelOutcome(group, name string, channelID int, success bool, lat
 // 冷却只覆盖该 (分组, 模型, 渠道)，不会把该渠道上的其它模型也标为冷却。
 func RecordAutoModelUnusableAnswer(group, name string, channelID int, reason string) {
 	recordAutoModelOutcome(group, name, channelID, false, 0, 0, true, reason)
+}
+
+// RecordAutoModelTestOutcome 把「渠道手动测试(单个/批量测试)」的结果并入 auto
+// 健康体系:成功提分并清除既有冷却;失败按与真实流量相同的判据分档——命中
+// 确定性判据(模型不存在/无权/不支持/上游网关 5xx/管理员关键词)走长冷却
+// (首犯一个窗口,再犯摘除),其余按抖动阶梯冷却并扣分。
+//
+// 与真实流量反馈共用同一套评分与冷却存储,一点差异:对渠道声明的每一个分组
+// 各记一条(打分键是 分组+模型+渠道)。
+//
+// 真实流量路径不经过这里,原有逻辑不变。定时渠道测试(若管理员开启)同样汇入。
+func RecordAutoModelTestOutcome(channel *model.Channel, modelName string, success bool, elapsedMs int64, testErr *types.NewAPIError) {
+	if channel == nil || !operation_setting.AutoModelEnabled {
+		return
+	}
+	name := strings.TrimSpace(modelName)
+	if name == "" || operation_setting.IsAutoModelName(name) {
+		return
+	}
+	for _, group := range strings.Split(channel.Group, ",") {
+		group = strings.TrimSpace(group)
+		if group == "" {
+			continue
+		}
+		if !success && testErr != nil && AutoModelPermanentFailure(testErr) {
+			reason := testErr.Error()
+			if runes := []rune(reason); len(runes) > 200 {
+				reason = string(runes[:200])
+			}
+			RecordAutoModelPermanentFailure(group, name, channel.Id, "手动测试失败: "+reason)
+			continue
+		}
+		RecordAutoModelOutcome(group, name, channel.Id, success, elapsedMs, elapsedMs)
+	}
 }
 
 func recordAutoModelOutcome(group, name string, channelID int, success bool, latencyMs int64, elapsedMs int64, modelOnlyCooldown bool, cooldownReason string) {

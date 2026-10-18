@@ -20,6 +20,11 @@ For licensing inquiries, please open an issue at https://github.com/bitscr/new-a
 export const CHANNEL_OPTIONS = [
   { value: 1, color: 'green', label: 'OpenAI' },
   {
+    value: 75,
+    color: 'blue',
+    label: 'New API',
+  },
+  {
     value: 2,
     color: 'light-blue',
     label: 'Midjourney Proxy',
@@ -213,11 +218,6 @@ export const CHANNEL_OPTIONS = [
     value: 59,
     color: 'blue',
     label: 'Poe',
-  },
-  {
-    value: 75,
-    color: 'blue',
-    label: 'New API',
   },
 ];
 

@@ -343,6 +343,29 @@ func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointTyp
 	return normalized
 }
 
+// resolveChannelTestModel 与 testChannel 的模型解析保持一致:
+// 指定模型 → 渠道测试模型 → 渠道第一个模型 → 兜底。测试反馈记账需要用它,
+// 保证失败路径也能拿到与请求一致的模型名。
+func resolveChannelTestModel(channel *model.Channel, testModel string) string {
+	testModel = strings.TrimSpace(testModel)
+	if testModel != "" {
+		return testModel
+	}
+	if channel.TestModel != nil && *channel.TestModel != "" {
+		return strings.TrimSpace(*channel.TestModel)
+	}
+	models := channel.GetModels()
+	if len(models) > 0 {
+		if m := strings.TrimSpace(models[0]); m != "" {
+			return m
+		}
+	}
+	if channel.Type == constant.ChannelTypeTypeSafe {
+		return "jev-latest"
+	}
+	return "gpt-4o-mini"
+}
+
 func testChannel(channel *model.Channel, testModel string, endpointType string, isStream bool) testResult {
 	tik := time.Now()
 	var unsupportedTestChannelTypes = []int{
@@ -363,23 +386,7 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	testModel = strings.TrimSpace(testModel)
-	if testModel == "" {
-		if channel.TestModel != nil && *channel.TestModel != "" {
-			testModel = strings.TrimSpace(*channel.TestModel)
-		} else {
-			models := channel.GetModels()
-			if len(models) > 0 {
-				testModel = strings.TrimSpace(models[0])
-			}
-			if testModel == "" {
-				testModel = "gpt-4o-mini"
-				if channel.Type == constant.ChannelTypeTypeSafe {
-					testModel = "jev-latest"
-				}
-			}
-		}
-	}
+	testModel = resolveChannelTestModel(channel, testModel)
 
 	endpointType = normalizeChannelTestEndpoint(channel, testModel, endpointType)
 	if channel.Type == constant.ChannelTypeTypeSafe {
@@ -1566,6 +1573,11 @@ func TestChannel(c *gin.Context) {
 	milliseconds := tok.Sub(tik).Milliseconds()
 	go channel.UpdateResponseTime(milliseconds)
 	consumedTime := float64(milliseconds) / 1000.0
+	// 手动测试结果并入 auto 健康打分:成功提分并清除既有冷却,失败走抖动阶梯。
+	// localErr(请求未真正发出)已在上方提前返回,不会走到这里。
+	service.RecordAutoModelTestOutcome(channel,
+		resolveChannelTestModel(channel, testModel),
+		result.newAPIError == nil, milliseconds, result.newAPIError)
 	if result.newAPIError != nil {
 		statusCode := http.StatusOK
 		if isChannelDailySuccessLimitError(result.newAPIError) {
@@ -1628,6 +1640,14 @@ func testAllChannels(notify bool) error {
 			result := testChannel(channel, "", "", shouldUseStreamForAutomaticChannelTest(channel))
 			tok := time.Now()
 			milliseconds := tok.Sub(tik).Milliseconds()
+			// 手动/定时渠道测试结果并入 auto 健康打分:失败按与真实流量相同的
+			// 判据分档(命中确定性判据走长冷却,再犯摘除)。不支持的渠道类型
+			// (localErr)没有真实请求发出,不计入。
+			if result.localErr == nil {
+				service.RecordAutoModelTestOutcome(channel,
+					resolveChannelTestModel(channel, ""),
+					result.newAPIError == nil, milliseconds, result.newAPIError)
+			}
 
 			shouldBanChannel := false
 			newAPIError := result.newAPIError

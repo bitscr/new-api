@@ -40,23 +40,26 @@ const (
 	// autoModelSlowLatencyMs 超过它就算"慢"。流式请求量到的是首字节时间;
 	// 非流式量不到首字节,用总耗时兜底(会包含生成长文的时间)。
 	autoModelSlowLatencyMs int64 = 20000
-	autoModelCooldownBase        = 15 * time.Minute
+	// autoModelCooldownBase 是抖动阶梯的起步时长"默认值"。实际运行值取
+	// operation_setting.AutoModelCooldownBaseMinutes()(面板可改,分钟),这里
+	// 只是无配置时的兜底;测试也直接引用本常量锁定默认阶梯。
+	autoModelCooldownBase = 15 * time.Minute
 	// autoModelCooldownMax 是封顶的兜底常量。实际运行值取
 	// operation_setting.AutoModelCooldownMax()(面板可改),这里只是没配置时的下限。
 	autoModelCooldownMax = 6 * time.Hour
-	// autoModelCooldownSecondTier 是阶梯第二档(首档翻倍)。评分衰减窗口必须
-	// 严格大于它,否则第 2 次失败解冻时扣分正好归零(见测试与配置校验)。
+	// autoModelCooldownSecondTier 是阶梯第二档(首档翻倍)的默认值。评分衰减窗口
+	// 必须严格大于它,否则第 2 次失败解冻时扣分正好归零(见测试与配置校验)。
 	autoModelCooldownSecondTier = 2 * autoModelCooldownBase
 )
 
-// AutoModelCooldownBaseForValidation 暴露抖动冷却的首档时长,供配置校验使用。
+// AutoModelCooldownBaseForValidation 暴露抖动冷却的首档时长(面板可配),供配置校验使用。
 //
 // 为什么需要它:评分衰减窗口必须长于首档冷却,否则第 1 次失败解冻时扣分几乎
 // 已归零;而窗口等于第 2 档(30 分钟)时,第 2 次失败解冻的瞬间分数正好回到
 // 中立,冷却彻底白做。校验要用同一个来源,不能在校验处再写一个 15 分钟常量,
 // 否则以后调冷却阶梯时会悄悄失配。
 func AutoModelCooldownBaseForValidation() time.Duration {
-	return autoModelCooldownBase
+	return time.Duration(operation_setting.AutoModelCooldownBaseMinutes()) * time.Minute
 }
 
 // AutoModelCooldownSecondTierForValidation 暴露抖动冷却的第二档时长(首档翻倍)。
@@ -65,7 +68,7 @@ func AutoModelCooldownBaseForValidation() time.Duration {
 // 那一刻分数精确回到中立的 0.5——惩罚"刚好"作废。所以真正的不变式是
 // "窗口 > 第二档",而不是"窗口 > 首档"。
 func AutoModelCooldownSecondTierForValidation() time.Duration {
-	return autoModelCooldownSecondTier
+	return 2 * time.Duration(operation_setting.AutoModelCooldownBaseMinutes()) * time.Minute
 }
 
 // autoModelPermanentCooldownBase / Max 是"确定性失败"的阶梯:模型不存在、无权、
@@ -200,13 +203,14 @@ func autoModelCooldownSnapshot() map[string]autoModelCooldownState {
 
 // nextAutoModelCooldown 计算下一次冷却:每犯一次错,窗口翻一倍,封顶取面板配置。
 func nextAutoModelCooldown(prev autoModelCooldownState, reason string, now time.Time) autoModelCooldownState {
-	// 封顶可由面板改(operation_setting)。取不到或不合法时退回常量兜底,
-	// 且必须 >= 首档,否则阶梯会一开始就"封"到比首档还短。
+	// 起步值与封顶都可由面板改(operation_setting)。任一取不到或不合法时退回
+	// 常量兜底,且封顶必须 >= 首档,否则阶梯会一开始就"封"到比首档还短。
+	base := time.Duration(operation_setting.AutoModelCooldownBaseMinutes()) * time.Minute
 	maximum := operation_setting.AutoModelCooldownMax()
-	if maximum < autoModelCooldownBase {
+	if maximum < base {
 		maximum = autoModelCooldownMax
 	}
-	return nextAutoModelCooldownIn(prev, reason, now, autoModelCooldownBase, maximum)
+	return nextAutoModelCooldownIn(prev, reason, now, base, maximum)
 }
 
 // nextAutoModelPermanentCooldown 是确定性失败的阶梯,只有两档:

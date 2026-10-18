@@ -22,6 +22,10 @@ const (
 	// 阶梯式翻倍(24h→48h→…→30 天)对本机的意义不大:需要几十天才收敛的组合,
 	// 早该被人工或自动清掉,而不是挂着一个"30 天后还会回来试"的窗口。
 	autoModelDefaultPermanentCooldownHours = 24
+	// autoModelDefaultCooldownBaseMinutes 是抖动(普通)冷却阶梯的起步时长(分钟)。
+	// 阶梯从这里起步、每犯一次翻倍,翻倍超出封顶时以封顶为准。可在面板调整
+	// (AutoModelCooldownBaseMinutes)。
+	autoModelDefaultCooldownBaseMinutes = 15
 	// autoModelDefaultCooldownMaxHours 是抖动(普通)冷却阶梯的封顶时长。
 	//
 	// 阶梯是首档 15 分钟起、每犯一次翻倍:15m→30m→1h→2h→4h→封顶。本值决定封顶。
@@ -192,6 +196,7 @@ var (
 	autoModelMaxAttempts            = autoModelDefaultMaxAttempts
 	autoModelPermanentCooldownHours = autoModelDefaultPermanentCooldownHours
 	autoModelCooldownMaxHours       = autoModelDefaultCooldownMaxHours
+	autoModelCooldownBaseMinutes    = autoModelDefaultCooldownBaseMinutes
 	autoModelScoreDecayMinutes      = autoModelDefaultScoreDecayMinutes
 	// autoModelPermanentKeywords 是管理员补充的确定性失败关键词(一行一个)。
 	// 命中即把该失败升级为长冷却,作用域仍是单个 (group, model, channel)。
@@ -220,6 +225,8 @@ func InitAutoModelSettingsFromEnv() {
 		common.GetEnvOrDefault("AUTO_MODEL_PERMANENT_COOLDOWN_HOURS", autoModelDefaultPermanentCooldownHours), 1)
 	autoModelCooldownMaxHours = sanitizePositive(
 		common.GetEnvOrDefault("AUTO_MODEL_COOLDOWN_MAX_HOURS", autoModelDefaultCooldownMaxHours), 1)
+	autoModelCooldownBaseMinutes = sanitizePositive(
+		common.GetEnvOrDefault("AUTO_MODEL_COOLDOWN_BASE_MINUTES", autoModelDefaultCooldownBaseMinutes), 1)
 	autoModelScoreDecayMinutes = sanitizePositive(
 		common.GetEnvOrDefault("AUTO_MODEL_SCORE_DECAY_MINUTES", autoModelDefaultScoreDecayMinutes), 1)
 }
@@ -293,6 +300,22 @@ func AutoModelCooldownMaxHours() int {
 	return autoModelCooldownMaxHours
 }
 
+// SetAutoModelCooldownBaseMinutes 面板写入路径(单位分钟,至少 1)。
+// 阶梯从这里起步、每犯一次翻倍;翻倍超出封顶时以封顶为准(封顶语义见
+// SetAutoModelCooldownMaxHours)。
+func SetAutoModelCooldownBaseMinutes(value int) {
+	autoModelSettingsMutex.Lock()
+	defer autoModelSettingsMutex.Unlock()
+	autoModelCooldownBaseMinutes = sanitizePositive(value, 1)
+}
+
+// AutoModelCooldownBaseMinutes 返回抖动冷却阶梯的起步时长(分钟)。
+func AutoModelCooldownBaseMinutes() int {
+	autoModelSettingsMutex.RLock()
+	defer autoModelSettingsMutex.RUnlock()
+	return autoModelCooldownBaseMinutes
+}
+
 // AutoModelRecommendedCooldownMaxHours 给出"与当前衰减窗口相配"的封顶建议值(小时)。
 //
 // 取衰减窗口换算的小时数:封顶不该超过记忆窗口,否则最高几档解冻时扣分已是 0,
@@ -309,14 +332,15 @@ func AutoModelRecommendedCooldownMaxHours() int {
 
 // AutoModelRecommendedScoreDecayMinutes 给出"与当前封顶相配"的衰减窗口建议值(分钟)。
 //
-// 取封顶换算的分钟数,并保证大于冷却第二档(30 分钟):窗口若等于第二档,
+// 取封顶换算的分钟数,并保证大于冷却第二档(2×起步值):窗口若等于第二档,
 // 第 2 次失败解冻时分数正好归零,惩罚精确作废。
 func AutoModelRecommendedScoreDecayMinutes() int {
 	autoModelSettingsMutex.RLock()
 	defer autoModelSettingsMutex.RUnlock()
 	minutes := autoModelCooldownMaxHours * 60
-	if minutes <= 30 {
-		return 31
+	secondTier := autoModelCooldownBaseMinutes * 2
+	if minutes <= secondTier {
+		return secondTier + 1
 	}
 	return minutes
 }
