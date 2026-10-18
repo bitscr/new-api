@@ -61,7 +61,7 @@ jobs:
               armv7) goarch=arm; goarm=7 ;;
               *)     goarch="$spec"; goarm="" ;;
             esac
-            GOOS=linux GOARCH="$goarch" ${goarm:+GOARM=$goarm} go build -trimpath \
+            env GOOS=linux GOARCH="$goarch" ${goarm:+GOARM=$goarm} go build -trimpath \
               -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" \
               -o "release/new-api-linux-$spec" .
             tar -C release -czf "release/new-api-linux-$spec.tar.gz" "new-api-linux-$spec"
