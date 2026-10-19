@@ -6,141 +6,101 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/stretchr/testify/require"
 )
 
-// AutoModelPermanentFailure 只认确定性失败。测试逐条锁定正面判据,以及
-// 明确不该判永久的抖动类失败(限流、请求超时、上下文超长、非 model 参数的非法值)。
-func TestAutoModelPermanentFailureClassifiesDeterministicOnly(t *testing.T) {
+// AutoModelPermanentFailure 的判据完全来自数据库里管理员配置的关键词:
+// 源码不内置任何状态码/错误码/文案判据,未配置关键词时没有任何失败会被判成确定性。
+// 本测试把"过去会被内置判据命中的失败"逐一钉住:现在必须全部按抖动处理。
+func TestAutoModelPermanentFailureWithoutKeywordsIsAlwaysFalse(t *testing.T) {
+	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
+	operation_setting.SetAutoModelPermanentKeywords("")
+
 	cases := []struct {
-		name      string
-		err       *types.NewAPIError
-		permanent bool
+		name string
+		err  *types.NewAPIError
 	}{
 		{"auth401", types.NewErrorWithStatusCode(errors.New("Invalid API key"),
-			types.ErrorCodeInvalidRequest, http.StatusUnauthorized), true},
+			types.ErrorCodeInvalidRequest, http.StatusUnauthorized)},
 		{"auth403", types.NewErrorWithStatusCode(errors.New("Credential access forbidden"),
-			types.ErrorCodeInvalidRequest, http.StatusForbidden), true},
+			types.ErrorCodeInvalidRequest, http.StatusForbidden)},
 		{"model-not-found-code", types.NewErrorWithStatusCode(errors.New("Requested model not found"),
-			types.ErrorCodeModelNotFound, http.StatusNotFound), true},
+			types.ErrorCodeModelNotFound, http.StatusNotFound)},
 		{"model-not-supported", types.NewErrorWithStatusCode(errors.New("model_not_supported"),
-			types.ErrorCode("model_not_supported"), http.StatusBadRequest), true},
-		{"unsupported-model", types.NewErrorWithStatusCode(errors.New("unsupported model"),
-			types.ErrorCode("unsupported_model"), http.StatusBadRequest), true},
-		{"param-model-404", types.NewOpenAIError(errors.New("no such model"),
-			types.ErrorCodeInvalidRequest, http.StatusNotFound,
-			withOpenAIParam("model")), true},
-		{"param-model-invalid-value", types.NewOpenAIError(errors.New("invalid value"),
-			types.ErrorCode("invalid_value"), http.StatusBadRequest,
-			withOpenAIParam("model")), true},
+			types.ErrorCode("model_not_supported"), http.StatusBadRequest)},
 		{"unsupported-model-feature", types.NewErrorWithStatusCode(
 			errors.New("This model does not support the requested feature"),
-			types.ErrorCode("unsupported_model_feature"), http.StatusUnprocessableEntity), true},
-
-		// 抖动类:必须保持短冷却。
-		{"rate-limit", types.NewErrorWithStatusCode(errors.New("Account rate limit exceeded"),
-			types.ErrorCode("rate_limit_exceeded"), http.StatusTooManyRequests), false},
-		{"timeout", types.NewErrorWithStatusCode(errors.New("Upstream request timeout"),
-			types.ErrorCode("request_timeout"), http.StatusRequestTimeout), false},
-		{"context-overflow", types.NewErrorWithStatusCode(errors.New("Maximum context length exceeded"),
-			types.ErrorCode("context_length_exceeded"), http.StatusBadRequest), false},
-		{"invalid-value-other-param", types.NewOpenAIError(errors.New("invalid value"),
-			types.ErrorCode("invalid_value"), http.StatusBadRequest,
-			withOpenAIParam("temperature")), false},
-		{"nil", nil, false},
-
-		// 上游网关挂掉、以及"端点/模型根本不存在"是确定性失败:本网关改不了,
-		// 靠"每 15 分钟再撞一次"等它自愈只会让同一个组合反复失败。
-		// 502/503/504 与 CF 自有的 520-527 同理。
-		//
-		// 下面这两条过去写的是 false(被归进"抖动类"),与 AutoModelPermanentFailure
-		// 里按状态码判永久的代码互相矛盾——是测试没跟上代码,不是代码有别的分支。
-		// 状态码分支不看错误码,所以 route_not_found 这种"不是模型问题"的 404
-		// 同样会被判永久;代码注释里对此是明确的(端点或模型不存在,重试无意义)。
+			types.ErrorCode("unsupported_model_feature"), http.StatusUnprocessableEntity)},
+		{"capability-wording", types.NewOpenAIError(
+			errors.New("tools / function calling is not supported by the upstream backend"),
+			types.ErrorCode("invalid_request_error"), http.StatusBadRequest)},
 		{"generic-404", types.NewErrorWithStatusCode(errors.New("Endpoint not found"),
-			types.ErrorCode("route_not_found"), http.StatusNotFound), true},
+			types.ErrorCode("route_not_found"), http.StatusNotFound)},
 		{"server-error", types.NewErrorWithStatusCode(errors.New("Upstream unavailable"),
-			types.ErrorCode("server_error"), http.StatusServiceUnavailable), true},
+			types.ErrorCode("server_error"), http.StatusServiceUnavailable)},
 		{"gateway-timeout", types.NewErrorWithStatusCode(errors.New("Upstream timed out"),
-			types.ErrorCode("bad_response_status_code"), http.StatusGatewayTimeout), true},
+			types.ErrorCode("bad_response_status_code"), http.StatusGatewayTimeout)},
 		{"cloudflare-524", types.NewErrorWithStatusCode(errors.New("bad response status code 524"),
-			types.ErrorCode("bad_response_status_code"), 524), true},
+			types.ErrorCode("bad_response_status_code"), 524)},
+		{"rate-limit", types.NewErrorWithStatusCode(errors.New("Account rate limit exceeded"),
+			types.ErrorCode("rate_limit_exceeded"), http.StatusTooManyRequests)},
+		{"context-overflow", types.NewErrorWithStatusCode(errors.New("Maximum context length exceeded"),
+			types.ErrorCode("context_length_exceeded"), http.StatusBadRequest)},
+		{"nil", nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.permanent, AutoModelPermanentFailure(tc.err))
+			require.False(t, AutoModelPermanentFailure(tc.err),
+				"没有配置关键词时,任何失败都不能被判成确定性")
 		})
 	}
 }
 
-func withOpenAIParam(param string) types.NewAPIErrorOptions {
-	return func(e *types.NewAPIError) {
-		if detail, ok := e.RelayError.(types.OpenAIError); ok {
-			detail.Param = param
-			e.RelayError = detail
-		}
-	}
+// 管理员关键词命中(错误正文或错误码,大小写不敏感)即判确定性;这是唯一的正向判据。
+func TestAutoModelPermanentFailureFollowsConfiguredKeywords(t *testing.T) {
+	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
+
+	err := types.NewErrorWithStatusCode(errors.New("Requested model not found"),
+		types.ErrorCodeModelNotFound, http.StatusNotFound)
+
+	operation_setting.SetAutoModelPermanentKeywords("model not found")
+	require.True(t, AutoModelPermanentFailure(err))
+
+	operation_setting.SetAutoModelPermanentKeywords("MODEL_NOT_FOUND")
+	require.True(t, AutoModelPermanentFailure(err), "错误码上的大小写不敏感匹配也要生效")
+
+	operation_setting.SetAutoModelPermanentKeywords("some other upstream string")
+	require.False(t, AutoModelPermanentFailure(err), "关键词不命中就不能扩大打击面")
 }
 
-// 确定性失败只有两档:首犯 = 首次窗口(默认 24h),再犯直接摘除该组合,不再逐级翻倍。
-// 抖动失败仍走独立的 15m 起步阶梯,两者不共用计数。
-func TestPermanentCooldownLadderIsSeparateFromTransient(t *testing.T) {
-	setupAutoModelCooldownTestDB(t)
-	now := time.Now()
+// 普通冷却关键词优先:管理员显式钉回抖动的失败,即使同时命中确定性关键词,
+// 也必须按抖动处理。
+func TestTransientKeywordDowngradesPermanentMatch(t *testing.T) {
+	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
+	t.Cleanup(func() { operation_setting.SetAutoModelTransientKeywords("") })
+	operation_setting.SetAutoModelPermanentKeywords("model not found")
+	operation_setting.SetAutoModelTransientKeywords("model not found")
 
-	permanent := autoModelCooldownState{}
-	windows := []time.Duration{}
-	for i := 0; i < 3; i++ {
-		permanent = nextAutoModelPermanentCooldown(permanent, "模型不存在", now)
-		windows = append(windows, permanent.Until.Sub(now))
-	}
-	require.Equal(t, autoModelPermanentCooldownBase(), windows[0], "首犯即 24h")
-	require.Equal(t, autoModelPermanentCooldownBase(), windows[1],
-		"不再翻倍:封顶恒等于首次窗口,再犯由 RetireAutoModelCombination 摘除,而不是等更久")
-	require.Equal(t, autoModelPermanentCooldownBase(), windows[2])
-	require.True(t, permanent.Permanent)
-	require.Equal(t, 3, permanent.Level, "等级仍逐次递增,只是不再用来拉长窗口")
-
-	// 抖动阶梯不受影响,仍是 15m 起步、逐级翻倍。
-	transient := autoModelCooldownState{}
-	transient = nextAutoModelCooldown(transient, "请求失败", now)
-	require.Equal(t, autoModelCooldownBase, transient.Until.Sub(now))
-	require.False(t, transient.Permanent, "抖动失败不该被标成永久")
+	err := types.NewErrorWithStatusCode(errors.New("Requested model not found"),
+		types.ErrorCodeModelNotFound, http.StatusNotFound)
+	require.False(t, AutoModelPermanentFailure(err))
 }
 
-// 永久阶梯也要封顶,不能无限翻倍。
-func TestPermanentCooldownCapsAtMax(t *testing.T) {
-	setupAutoModelCooldownTestDB(t)
-	now := time.Now()
-	prev := autoModelCooldownState{}
-	for i := 0; i < 20; i++ {
-		prev = nextAutoModelPermanentCooldown(prev, "模型不存在", now)
-	}
-	require.Equal(t, autoModelPermanentCooldownMax(), prev.Until.Sub(now))
-}
+// 保护项优先于关键词:上下文超长是"这次请求太长",不是"模型不存在"。
+// 管理员加错关键词也不能把整个模型摘掉。
+func TestKeywordCannotOverrideProtectedTransient(t *testing.T) {
+	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
+	operation_setting.SetAutoModelPermanentKeywords("maximum context length")
 
-// 永久失败落库并跨重启保留;标志位必须一起存取。
-func TestPermanentCooldownPersistsAndReloads(t *testing.T) {
-	setupAutoModelCooldownTestDB(t)
-	group := "default"
+	err := types.NewErrorWithStatusCode(errors.New("Maximum context length exceeded"),
+		types.ErrorCode("context_length_exceeded"), http.StatusBadRequest)
 
-	RecordAutoModelPermanentFailure(group, "ghost-model", 3, "模型不存在(model_not_found)")
-
-	rows := cooldownRows(t)
-	require.Len(t, rows, 1)
-	require.True(t, rows[0].Permanent, "库里必须记住这是永久级冷却")
-	require.Greater(t, rows[0].Until-time.Now().Unix(), int64(23*3600),
-		"永久级冷却至少要留 23 小时")
-
-	// 模拟进程重启:内存清空后从库里读回,标志位仍在。
-	autoModelCooldowns.Clear()
-	LoadAutoModelCooldowns()
-	state, ok := autoModelCooldowns.Get(autoModelHealthKey(group, "ghost-model", 3))
-	require.True(t, ok)
-	require.True(t, state.Permanent, "重启后仍必须是永久级")
-	require.Equal(t, 1, state.Level)
+	require.False(t, AutoModelPermanentFailure(err),
+		"上下文超长必须永远按抖动处理,即使关键词命中")
 }
 
 // 老行(没有 permanent 列/值为假)必须按抖动冷却载入,不能被误升为永久。
@@ -154,42 +114,72 @@ func TestLegacyCooldownRowLoadsAsTransient(t *testing.T) {
 	LoadAutoModelCooldowns()
 	state, ok := autoModelCooldowns.Get(autoModelHealthKey("default", "old-model", 1))
 	require.True(t, ok)
-	require.False(t, state.Permanent)
+	require.Equal(t, 2, state.Level)
 }
 
-// 正常速度的成功恢复必须清掉永久标志,否则一个修好的模型永远回不来。
-func TestSuccessClearsPermanentCooldown(t *testing.T) {
+// 确定性失败不再有冷却档:存量 Permanent=true 的行(旧版本的"永久级冷却")
+// 在载入时直接清库,否则新代码没有任何路径会去清除它们。
+func TestLegacyPermanentCooldownRowIsPurged(t *testing.T) {
 	setupAutoModelCooldownTestDB(t)
-	group := "default"
+	require.NoError(t, model.UpsertAutoModelCooldown(&model.AutoModelCooldown{
+		Group: "default", Model: "ghost-model", ChannelId: 1,
+		Until: time.Now().Add(24 * time.Hour).Unix(), Level: 1, Reason: "模型不存在",
+		Permanent: true,
+		UpdatedAt: time.Now().Unix(),
+	}))
+	LoadAutoModelCooldowns()
 
-	RecordAutoModelPermanentFailure(group, "fixed-model", 5, "模型不存在(model_not_found)")
-	require.True(t, autoModelCooldownActive(group, "fixed-model", []int{5}))
-
-	applyAutoModelCooldown(group, "fixed-model", 5, true, 1200)
-	_, ok := autoModelCooldowns.Get(autoModelHealthKey(group, "fixed-model", 5))
-	require.False(t, ok, "成功恢复后不该留下任何冷却(含永久标志)")
-	require.Empty(t, cooldownRows(t))
+	require.Empty(t, cooldownRows(t), "旧版确定性冷却记录应在载入时被清掉")
+	_, ok := autoModelCooldowns.Get(autoModelHealthKey("default", "ghost-model", 1))
+	require.False(t, ok)
 }
 
-// 再犯一次:等级递增,且仍留在永久阶梯上——绝不退回抖动档的 15 分钟。
-//
-// 正常情况下第二次会直接调 RetireAutoModelCombination 把模型从渠道里摘掉;
-// 这个测试的库里没有 channels 表,摘除必然失败,于是走"退回永久冷却"的兜底路径。
-// 要锁住的不变式就是那条兜底不能变成 15 分钟。
-func TestPermanentFailureEscalatesOnRepeat(t *testing.T) {
-	setupAutoModelCooldownTestDB(t)
-	group := "default"
+// 命中确定性关键词的组合在第一次失败时就被直接摘除:模型从渠道声明里删除,
+// 全程没有任何冷却记录。再犯是幂等的,不会重复写库。
+func TestPermanentFailureRetiresCombinationImmediately(t *testing.T) {
+	db := setupAutoModelRouteRequestTest(t)
+	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
+	operation_setting.SetAutoModelPermanentKeywords("model not found")
 
-	RecordAutoModelPermanentFailure(group, "ghost-model", 3, "模型不存在")
-	first := cooldownRows(t)[0]
-	RecordAutoModelPermanentFailure(group, "ghost-model", 3, "模型不存在")
-	second := cooldownRows(t)[0]
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 11, Key: "k", Status: common.ChannelStatusEnabled, Group: "g", Models: "m1,m2",
+	}).Error)
+	require.NoError(t, db.Create(&[]model.Ability{
+		{Group: "g", Model: "m1", ChannelId: 11, Enabled: true},
+		{Group: "g", Model: "m2", ChannelId: 11, Enabled: true},
+	}).Error)
 
-	require.Equal(t, first.Level+1, second.Level)
-	require.True(t, second.Permanent, "摘除失败也必须留在永久档")
-	// 窗口不再翻倍,但也不能被缩短。Until 按秒落库,两次调用可能落在同一秒,
-	// 所以这里是"不短于"而不是"严格大于"。
-	require.GreaterOrEqual(t, second.Until, first.Until)
-	require.Greater(t, second.Until-time.Now().Unix(), int64(23*3600),
-		"仍必须是 24h 量级,而不是回到抖动档的 15 分钟")
+	RecordAutoModelPermanentFailure("g", "m1", 11, "模型不存在(model_not_found)")
+
+	channel, err := model.GetChannelById(11, false)
+	require.NoError(t, err)
+	require.Equal(t, "m2", channel.Models, "命中确定性关键词的模型应立即从渠道里删除")
+	require.Empty(t, ListAutoModelCooldowns(time.Now()), "确定性失败不再产生任何冷却")
+
+	RecordAutoModelPermanentFailure("g", "m1", 11, "模型不存在(model_not_found)")
+	channel, err = model.GetChannelById(11, false)
+	require.NoError(t, err)
+	require.Equal(t, "m2", channel.Models, "再犯是幂等的")
+}
+
+// 渠道被摘掉最后一个模型后自动禁用,状态里带原因。
+func TestPermanentFailureDisablesEmptiedChannel(t *testing.T) {
+	db := setupAutoModelRouteRequestTest(t)
+	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
+	operation_setting.SetAutoModelPermanentKeywords("model not found")
+
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 12, Key: "k", Status: common.ChannelStatusEnabled, Group: "g", Models: "only",
+	}).Error)
+	require.NoError(t, db.Create(&[]model.Ability{
+		{Group: "g", Model: "only", ChannelId: 12, Enabled: true},
+	}).Error)
+
+	RecordAutoModelPermanentFailure("g", "only", 12, "模型不存在(model_not_found)")
+
+	channel, err := model.GetChannelById(12, false)
+	require.NoError(t, err)
+	require.Empty(t, channel.Models)
+	require.Equal(t, common.ChannelStatusAutoDisabled, channel.Status,
+		"渠道没有剩余模型时应被自动禁用")
 }

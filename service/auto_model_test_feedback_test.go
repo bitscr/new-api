@@ -13,7 +13,8 @@ import (
 )
 
 // 手动渠道测试结果并入打分:多分组渠道每个分组各记一条;失败走抖动阶梯;
-// 冷却中的组合被一次快速成功的测试解冻;auto 关闭或模型名为 auto 时不记。
+// 命中确定性关键词的失败直接摘除组合(不再有冷却);冷却中的组合被一次快速
+// 成功的测试解冻;auto 关闭或模型名为 auto 时不记。
 func TestRecordAutoModelTestOutcome(t *testing.T) {
 	setupAutoModelCooldownTestDB(t)
 	operation_setting.AutoModelEnabled = true
@@ -66,23 +67,23 @@ func TestRecordAutoModelTestOutcome(t *testing.T) {
 	secondWindow := second[0].Until - second[0].UpdatedAt
 	require.Greater(t, secondWindow, firstWindow, "重复失败阶梯必须升级")
 
-	// g) 失败命中确定性判据(524):与真实流量同档 → 长冷却(Permanent=true),
-	//    同 key 的抖动冷却记录被确定性冷却覆盖,原因带来源与判据信息。
+	// g) 失败命中确定性关键词:直接摘除组合,不再有冷却档。
+	//    本测试的内存库只有 auto_model_cooldowns 表,摘除必然失败(没有 channels
+	//    表);此时不得退回冷却——宁可让组合保持可选、下次失败再试摘除,也不能
+	//    退回"每 15 分钟再撞一次"的抖动档装作无事发生。
+	RecordAutoModelTestOutcome(channel, "m1", true, 600, nil)
+	require.Empty(t, ListAutoModelCooldowns(time.Now()))
+	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
+	operation_setting.SetAutoModelPermanentKeywords("status code 524")
 	permErr := types.NewErrorWithStatusCode(
 		errors.New("bad response status code 524"),
 		types.ErrorCode("bad_response_status_code"), 524)
 	RecordAutoModelTestOutcome(channel, "m1", false, 500, permErr)
-	permRows := ListAutoModelCooldowns(time.Now())
-	require.Len(t, permRows, 2, "两个分组各一条确定性冷却")
-	for _, row := range permRows {
-		require.True(t, row.Permanent, "命中确定性判据的测试失败必须进入长冷却")
-		require.Contains(t, row.Reason, "手动测试失败", "冷却原因应标明来自手动测试")
-		require.Contains(t, row.Reason, "524", "冷却原因应包含判据信息")
-	}
+	require.Empty(t, ListAutoModelCooldowns(time.Now()),
+		"确定性失败不再产生冷却;摘除失败也不得退回抖动冷却")
 
-	// h) 普通瞬态错误(非确定性)仍走抖动档:先用快速成功清状态,再失败一次。
-	RecordAutoModelTestOutcome(channel, "m1", true, 600, nil)
-	require.Empty(t, ListAutoModelCooldowns(time.Now()))
+	// h) 普通瞬态错误(非确定性)仍走抖动档:清掉关键词后失败一次。
+	operation_setting.SetAutoModelPermanentKeywords("")
 	transientErr := types.NewErrorWithStatusCode(
 		errors.New("account rate limit exceeded"),
 		types.ErrorCode("rate_limit_exceeded"), http.StatusTooManyRequests)
@@ -90,6 +91,6 @@ func TestRecordAutoModelTestOutcome(t *testing.T) {
 	tr := ListAutoModelCooldowns(time.Now())
 	require.Len(t, tr, 2, "两个分组各一条抖动冷却")
 	for _, row := range tr {
-		require.False(t, row.Permanent, "瞬态错误不得进入长冷却")
+		require.Equal(t, 1, row.Level, "清状态后第一档从起步时长开始")
 	}
 }

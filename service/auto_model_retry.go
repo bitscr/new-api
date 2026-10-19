@@ -90,14 +90,12 @@ func autoModelCompatibilityStatus(status int) bool {
 // AutoModelCapabilityFailure 判定一次失败是不是"这个模型不支持本次请求需要的能力",
 // 返回命中的能力名(tools / vision / json_schema / reasoning / audio),未命中返回空串。
 //
-// 它同时决定两件事:
+// 它只决定重试作用域:换模型而不是换渠道。同一条上游的同名模型通常一样不支持,
+// 换渠道是白跑;而 400 默认不在重试状态码区间里,不提前判用户会直接拿到一个 400,
+// 连换模型的机会都没有。
 //
-//   - 冷却档位:命中即按确定性失败处理(首犯 24 小时,再犯摘除该组合)。本网关的
-//     auto 主要用于工具调用,一个给不了 tools 的模型对这个用途就是废的;不摘掉它
-//     会被反复选中、每次白费一次尝试,也就是"不适配的一直重复运行"。
-//   - 重试作用域:换模型而不是换渠道。同一条上游的同名模型通常一样不支持,换渠道
-//     是白跑;而 400 默认不在重试状态码区间里,不提前判用户会直接拿到一个 400,
-//     连换模型的机会都没有。
+// 它不参与冷却分档:是否把某个能力措辞当成确定性失败(命中即摘除组合),由管理员
+// 在面板配置的关键词决定,见 AutoModelPermanentFailure。
 //
 // 判据范围与其它关键词一致:错误正文、错误码、错误类型三处都看。
 func AutoModelCapabilityFailure(err *types.NewAPIError) string {
@@ -118,145 +116,37 @@ func AutoModelCapabilityFailure(err *types.NewAPIError) string {
 	return ""
 }
 
-// AutoModelPermanentFailure 判定一次上游失败是不是"确定性"的:这类失败重试也
-// 不会好(鉴权/权限、模型不存在、模型不支持、上游网关/CF 层挂掉),应该给
-// 永久级长冷却,而不是和限流一样只冷却 15 分钟。
+// AutoModelPermanentFailure 判定一次上游失败是不是"确定性"的:命中管理员在面板
+// 配置的确定性失败关键词(存于数据库,每次判定实时读取)。
 //
-// 判据是正面枚举,不做"认不出就当永久":认不出的失败按抖动处理,宁可多试几次,
-// 也不误杀一个只是暂时出问题的模型。上下文超长(context_length_exceeded)与请求
-// 内容有关,不算模型不存在,因此也不在这里。
+// 判据完全来自数据库:源码不内置任何状态码、错误码或文案,未配置关键词时没有
+// 任何失败会被判成确定性。命中后该组合会被直接摘除(见
+// RecordAutoModelPermanentFailure),不再有冷却等待。
 //
-// 内置判据之外,管理员可以在面板补关键词(一行一个),覆盖上游冒出的新错误串,
-// 否则那些失败只会拿到 15 分钟冷却并被反复重试。关键词只升级冷却时长,
-// 作用域仍是单个 (group, model, channel)。
-//
-// "模型不支持本次要的能力"(如 function calling)同样算确定性失败,见下面那条
-// AutoModelCapabilityFailure 判据:一个给不了 tools 的模型对本网关的用途就是废的,
-// 留着只会被反复选中、反复失败。
+// 两道前置闸门:
+//   - 保护项(context_length_exceeded)优先于任何关键词:上下文超长是"这次请求"
+//     的问题,不是"这个模型不存在",管理员加错关键词也不能把模型摘掉。
+//   - 管理员把某个错误写进"普通冷却关键词"(AutoModelTransientKeywords)等于
+//     明确要求"这一条按抖动处理",它优先于确定性关键词。
 func AutoModelPermanentFailure(err *types.NewAPIError) bool {
 	if err == nil {
 		return false
 	}
 	if autoModelProtectedTransient(err) {
-		// 保护项优先于任何关键词:上下文超长和泛化请求错误是"这次请求"的问题,
-		// 不是"这个模型不存在"。管理员加错关键词也不能把它们变成永久封禁。
+		// 保护项优先于任何关键词:上下文超长是"这次请求"的问题,不是"这个模型
+		// 不存在"。管理员加错关键词也不能把它们变成永久封禁。
 		return false
 	}
 	if autoModelMatchesTransientKeyword(err) {
-		// 管理员显式指定"这属于会自愈的普通失败":它优先于下面所有确定性判据。
-		// 作用是防止某个其实会恢复的错误(或过宽的固定文案)被误升级成 24 小时
-		// 冷却乃至摘除模型。
+		// 管理员显式指定"这属于会自愈的普通失败":它优先于确定性关键词。
 		return false
-	}
-	if AutoModelCapabilityFailure(err) != "" {
-		// 能力不匹配按确定性失败处理:本网关的 auto 主要用于工具调用,一个给不了
-		// tools 的模型对这个用途就是废的,留着只会被反复选中、每次白费一次尝试。
-		//
-		// 判据用措辞表而不是单条内置关键词,是因为上游表达同一件事的写法太多:
-		// "function calling is not supported" / "tool calling is not supported" /
-		// "does not support tools" / "不支持工具调用"……单条字符串只能覆盖其中一种,
-		// 其余写法会漏进抖动档,于是这个废组合永远删不掉。
-		//
-		// 位置在抖动关键词之后:管理员把某个能力措辞写进 AutoModelTransientKeywords
-		// 就等于明确要求"这一条别删",那是他的判断,应当生效。
-		return true
-	}
-	switch err.StatusCode {
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return true
-	case http.StatusNotFound, http.StatusBadGateway, http.StatusServiceUnavailable,
-		http.StatusGatewayTimeout:
-		// 404 / 502 / 503 / 504 都是"这条上游根本给不出这个模型的回答":404 是端点或
-		// 模型不存在,后三者是上游网关本身挂了、或者根本答不上来。重试同一个组合
-		// 不会变好。它们也可能短暂,但首犯只冷却 24 小时、再犯才摘除,代价可控。
-		return true
-	case 520, 521, 522, 523, 524, 525, 526, 527:
-		// Cloudflare 自有的 5xx:源站返回空/非法响应(520)、连不上(521/522/523)、
-		// 超时(524)、SSL 握手失败(525/526)、非法请求(527)。全部是上游侧的问题,
-		// 本网关改不了,也不该靠"每 15 分钟再撞一次"等它自愈——那只会让这个组合
-		// 反复被选中、反复失败。按确定性失败处理:冷却,再犯摘除,上游修好了再由
-		// 管理员加回来。
-		//
-		// 判状态码而不是关键词:RelayErrorHandler 把这类失败渲染成
-		// "bad response status code 524" 这类文案,匹配 "status code: 524" 那种
-		// 带冒号的写法永远命中不了。
-		return true
-	}
-	detail := err.ToOpenAIError()
-	codes := []string{
-		strings.ToLower(strings.TrimSpace(string(err.GetErrorCode()))),
-		strings.ToLower(strings.TrimSpace(detail.Type)),
-	}
-	modelParam := strings.EqualFold(strings.TrimSpace(detail.Param), "model")
-	for _, code := range codes {
-		switch code {
-		case "model_not_found", "model_not_supported", "unsupported_model", "unsupported_model_feature":
-			return true
-		case "not_found", "invalid_value", "unsupported_value", "unsupported_parameter", "invalid_request":
-			// 只有明确指向 model 参数时才算确定性:泛化的 invalid_request
-			// (请求体别的字段写错、端点不支持等)不是模型不存在。
-			if modelParam {
-				return true
-			}
-		}
-	}
-	if autoModelMatchesModelUnavailableText(err) {
-		return true
 	}
 	return autoModelMatchesPermanentKeyword(err)
 }
 
-// autoModelBuiltinPermanentTexts 是"上游明说这个模型它不提供"的固定文案判据。
-//
-// 为什么需要它:很多中转上游只回一句自然语言(中文/英文),既不给结构化 code,
-// 也不带 param=model。早先这类失败只能落到"抖动失败"的 15 分钟冷却,于是
-// 同一个不可用的组合每 15 分钟被选中一次、再失败一次,循环一整天
-// (实测 ch11 的 tr-alpha-channel 就是这样被反复选中)。
-//
-// 这里只收"明确说模型不可用/不存在"的措辞。刻意不收泛化的 400 文案
-// (如 invalid_request、Bad Request):那些可能是请求体自己写坏了,不该算到模型头上。
-var autoModelBuiltinPermanentTexts = []string{
-	"模型不可用",
-	"模型不存在",
-	"模型未找到",
-	"model not found",
-	"model is not available",
-	"model unavailable",
-	"community model not found",
-	"no such model",
-	"unsupported model",
-	"model_not_found",
-	"model_not_supported",
-}
-
-// autoModelMatchesModelUnavailableText 在错误正文里找"模型不可用"类固定文案。
-func autoModelMatchesModelUnavailableText(err *types.NewAPIError) bool {
-	if err == nil {
-		return false
-	}
-	detail := err.ToOpenAIError()
-	haystacks := []string{
-		strings.ToLower(err.Error()),
-		strings.ToLower(detail.Message),
-		strings.ToLower(string(err.GetErrorCode())),
-		strings.ToLower(detail.Type),
-	}
-	for _, text := range autoModelBuiltinPermanentTexts {
-		for _, haystack := range haystacks {
-			if haystack != "" && strings.Contains(haystack, text) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // autoModelProtectedTransient 列出永远按抖动处理的失败,即使管理员关键词命中。
-// 它描述的是"这次请求/这次输入"而不是"这个模型不存在",冷却一整天是错的:
-// context_length_exceeded 只要截断重发就能过,不是模型坏了。
-//
-// 注意这里只保护上下文超长。泛化 400/422 不在这里,因为它们本来就不会被判永久
-// (判据是正面枚举);但如果管理员明确加了某个 400 关键词,那是他的判断,应当生效。
+// 它描述的是"这次请求/这次输入"而不是"这个模型不存在":
+// context_length_exceeded 只要截断重发就能过,不是模型坏了,摘掉组合更没有道理。
 func autoModelProtectedTransient(err *types.NewAPIError) bool {
 	detail := err.ToOpenAIError()
 	for _, code := range []string{
@@ -297,8 +187,8 @@ func autoModelMatchesTransientKeyword(err *types.NewAPIError) bool {
 	return false
 }
 
-// autoModelMatchesPermanentKeyword 在错误正文与错误 code 里找管理员关键词。
-// 命中范围刻意包含 code,因为很多上游只在结构化字段里给原因。
+// autoModelMatchesPermanentKeyword 在错误正文与错误 code 里找管理员配置的
+// 确定性失败关键词。命中范围刻意包含 code,因为很多上游只在结构化字段里给原因。
 func autoModelMatchesPermanentKeyword(err *types.NewAPIError) bool {
 	keywords := operation_setting.AutoModelPermanentKeywords()
 	if len(keywords) == 0 {

@@ -408,9 +408,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 		// 所有失败照常记录并按判据分档——包括请求体错误(400/422 且文本指向请求体):
-		// 它们对"这个组合能不能服务好本次调用方"同样是证据,照常进普通冷却
-		// (400 不在确定性判据里;上下文超长等保护项仍在 AutoModelPermanentFailure
-		// 内部优先处理)。能力不匹配(tools 等)照常走确定性档(首犯长冷却,再犯摘除)。
+		// 它们对"这个组合能不能服务好本次调用方"同样是证据,照常进普通冷却。
+		// 上下文超长等保护项仍在 AutoModelPermanentFailure 内部优先处理;命中确定性
+		// 关键词的组合会被直接摘除,其余失败走普通冷却阶梯。
 		// 早先请求体错误有豁免(不记冷却),已按使用者决策移除:工具负载被拒也是证据,
 		// 豁免会让这类组合永远留在候选池里反复被选中。
 		recordAutoModelUpstreamFailure(c, relayInfo, newAPIError)
@@ -1091,8 +1091,8 @@ func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, succes
 }
 
 // recordAutoModelUpstreamFailure 记录一次上游失败,并在入队时定格它的"永久性":
-// 模型不存在/无权/不支持这类确定性失败重试也不会自愈,要的是长冷却,而不是
-// 15 分钟后再来一次。分类必须现在做,不能等 flush(那时 RelayInfo 可能已经
+// 命中确定性关键词的失败重试也不会自愈,要的是直接摘除该组合,而不是冷却一段
+// 时间后再来一次。分类必须现在做,不能等 flush(那时 RelayInfo 可能已经
 // 是另一次尝试的字段)。
 //
 // 失败也带上耗时:一个 200ms 就被拒的组合和一个卡满 60 秒才失败的组合,对客户端
@@ -1172,7 +1172,7 @@ type autoModelFeedback struct {
 	elapsedMS int64 // cooldown signal: successful TTFB (or non-stream elapsed), failed elapsed
 	unusable  bool
 	reason    string
-	// permanent 在入队时定格:这次失败是不是确定性失败(模型不存在/无权/不支持)。
+	// permanent 在入队时定格:这次失败是否命中管理员配置的确定性失败关键词。
 	// 队列是延迟 flush 的,不能等到 flush 时再读可能已被复用/覆盖的 RelayInfo。
 	permanent bool
 }
@@ -1227,8 +1227,8 @@ func flushAutoModelFeedback(c *gin.Context) {
 		case feedback.unusable:
 			service.RecordAutoModelUnusableAnswer(key.group, key.modelName, key.channelID, feedback.reason)
 		case feedback.permanent:
-			// 确定性失败:首犯冷却 24 小时;再犯直接把这个模型从这条渠道里摘除
-			// (渠道无剩余模型时自动禁用),仍然只挡这一个组合。
+			// 确定性失败:直接把这个模型从这条渠道里摘除(渠道无剩余模型时自动
+			// 禁用),没有冷却等待;仍然只挡这一个组合。
 			service.RecordAutoModelPermanentFailure(key.group, key.modelName, key.channelID, feedback.reason)
 		default:
 			service.RecordAutoModelOutcome(key.group, key.modelName, key.channelID, feedback.success, feedback.latencyMS, feedback.elapsedMS)
@@ -1297,7 +1297,7 @@ func recordRelayErrorLog(c *gin.Context, err *types.NewAPIError) {
 }
 
 // logModelRequestError 将失败的模型请求写入本地按天分割的报错日志文件。
-// 若本次失败已触发冷却(识别到冷却关键词/确定性判据并加入冷却),一并写出冷却类别与等级。
+// 若本次失败已触发冷却,一并写出冷却等级。
 func logModelRequestError(c *gin.Context, err *types.NewAPIError) {
 	modelName := c.GetString("original_model")
 	cooldown := ""
@@ -1312,11 +1312,7 @@ func logModelRequestError(c *gin.Context, err *types.NewAPIError) {
 			cooldownChannel = relayInfo.ChannelMeta.ChannelId
 		}
 		if info, ok := service.GetAutoModelCooldown(relayInfo.UsingGroup, relayInfo.OriginModelName, cooldownChannel, time.Now()); ok {
-			kind := "transient"
-			if info.Permanent {
-				kind = "permanent"
-			}
-			cooldown = fmt.Sprintf(", cooldown=%s level=%d", kind, info.Level)
+			cooldown = fmt.Sprintf(", cooldown level=%d", info.Level)
 		}
 	}
 	logger.LogModelError(c, fmt.Sprintf("model request failed: model=%s, channel=%d, status=%d, error=%s%s",

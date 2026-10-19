@@ -9,12 +9,12 @@ import (
 )
 
 // ListAutoModelCooldowns 必须如实反映当前生效的冷却:分组、模型、渠道、原因、
-// 等级、是否永久、剩余时长。没有它,管理员在故障时看不到 auto 到底挡住了谁。
+// 等级、剩余时长。没有它,管理员在故障时看不到 auto 到底挡住了谁。
 func TestListAutoModelCooldownsReportsActiveRows(t *testing.T) {
 	setupAutoModelCooldownTestDB(t)
 	now := time.Now()
 
-	RecordAutoModelPermanentFailure("default", "ghost-model", 3, "模型不存在(model_not_found)")
+	tripAutoModelCooldown("default", "ghost-model", 3, "模型不存在(model_not_found)", now)
 	applyAutoModelCooldown("default", "flaky-model", 7, false, 30000)
 
 	rows := ListAutoModelCooldowns(now)
@@ -29,14 +29,13 @@ func TestListAutoModelCooldownsReportsActiveRows(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "default", ghost.Group)
 	require.Equal(t, 3, ghost.ChannelID)
-	require.True(t, ghost.Permanent, "永久级冷却必须能被看出来")
 	require.Equal(t, "模型不存在(model_not_found)", ghost.Reason)
 	require.Equal(t, 1, ghost.Level)
-	require.Greater(t, ghost.RemainingSeconds, int64(23*3600), "首犯永久冷却至少 23 小时")
+	require.LessOrEqual(t, ghost.RemainingSeconds, int64(15*60), "抖动冷却窗口 15 分钟")
+	require.Greater(t, ghost.RemainingSeconds, int64(0), "冷却中必须带剩余时长")
 
 	flaky, ok := byModel["flaky-model"]
 	require.True(t, ok)
-	require.False(t, flaky.Permanent, "抖动冷却不该被标成永久")
 	require.Equal(t, 7, flaky.ChannelID)
 	require.LessOrEqual(t, flaky.RemainingSeconds, int64(15*60), "抖动冷却窗口 15 分钟")
 	require.Greater(t, flaky.RemainingSeconds, int64(0))
@@ -59,10 +58,8 @@ func TestListAutoModelCooldownsOmitsExpiredRows(t *testing.T) {
 
 // DeleteAutoModelCooldown 只清掉指定的那一条:同一个模型在别的渠道上的冷却必须留着。
 func TestDeleteAutoModelCooldownRemovesOnlyRequestedPair(t *testing.T) {
-	setupAutoModelCooldownTestDB(t)
-
-	RecordAutoModelPermanentFailure("default", "ghost-model", 3, "模型不存在")
-	RecordAutoModelPermanentFailure("default", "ghost-model", 9, "模型不存在")
+	setupAutoModelCooldownTestDB(t)	tripAutoModelCooldown("default", "ghost-model", 3, "模型不存在", time.Now())
+	tripAutoModelCooldown("default", "ghost-model", 9, "模型不存在", time.Now())
 
 	require.NoError(t, DeleteAutoModelCooldown("default", "ghost-model", 3))
 
@@ -82,9 +79,7 @@ func TestDeleteAutoModelCooldownRemovesOnlyRequestedPair(t *testing.T) {
 
 // 删除不存在的键不是错误,但也不能顺手清掉别人。
 func TestDeleteUnknownAutoModelCooldownKeepsOthers(t *testing.T) {
-	setupAutoModelCooldownTestDB(t)
-
-	RecordAutoModelPermanentFailure("default", "ghost-model", 3, "模型不存在")
+	setupAutoModelCooldownTestDB(t)	tripAutoModelCooldown("default", "ghost-model", 3, "模型不存在", time.Now())
 
 	require.NoError(t, DeleteAutoModelCooldown("default", "ghost-model", 99))
 
@@ -95,9 +90,7 @@ func TestDeleteUnknownAutoModelCooldownKeepsOthers(t *testing.T) {
 
 // 参数不全时不能误删(空分组/空模型/非法渠道一律拒绝)。
 func TestDeleteAutoModelCooldownRejectsIncompleteKey(t *testing.T) {
-	setupAutoModelCooldownTestDB(t)
-
-	RecordAutoModelPermanentFailure("default", "ghost-model", 3, "模型不存在")
+	setupAutoModelCooldownTestDB(t)	tripAutoModelCooldown("default", "ghost-model", 3, "模型不存在", time.Now())
 
 	for _, tc := range []struct {
 		name      string

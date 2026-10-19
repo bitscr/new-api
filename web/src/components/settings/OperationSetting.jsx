@@ -98,7 +98,6 @@ const OperationSetting = () => {
     /* auto 路由失败判据与时长(与其它设置项同理:不在这里白名单里,
        子组件就永远拿不到基准值,compareObjects 判不出变更 → 保存无反应) */
     AutoModelMaxAttempts: '4',
-    AutoModelPermanentCooldownHours: '24',
     AutoModelCooldownMaxHours: '6',
     AutoModelScoreDecayMinutes: '360',
     AutoModelPermanentKeywords: '',

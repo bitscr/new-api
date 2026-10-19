@@ -372,10 +372,10 @@ func UpdateOption(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"success": false, "message": "AutoModelEnabled 必须是 true 或 false"})
 			return
 		}
-	case "AutoModelMaxAttempts", "AutoModelPermanentCooldownHours", "AutoModelCooldownMaxHours",
+	case "AutoModelMaxAttempts", "AutoModelCooldownMaxHours",
 		"AutoModelCooldownBaseMinutes", "AutoModelScoreDecayMinutes", "AutoModelScoreRefreshSeconds":
 		// 这些都是"至少 1"的正整数;写 0 或负数会直接让 auto 不可用。
-		// (确定性失败已无"封顶天数"选项:首犯 24h、再犯直接摘除模型。)
+		// (确定性失败已无冷却时长选项:命中关键词即直接摘除模型,不再有冷却档。)
 		parsed, parseErr := strconv.Atoi(strings.TrimSpace(option.Value.(string)))
 		if parseErr != nil || parsed < 1 {
 			c.JSON(http.StatusOK, gin.H{
@@ -409,9 +409,9 @@ func UpdateOption(c *gin.Context) {
 			}
 		}
 	case "AutoModelPermanentKeywords":
-		// 关键词是"把某类失败升级为长冷却"的判据,代价高:命中即 24h 起。
+		// 关键词是"把某类失败判为确定性"的判据,代价高:命中即直接摘除该组合。
 		// 只做最基本的可用性校验,不猜测管理员的意图;但显然无意义或会误伤的
-		// 条目必须在写库前挡住,否则一次粘贴就把一片组合封 30 天。
+		// 条目必须在写库前挡住,否则一次粘贴就把一片组合从渠道里删光。
 		for _, line := range strings.Split(option.Value.(string), "\n") {
 			if message := operation_setting.ValidateAutoModelPermanentKeyword(line); message != "" {
 				c.JSON(http.StatusOK, gin.H{"success": false, "message": message})

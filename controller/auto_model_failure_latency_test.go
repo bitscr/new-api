@@ -50,16 +50,14 @@ func TestAutoModelUpstreamFailureCarriesElapsedLatency(t *testing.T) {
 	}
 }
 
-// 关键词把原本认不出的失败升级为长冷却,并且这条路径必须是真实请求路径:
-// 同一个错误只改管理员关键词,分类结果必须翻转。
+// 关键词把原本按抖动处理的失败升级为确定性(命中即直接摘除组合),并且这条
+// 路径必须是真实请求路径:同一个错误只改管理员关键词,分类结果必须翻转。
 func TestAutoModelKeywordUpgradesOnlyWhenConfigured(t *testing.T) {
 	original := operation_setting.AutoModelPermanentKeywordsToString()
 	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords(original) })
 	_ = common.OptionMap
 
-	// 错误串必须既不在内置判据、也不在能力措辞表里,否则"只有关键词能升级它"
-	// 这个前提就不成立。早先用的是 "function calling is not supported",它现在
-	// 既在内置永久关键词里、也在能力措辞表里,未配置关键词时就已经是永久了。
+	// 错误串必须不在管理员关键词里,否则"只有关键词能升级它"这个前提不成立。
 	err := types.NewErrorWithStatusCode(
 		errors.New("upstream anonymous backend retired this route"),
 		types.ErrorCode("unsupported_feature"), http.StatusBadRequest)

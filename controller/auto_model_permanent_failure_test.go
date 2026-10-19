@@ -61,8 +61,11 @@ func TestAutoModelBudgetHonoursConfiguredLimit(t *testing.T) {
 }
 
 // 确定性失败的分类要在"入队时"定格:队列是延迟 flush 的,事后读 RelayInfo
-// 可能已经是另一次尝试的字段。这里锁定时序契约。
+// 可能已经是另一次尝试的字段。这里锁定时序契约;判据来自管理员配置的关键词。
 func TestAutoModelFeedbackFreezesFailureClassAtQueueTime(t *testing.T) {
+	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
+	operation_setting.SetAutoModelPermanentKeywords("model not found")
+
 	c := newAutoModelFeedbackTestContext()
 	start := time.Unix(1700000000, 0)
 	info := &relaycommon.RelayInfo{
@@ -72,9 +75,7 @@ func TestAutoModelFeedbackFreezesFailureClassAtQueueTime(t *testing.T) {
 		AttemptStartTime: start,
 		AttemptEndTime:   start.Add(time.Second),
 	}
-	info.MarkUpstreamDispatch()
-
-	// 一次确定性失败(模型不存在)。
+	info.MarkUpstreamDispatch()	// 一次确定性失败(命中关键词"model not found")。
 	recordAutoModelUpstreamFailure(c, info, types.NewErrorWithStatusCode(
 		errors.New("Requested model not found"), types.ErrorCodeModelNotFound, http.StatusNotFound))
 
@@ -89,11 +90,8 @@ func TestAutoModelFeedbackFreezesFailureClassAtQueueTime(t *testing.T) {
 	require.False(t, outcome.success)
 }
 
-// 抖动失败(限流/超时)入队时不能被标成永久。
-//
-// 这里刻意用 429 而不是 5xx:502/503/504 与 CF 的 520-527 现在由状态码直接判永久
-// (上游网关挂掉本网关改不了,靠反复重试等它自愈只会让同一个组合反复失败)。
-// 拿 5xx 当"抖动"的例子会测错东西。
+// 抖动失败(限流/超时)入队时不能被标成永久:未命中任何管理员关键词的失败
+// 一律按抖动处理,源码不内置任何确定性判据。
 func TestAutoModelFeedbackKeepsTransientFailureTransient(t *testing.T) {
 	c := newAutoModelFeedbackTestContext()
 	start := time.Unix(1700000000, 0)

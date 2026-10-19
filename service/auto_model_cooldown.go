@@ -71,25 +71,13 @@ func AutoModelCooldownSecondTierForValidation() time.Duration {
 	return 2 * time.Duration(operation_setting.AutoModelCooldownBaseMinutes()) * time.Minute
 }
 
-// autoModelPermanentCooldownBase / Max 是"确定性失败"的阶梯:模型不存在、无权、
-// 不支持这类错误重试也不会自愈,所以第一次就冷却一整天,重复犯翻倍、封顶 30 天。
-// 抖动失败(限流、超时、5xx)仍走 15m/6h,不受影响。
-func autoModelPermanentCooldownBase() time.Duration {
-	return operation_setting.AutoModelPermanentCooldownBase()
-}
-
-func autoModelPermanentCooldownMax() time.Duration {
-	return operation_setting.AutoModelPermanentCooldownMax()
-}
-
 // autoModelCooldownState 是一条冷却记录的内存态。
+// 只有抖动(普通)冷却一种:确定性失败不再进冷却,命中关键词的组合会被直接摘除。
 type autoModelCooldownState struct {
 	Until     time.Time
 	Level     int
 	Reason    string
 	UpdatedAt time.Time
-	// Permanent 表示这条冷却来自确定性失败,用的是长阶梯。
-	Permanent bool
 	// Pending writes live with the cached state so clearing the map also resets
 	// recovery state. A pending deletion is a tombstone with a zero Until.
 	pending *autoModelCooldownPendingWrite
@@ -100,7 +88,6 @@ type autoModelCooldownPendingWrite struct {
 	name      string
 	channelID int
 	delete    bool
-	permanent bool
 }
 
 var (
@@ -145,6 +132,15 @@ func loadAutoModelCooldownsLocked() bool {
 			}
 			continue
 		}
+		if row.Permanent {
+			// "永久级冷却"已废弃：确定性失败不再产生冷却（命中关键词的组合会被
+			// 直接摘除）。旧版本留下的 Permanent=true 记录在这里一并清掉——新代码
+			// 没有任何路径会去清除它们，不清就永远挡路。
+			if err := model.DB.Delete(&row).Error; err != nil {
+				common.SysError("failed to purge legacy permanent auto model cooldown: " + err.Error())
+			}
+			continue
+		}
 		until := time.Unix(row.Until, 0)
 		if !until.After(now) {
 			if err := model.DB.Delete(&row).Error; err != nil {
@@ -156,7 +152,6 @@ func loadAutoModelCooldownsLocked() bool {
 			Until:     until,
 			Level:     row.Level,
 			Reason:    row.Reason,
-			Permanent: row.Permanent,
 			UpdatedAt: time.Unix(row.UpdatedAt, 0),
 		}
 	}
@@ -210,25 +205,6 @@ func nextAutoModelCooldown(prev autoModelCooldownState, reason string, now time.
 	if maximum < base {
 		maximum = autoModelCooldownMax
 	}
-	return nextAutoModelCooldownIn(prev, reason, now, base, maximum)
-}
-
-// nextAutoModelPermanentCooldown 是确定性失败的阶梯,只有两档:
-//   - 首犯:冷却 autoModelPermanentCooldownBase()(默认 24 小时);
-//   - 再犯:不再延长冷却,而是直接把该 (分组, 模型, 渠道) 的模型注册删掉
-//     (见 RetireAutoModelCombination)。
-//
-// 为什么不再翻倍到 30 天:确定性失败(模型不存在/无权)重试永远不会好。
-// 挂一个"30 天后还会回来试"的窗口,等于给自己埋一个到期就复发的问题;
-// 而两档处理能让它在第二次就彻底退出候选池,不用等。
-func nextAutoModelPermanentCooldown(prev autoModelCooldownState, reason string, now time.Time) autoModelCooldownState {
-	state := nextAutoModelCooldownIn(prev, reason, now, autoModelPermanentCooldownBase(), autoModelPermanentCooldownMax())
-	state.Permanent = true
-	return state
-}
-
-// nextAutoModelCooldownIn 两条阶梯共用同一套计数,只有窗口参数不同。
-func nextAutoModelCooldownIn(prev autoModelCooldownState, reason string, now time.Time, base, maximum time.Duration) autoModelCooldownState {
 	level := prev.Level + 1
 	window := base
 	for i := 1; i < level; i++ {
@@ -278,64 +254,8 @@ func applyAutoModelCooldown(group, name string, channelID int, success bool, ela
 	// 整条避让就把它们错过了。所以渠道级冷却已移除（历史上的 model='' 记录在载入时清理）。
 }
 
-// tripAutoModelCooldown 让一个 (分组, 模型, 渠道) 组合进入(或加重)冷却。
+// tripAutoModelCooldown 让一个 (分组, 模型, 渠道) 组合进入(或加重)抖动冷却。
 func tripAutoModelCooldown(group, name string, channelID int, reason string, now time.Time) {
-	tripAutoModelCooldownWith(group, name, channelID, reason, now, false)
-}
-
-// RecordAutoModelPermanentFailure 记一次确定性失败(模型不存在/无权/不支持)。
-//
-// 两档处理:
-//   - 首犯(prev.Level == 0):冷却 autoModelPermanentCooldownBase()(默认 24 小时);
-//   - 再犯(prev.Level >= 1):不再延长冷却,直接摘除该 (分组, 模型, 渠道)
-//     组合,让它永久退出候选池。
-//
-// 第二次之后没必要再挂冷却:一个明确"模型在这条渠道上不存在/无权"的组合,
-// 24 小时后再试一次就已经足够宽容了,继续失败只能说明它就是不该被选。
-func RecordAutoModelPermanentFailure(group, name string, channelID int, reason string) {
-	group = strings.TrimSpace(group)
-	name = strings.TrimSpace(name)
-	reason = strings.TrimSpace(reason)
-	if group == "" || name == "" || channelID <= 0 {
-		return
-	}
-
-	// 先看这个组合是否已经吃过一次确定性失败。要在加锁前读,避免摘除流程
-	// 里去拿 model.DB 时与冷却锁互相等待。
-	if autoModelPermanentStrikeCount(group, name, channelID) >= 1 {
-		if err := RetireAutoModelCombination(group, name, channelID, reason); err != nil {
-			common.SysError(fmt.Sprintf("auto model: retire %s(渠道 %d) failed: %s", name, channelID, err.Error()))
-			// 摘除失败就退回冷却,至少别让它在候选池里裸奔。
-			tripAutoModelCooldownWith(group, name, channelID, reason, time.Now(), true)
-		}
-		return
-	}
-
-	tripAutoModelCooldownWith(group, name, channelID, reason, time.Now(), true)
-}
-
-// autoModelPermanentStrikeCount 返回该组合已经记录过几次确定性失败。
-// 只读:不加写锁副作用,拿到的是一致快照。
-func autoModelPermanentStrikeCount(group, name string, channelID int) int {
-	autoModelCooldownMutex.Lock()
-	defer autoModelCooldownMutex.Unlock()
-	ensureAutoModelCooldownsLoadedLocked()
-
-	state, ok := autoModelCooldowns.Get(autoModelHealthKey(group, name, channelID))
-	if !ok {
-		return 0
-	}
-	if !state.Permanent {
-		return 0
-	}
-	// pending.delete 是"已被成功请求清掉"的墓碑,不算已经吃过失败。
-	if state.pending != nil && state.pending.delete {
-		return 0
-	}
-	return state.Level
-}
-
-func tripAutoModelCooldownWith(group, name string, channelID int, reason string, now time.Time, permanent bool) {
 	if group == "" || name == "" || channelID <= 0 {
 		return
 	}
@@ -354,28 +274,41 @@ func tripAutoModelCooldownWith(group, name string, channelID int, reason string,
 		prev = autoModelCooldownState{}
 	}
 	state := nextAutoModelCooldown(prev, reason, now)
-	if permanent {
-		state = nextAutoModelPermanentCooldown(prev, reason, now)
-	}
-	state.pending = &autoModelCooldownPendingWrite{group: group, name: name, channelID: channelID, permanent: state.Permanent}
+	state.pending = &autoModelCooldownPendingWrite{group: group, name: name, channelID: channelID}
 	autoModelCooldowns.Set(key, state)
 	if !persistAutoModelCooldownLocked(key, state) {
-		return
-	}
-	if state.Permanent {
-		common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)进入永久级冷却,%s 后再试,等级 %d,原因:%s",
-			name, channelID, state.Until.Sub(now).Round(time.Second), state.Level, reason))
 		return
 	}
 	common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)进入冷却,%s 后再试,等级 %d,原因:%s",
 		name, channelID, state.Until.Sub(now).Round(time.Second), state.Level, reason))
 }
 
-// clearAutoModelCooldown 正常速度的成功：清掉这个组合的模型级冷却。
-// RetireAutoModelCombination 把一个"确定性失败且已经犯过一次"的 (分组, 模型, 渠道)
-// 组合从候选池里彻底摘掉:从渠道声明的 models 里移除该模型,并同步重建 abilities。
+// RecordAutoModelPermanentFailure 处理一次确定性失败(命中管理员配置的
+// 确定性失败关键词,见 AutoModelPermanentFailure)。
 //
-// 这是"第二次直接删除"——不删除整条渠道(渠道上还有别的模型,凭据与配置都是复用的),
+// 没有冷却档:确定性失败重试也不会好,给它挂一个"过几小时再撞一次"的窗口
+// 只是推迟必然的失败,还会让废组合在窗口到期后再次被选中、再次浪费一次尝试。
+// 命中即把该 (分组, 模型, 渠道) 组合直接摘除(见 RetireAutoModelCombination):
+// 模型从渠道声明里删除、abilities 同步失效;渠道被摘空时自动禁用。
+//
+// 摘除失败(如数据库暂不可用)只记错误日志,组合保持可选,下次再撞上同一失败
+// 会再次尝试摘除——绝不退回抖动冷却,那会让摘除动作被一个 15 分钟窗口顶掉。
+func RecordAutoModelPermanentFailure(group, name string, channelID int, reason string) {
+	group = strings.TrimSpace(group)
+	name = strings.TrimSpace(name)
+	reason = strings.TrimSpace(reason)
+	if group == "" || name == "" || channelID <= 0 {
+		return
+	}
+	if err := RetireAutoModelCombination(group, name, channelID, reason); err != nil {
+		common.SysError(fmt.Sprintf("auto model: retire %s(渠道 %d) failed: %s", name, channelID, err.Error()))
+	}
+}
+
+// RetireAutoModelCombination 把一个命中确定性关键词的 (分组, 模型, 渠道) 组合从
+// 候选池里彻底摘掉:从渠道声明的 models 里移除该模型,并同步重建 abilities。
+//
+// 不删除整条渠道(渠道上还有别的模型,凭据与配置都是复用的),
 // 只摘掉这个不可用的模型。摘除后:
 //   - 该模型不再出现在渠道的 models 里,auto 路由不会再挑中它;
 //   - abilities 表同步失效,显式请求也会立刻得到"无可用渠道",不再打到上游;
@@ -425,7 +358,7 @@ func RetireAutoModelCombination(group, name string, channelID int, reason string
 
 	// 摘除后冷却没有意义;清除以免残留记录干扰面板显示。
 	clearAutoModelCooldown(group, name, channelID, time.Now())
-	common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)确定性失败已达上限,已从渠道模型列表中删除(原因:%s)",
+	common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)命中确定性失败判据,已从渠道模型列表中删除(原因:%s)",
 		name, channelID, reason))
 	return nil
 }
@@ -499,7 +432,6 @@ func persistAutoModelCooldownLocked(key string, state autoModelCooldownState) bo
 		Until:     state.Until.Unix(),
 		Level:     state.Level,
 		Reason:    state.Reason,
-		Permanent: state.Permanent,
 		UpdatedAt: state.UpdatedAt.Unix(),
 	}
 	if err := model.UpsertAutoModelCooldown(row); err != nil {
@@ -537,7 +469,6 @@ type AutoModelCooldownInfo struct {
 	ChannelID        int    `json:"channel_id"`
 	Level            int    `json:"level"`
 	Reason           string `json:"reason"`
-	Permanent        bool   `json:"permanent"`
 	Until            int64  `json:"until"`
 	RemainingSeconds int64  `json:"remaining_seconds"`
 	UpdatedAt        int64  `json:"updated_at"`
@@ -545,10 +476,10 @@ type AutoModelCooldownInfo struct {
 
 // ListAutoModelCooldowns 返回当前仍在冷却的组合,按到期时间从近到远排序。
 //
-// 为什么要它:冷却阶梯是自我强化的(24h 起、翻倍、封顶 30 天),而清除条件是
-// "一次 20 秒内的快速成功"——冷却中的组合根本不会被路由,所以它只能等窗口自然到期。
-// 没有这个入口,管理员在故障时看不到 auto 挡住了谁、为什么、还要多久,
-// 只能手改数据库。共享同一把读锁,不改动任何状态。
+// 为什么要它:抖动冷却阶梯是自我强化的(起步时长起步、翻倍、封顶可配),而清除
+// 条件是"一次 20 秒内的快速成功"——冷却中的组合根本不会被路由,所以它只能等
+// 窗口自然到期。没有这个入口,管理员在故障时看不到 auto 挡住了谁、为什么、还要
+// 多久,只能手改数据库。共享同一把读锁,不改动任何状态。
 func ListAutoModelCooldowns(now time.Time) []AutoModelCooldownInfo {
 	snapshot := autoModelCooldownSnapshot()
 	rows := make([]AutoModelCooldownInfo, 0, len(snapshot))
@@ -566,7 +497,6 @@ func ListAutoModelCooldowns(now time.Time) []AutoModelCooldownInfo {
 			ChannelID:        channelID,
 			Level:            state.Level,
 			Reason:           state.Reason,
-			Permanent:        state.Permanent,
 			Until:            state.Until.Unix(),
 			RemainingSeconds: int64(state.Until.Sub(now).Seconds()),
 			UpdatedAt:        state.UpdatedAt.Unix(),
@@ -611,7 +541,6 @@ func GetAutoModelCooldown(group, name string, channelID int, now time.Time) (Aut
 		ChannelID:        channelID,
 		Level:            state.Level,
 		Reason:           state.Reason,
-		Permanent:        state.Permanent,
 		Until:            state.Until.Unix(),
 		RemainingSeconds: remaining,
 		UpdatedAt:        state.UpdatedAt.Unix(),

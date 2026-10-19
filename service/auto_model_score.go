@@ -1,8 +1,12 @@
 package service
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 	"time"
+
+	"github.com/QuantumNous/new-api/common"
 )
 
 // AutoModelScoreInfo 是"模型得分排序"页面的一条只读明细。
@@ -18,7 +22,6 @@ type AutoModelScoreInfo struct {
 	UpdatedAt     int64   `json:"updated_at"`
 	Cooling       bool    `json:"cooling"`
 	CooldownLevel int     `json:"cooldown_level"`
-	Permanent     bool    `json:"permanent"`
 }
 
 // ListAutoModelScores 返回所有已观察到反馈的 (分组, 模型, 渠道) 得分明细,
@@ -44,7 +47,6 @@ func ListAutoModelScores(now time.Time) []AutoModelScoreInfo {
 		if state, ok := cooldowns[key]; ok && state.Until.After(now) {
 			info.Cooling = true
 			info.CooldownLevel = state.Level
-			info.Permanent = state.Permanent
 		}
 		result = append(result, info)
 	}
@@ -52,4 +54,37 @@ func ListAutoModelScores(now time.Time) []AutoModelScoreInfo {
 		return result[i].Score > result[j].Score
 	})
 	return result
+}
+
+// ClearAutoModelNegativeEffects 一键清除某个 (分组, 模型, 渠道) 组合的负面效果:
+// 得分恢复中立 0.5,延迟惩罚清零,冷却解除。观测次数保留——它只表达置信度,
+// 得分回中后不再携带任何偏差。组合没有观测数据时本就是中立,返回 false 表示无事可做。
+//
+// 只清模型层:渠道层聚合来自该渠道全部模型的共同证据,不属于这一行,
+// 从模型得分页的一颗按钮里清掉它会误伤同渠道其它模型的证据。
+//
+// 持久化无需特殊处理:快照按固定周期把重置后的值 upsert 覆盖旧行,重启后
+// restore 读到的就是中性值(restore 只合并内存缺失的键,不覆盖在线值)。
+func ClearAutoModelNegativeEffects(group, name string, channelID int) bool {
+	group = strings.TrimSpace(group)
+	name = strings.TrimSpace(name)
+	if group == "" || name == "" || channelID <= 0 {
+		return false
+	}
+	key := autoModelHealthKey(group, name, channelID)
+	now := time.Now()
+	cleared := false
+	// Get + Set 而不是 Update:RWMap.Update 对不存在的键也会写入返回值,
+	// 那会在没有观测数据时凭空造出一条零分记录。
+	autoModelScoreMutex.Lock()
+	if current, exists := autoModelHealth.Get(key); exists {
+		autoModelHealth.Set(key, autoModelOutcome{Score: 0.5, Observations: current.Observations, UpdatedAt: now})
+		cleared = true
+	}
+	autoModelScoreMutex.Unlock()
+	if cleared {
+		clearAutoModelCooldown(group, name, channelID, now)
+		common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)的负面效果已清除,得分恢复中立 0.5", name, channelID))
+	}
+	return cleared
 }

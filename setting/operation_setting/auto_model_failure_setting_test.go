@@ -29,7 +29,7 @@ func TestValidateAutoModelPermanentKeyword(t *testing.T) {
 		// 保护项自身:判定里保护项优先,存了也永远不生效。
 		{"protected_by_name", "context_length_exceeded", false},
 		{"protected_inside_longer_phrase", "error: context_length_exceeded", false},
-		// 过于宽泛:命中即 24h 冷却,等于轮着封所有组合。
+		// 过于宽泛:命中即直接摘除该组合,等于轮着把组合删光。
 		{"too_broad_error", "error", false},
 		{"too_broad_chinese", "失败", false},
 		// 但包含这些词的具体短语要放行(精确匹配才拒绝)。

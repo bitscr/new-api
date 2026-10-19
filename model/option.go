@@ -194,7 +194,6 @@ func InitOptionMap() {
 	common.OptionMap["AutoModelCandidates"] = operation_setting.AutoModelCandidatesToJSONString()
 	common.OptionMap["AutoModelWeights"] = operation_setting.AutoModelWeightsToJSONString()
 	common.OptionMap["AutoModelMaxAttempts"] = strconv.Itoa(operation_setting.AutoModelMaxAttempts())
-	common.OptionMap["AutoModelPermanentCooldownHours"] = strconv.Itoa(int(operation_setting.AutoModelPermanentCooldownBase() / time.Hour))
 	common.OptionMap["AutoModelCooldownMaxHours"] = strconv.Itoa(operation_setting.AutoModelCooldownMaxHours())
 	common.OptionMap["AutoModelCooldownBaseMinutes"] = strconv.Itoa(operation_setting.AutoModelCooldownBaseMinutes())
 	common.OptionMap["AutoModelScoreDecayMinutes"] = strconv.Itoa(operation_setting.AutoModelScoreDecayMinutes())
@@ -617,8 +616,6 @@ func updateOptionMap(key string, value string) (err error) {
 		err = operation_setting.SetAutoModelWeights(value)
 	case "AutoModelMaxAttempts":
 		autoModelSetIntOption(value, operation_setting.SetAutoModelMaxAttempts)
-	case "AutoModelPermanentCooldownHours":
-		autoModelSetIntOption(value, operation_setting.SetAutoModelPermanentCooldownHours)
 	case "AutoModelCooldownMaxHours":
 		autoModelSetIntOption(value, operation_setting.SetAutoModelCooldownMaxHours)
 	case "AutoModelCooldownBaseMinutes":

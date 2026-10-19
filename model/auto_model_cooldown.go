@@ -18,8 +18,9 @@ type AutoModelCooldown struct {
 	Until     int64  `json:"until" gorm:"bigint;index"`
 	Level     int    `json:"level"`
 	Reason    string `json:"reason" gorm:"type:varchar(255)"`
-	// Permanent 标记这是"确定性失败"(模型不存在/无权/不支持)的长冷却,
-	// 与限流、超时、5xx 那类会自愈的抖动失败区分开。老行为 false。
+	// Permanent 是历史遗留列:旧版本用它区分"确定性失败"的长冷却,现在确定性
+	// 失败不再产生冷却(命中关键词的组合会被直接摘除),新写入恒为 false,
+	// 存量 Permanent=true 的行在载入时被清掉。列保留是为了不动三库迁移。
 	Permanent bool  `json:"permanent" gorm:"not null;default:false"`
 	UpdatedAt int64 `json:"updated_at" gorm:"bigint"`
 }

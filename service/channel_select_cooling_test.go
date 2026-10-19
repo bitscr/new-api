@@ -26,14 +26,12 @@ func TestMergeCoolingAutoModelChannelIDs(t *testing.T) {
 
 	excluded := map[int]bool{}
 	mergeCoolingAutoModelChannelIDs(c, "default", "m1", excluded)
-	require.Empty(t, excluded, "无冷却时排除集为空")
-
-	RecordAutoModelPermanentFailure("default", "m1", 1, "测试")
+	require.Empty(t, excluded, "无冷却时排除集为空")	tripAutoModelCooldown("default", "m1", 1, "测试", time.Now())
 	tripAutoModelCooldown("default", "m1", 2, "测试", time.Now())
 	excluded = map[int]bool{}
 	mergeCoolingAutoModelChannelIDs(c, "default", "m1", excluded)
-	require.True(t, excluded[1], "确定性冷却的渠道必须被排除")
-	require.True(t, excluded[2], "抖动冷却的渠道必须被排除")
+	require.True(t, excluded[1], "冷却中的渠道必须被排除")
+	require.True(t, excluded[2], "冷却中的渠道必须被排除")
 
 	other := map[int]bool{}
 	mergeCoolingAutoModelChannelIDs(c, "default", "m2", other)
@@ -57,8 +55,7 @@ func TestNamedSelectionSkipsCoolingChannels(t *testing.T) {
 		{Group: "g", Model: "m1", ChannelId: 1, Enabled: true},
 		{Group: "g", Model: "m1", ChannelId: 2, Enabled: true},
 	}).Error)
-
-	RecordAutoModelPermanentFailure("g", "m1", 1, "测试")
+	tripAutoModelCooldown("g", "m1", 1, "测试", time.Now())
 
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -70,8 +67,7 @@ func TestNamedSelectionSkipsCoolingChannels(t *testing.T) {
 		require.NotNil(t, channel)
 		require.Equal(t, 2, channel.Id, "冷却中的渠道 1 不得被具名选路选中")
 	}
-
-	RecordAutoModelPermanentFailure("g", "m1", 2, "测试")
+	tripAutoModelCooldown("g", "m1", 2, "测试", time.Now())
 	channel, _, err := CacheGetRandomSatisfiedChannel(param)
 	require.Nil(t, channel, "全部冷却时不得选中任何渠道")
 	_ = err

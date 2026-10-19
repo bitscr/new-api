@@ -27,8 +27,7 @@ func TestAutoModelCapabilityFailureRecognizesFeatureWording(t *testing.T) {
 		{"audio-cn", "不支持音频输入", "audio"},
 		// 泛化措辞刻意不收:可能是请求体别的字段写错,算到模型头上会误伤。
 		{"generic-unsupported-parameter", "unsupported parameter: temperature", ""},
-		{"generic-invalid-request", "invalid request: messages[0].content", ""},
-		// "模型不存在"是组合级问题,不是能力问题,必须留给永久判据。
+		{"generic-invalid-request", "invalid request: messages[0].content", ""},		// "模型不存在"是组合级问题,不是能力问题,必须留给关键词判据。
 		{"model-not-found", "the model gpt-5 does not exist", ""},
 		{"empty", "", ""},
 	}
@@ -42,19 +41,18 @@ func TestAutoModelCapabilityFailureRecognizesFeatureWording(t *testing.T) {
 	require.Empty(t, AutoModelCapabilityFailure(nil))
 }
 
-// 能力不匹配要同时做对两件事,它们分属两个不同的判定,别把它们混起来:
+// 能力不匹配只影响重试作用域:换模型而不是换渠道。同一条上游的同名模型通常
+// 一样不支持,换渠道是白跑;而 400 默认不在重试状态码区间里,不提前判用户会
+// 直接拿到 400。
 //
-//   - 冷却档位:按确定性失败处理(首犯 24 小时,再犯摘除该组合)。本网关的 auto
-//     主要用于工具调用,一个给不了 tools 的模型对这个用途就是废的;不摘掉它会被
-//     反复选中、每次白费一次尝试。
-//   - 重试作用域:换模型而不是换渠道。同一条上游的同名模型通常一样不支持,
-//     换渠道是白跑;而 400 默认不在重试状态码区间里,不提前判用户会直接拿到 400。
-func TestAutoModelCapabilityFailureIsPermanentAndRetriesWithAnotherModel(t *testing.T) {
+// 它不再是内置的确定性判据:未配置确定性关键词时,这类失败按抖动失败处理;
+// 管理员把能力措辞配成关键词后才会升级(见 TestAutoModelCapabilityFailureHonoursAdminKeyword)。
+func TestAutoModelCapabilityFailureRetriesWithAnotherModel(t *testing.T) {
 	for _, status := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity} {
 		err := types.NewOpenAIError(errors.New("tool calling is not supported"),
 			types.ErrorCode("invalid_request_error"), status)
-		require.True(t, AutoModelPermanentFailure(err),
-			"能力不匹配是确定性失败,状态码 %d 也不例外", status)
+		require.False(t, AutoModelPermanentFailure(err),
+			"能力措辞不再是内置判据,状态码 %d 也不例外", status)
 		require.Equal(t, AutoModelRetryNextModel, ClassifyAutoModelRetry(err),
 			"必须换模型,而且要在状态码白名单之前判——400 默认不可重试")
 	}
@@ -74,8 +72,8 @@ func TestAutoModelCapabilityFailureDoesNotOverrideChannelOrLocalDecisions(t *tes
 		"本地请求体错误保持不重试")
 }
 
-// 能力措辞写成永久关键词要照常生效:管理员抄一次日志就应该能把它升级成长冷却,
-// 这也是内置关键词表里那条 "function calling is not supported" 依赖的机制。
+// 能力措辞写成永久关键词要照常生效:管理员抄一次日志就应该能把这类失败
+// 判成确定性失败(命中即直接摘除组合)。
 func TestAutoModelCapabilityFailureHonoursAdminKeyword(t *testing.T) {
 	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
 	operation_setting.SetAutoModelPermanentKeywords("tool calling is not supported")
@@ -85,21 +83,25 @@ func TestAutoModelCapabilityFailureHonoursAdminKeyword(t *testing.T) {
 	require.True(t, AutoModelPermanentFailure(err))
 }
 
-// 上游网关/CF 侧的 5xx 一律按确定性失败处理:这些是上游的问题,本网关改不了,
-// 靠"每 15 分钟再撞一次"等它自愈只会让同一个组合反复被选中、反复失败。
-//
-// 判状态码而不是关键词是有原因的:RelayErrorHandler 把这类失败渲染成
-// "bad response status code 524",旧的关键词写法 "status code: 524" 带冒号,
-// 子串匹配永远命中不了——它们过去表现成抖动冷却,只是因为认不出的失败默认走抖动档。
-func TestUpstreamGatewayStatusCodesArePermanent(t *testing.T) {
+// 上游网关/CF 侧的 5xx 不再有内置的确定性判定:源码不内置状态码判据,未配置
+// 关键词时它们按抖动失败走普通冷却阶梯。管理员想摘掉某个组合,把对应文案配成
+// 确定性关键词即可(注意 RelayErrorHandler 把这类失败渲染成
+// "bad response status code 524",没有冒号,关键词要按这个写法配)。
+func TestUpstreamGatewayStatusCodesStayTransientWithoutKeywords(t *testing.T) {
 	for _, status := range []int{
 		http.StatusGatewayTimeout, 520, 521, 522, 523, 524, 525, 526, 527,
 	} {
 		err := types.NewOpenAIError(
 			errors.New("bad response status code"), types.ErrorCode("bad_response_status_code"), status)
-		require.True(t, AutoModelPermanentFailure(err),
-			"上游网关故障(HTTP %d)必须按确定性失败处理,否则它永远删不掉", status)
+		require.False(t, AutoModelPermanentFailure(err),
+			"未配置关键词时 HTTP %d 不得被判成确定性失败", status)
 	}
+
+	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
+	operation_setting.SetAutoModelPermanentKeywords("status code 524")
+	err := types.NewOpenAIError(
+		errors.New("bad response status code 524"), types.ErrorCode("bad_response_status_code"), 524)
+	require.True(t, AutoModelPermanentFailure(err), "配置关键词后按正文命中")
 
 	// 限流仍是抖动失败:冷却阶梯才是它该待的地方。
 	rateLimited := types.NewOpenAIError(errors.New("rpm exhausted"),

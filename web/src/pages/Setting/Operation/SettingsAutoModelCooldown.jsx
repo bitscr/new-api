@@ -18,7 +18,7 @@ For licensing inquiries, please open an issue at https://github.com/bitscr/new-a
 */
 
 import React, { useCallback, useEffect, useState } from 'react';
-import { Button, Empty, Modal, Table, Tag, Typography } from '@douyinfe/semi-ui';
+import { Button, Empty, Modal, Table, Typography } from '@douyinfe/semi-ui';
 import { API, showError, showSuccess } from '../../../helpers';
 import { useTranslation } from 'react-i18next';
 
@@ -119,16 +119,6 @@ export default function SettingsAutoModelCooldown() {
       title: t('渠道'),
       dataIndex: 'channel_id',
       render: (value) => `#${value}`,
-    },
-    {
-      title: t('类型'),
-      dataIndex: 'permanent',
-      render: (permanent) =>
-        permanent ? (
-          <Tag color='red'>{t('确定性失败(长冷却)')}</Tag>
-        ) : (
-          <Tag color='orange'>{t('抖动失败(短冷却)')}</Tag>
-        ),
     },
     {
       title: t('剩余时间'),

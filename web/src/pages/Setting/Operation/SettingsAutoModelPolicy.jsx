@@ -40,7 +40,6 @@ const { Text } = Typography;
 
 const AUTO_MODEL_OPTION_KEYS = [
   'AutoModelMaxAttempts',
-  'AutoModelPermanentCooldownHours',
   'AutoModelCooldownMaxHours',
   'AutoModelCooldownBaseMinutes',
   'AutoModelScoreDecayMinutes',
@@ -53,87 +52,47 @@ const AUTO_MODEL_OPTION_KEYS = [
 // 后者每加一个文本项就要记得补一次排除,漏一个就报错(实测漏过 Transient)。
 const AUTO_MODEL_NUMERIC_KEYS = [
   'AutoModelMaxAttempts',
-  'AutoModelPermanentCooldownHours',
   'AutoModelCooldownMaxHours',
   'AutoModelCooldownBaseMinutes',
   'AutoModelScoreDecayMinutes',
   'AutoModelScoreRefreshSeconds',
 ];
 
-// 关键词键与数值键必须正好构成上面那张总表,漏一个就会出现"存了但不校验"
-// 或"校验了但没存"的错配。改这张表时这里会立刻报出来。
-const AUTO_MODEL_KEYWORD_KEYS = [
-  'AutoModelPermanentKeywords',
-  'AutoModelTransientKeywords',
-];
-
 // 数值项的中文名。报错信息里要用人能看懂的名字,否则管理员看到的是一串
 // OptionMap key。这里的每一项都必须也在语言包里,漏一个就会显示原文。
 const NUMERIC_LABELS = {
   AutoModelMaxAttempts: 'auto 单请求最大尝试次数',
-  AutoModelPermanentCooldownHours: '确定性失败冷却时长(小时)',
   AutoModelCooldownMaxHours: '普通冷却封顶(小时)',
   AutoModelCooldownBaseMinutes: '普通冷却起始时间(分钟)',
   AutoModelScoreDecayMinutes: '评分衰减窗口(分钟)',
   AutoModelScoreRefreshSeconds: '模型得分页面刷新间隔(秒)',
 };
 
-// 本机在用的"普通冷却"关键词:命中后强制只走抖动冷却(15m 起步的阶梯),
-// 绝不升级为确定性失败。用于把其实会自愈、却被确定性判据误伤的错误钉回来。
-//
-// 内容与后端 setting/operation_setting 的 autoModelBuiltinTransientKeywords 一致。
-// 后端才是权威来源(未配置时 GET /api/option/ 会回显后端内置值,直接覆盖这里);
-// 这里保留一份是为了在接口返回前/失败时输入框不为空。
-//
-// 这里不再收 520/524:它们是上游/CF 侧的问题,后端已按确定性失败处理
-// (冷却 → 再犯摘除),留在这里反而会把它们钉回抖动档、永远删不掉。
-const DEFAULT_TRANSIENT_KEYWORDS = [
-  // 限流是明确的临时状态,冷却窗口本来就有更合适的阶梯。
-  'rpm exhausted',
-  'token plan entitlement exhausted',
-  // 上游自己的容量/健康问题,不是模型不存在。
-  'all candidates failed',
-  'upstream_response_timeout',
-];
-// 内容与后端 autoModelBuiltinPermanentKeywords 一致(后端为权威来源,理由同上)。
-const DEFAULT_PERMANENT_KEYWORDS = [
-  // 上游明说"这个模型我不提供"——结构化 code 缺失时的自然语言兜底
-  '模型不可用',
-  '模型不存在',
-  'model not found',
-  'community model not found',
-  // 已实证会复发:某个上游确实不支持的确定性能力。
-  // 本网关的 auto 主要用于工具调用,给不了 tools 的模型对这个用途就是废的,
-  // 应当冷却并在再犯时摘除,而不是留着被反复选中、每次白费一次尝试。
-  'function calling is not supported',
-  // 账号/密钥级确定性失败:换了模型也一样,重试没有意义
-  'invalid_api_key',
-  'invalid_authentication',
-  // 明确的状态码(可写数字,判定用子串匹配 “status code: 404” 这类文本)
-  'status code: 404',
-];
+// 判据(两份关键词表)完全以数据库里的值为准:前端不做任何预填,
+// 后端 GET /api/option/ 回显什么,输入框里就是什么。
+// 命中"确定性失败关键词"的组合会被直接从渠道里删除(不再有冷却等待);
+// 命中"普通冷却关键词"的失败强制走抖动冷却阶梯。
 
 /**
  * auto 的失败判据与时长。
  *
  * 判据硬编码认不出上游冒出的新错误串,那些失败只会拿 15 分钟冷却然后被反复重试。
- * 这里让管理员把日志里看到的永久性报错补成关键词,以及调整四个时长/次数上限。
+ * 这里让管理员把日志里看到的永久性报错补成关键词,以及调整几个时长/次数上限。
  *
- * 红线:关键词只对真实业务请求的失败生效,只升级冷却时长,作用域仍是单个
- * (模型, 渠道) 组合——不会禁用渠道,也不引入任何主动探测。
+ * 红线:关键词只对真实业务请求的失败生效,作用域仍是单个 (模型, 渠道) 组合——
+ * 不会禁用渠道(渠道被删空时才会自动禁用),也不引入任何主动探测。
  */
 export default function SettingsAutoModelPolicy(props) {
   const { t } = useTranslation();
   const [loading, setLoading] = useState(false);
   const [inputs, setInputs] = useState({
     AutoModelMaxAttempts: '4',
-    AutoModelPermanentCooldownHours: '24',
     AutoModelCooldownMaxHours: '6',
     AutoModelCooldownBaseMinutes: '15',
     AutoModelScoreDecayMinutes: '360',
     AutoModelScoreRefreshSeconds: '60',
-    AutoModelPermanentKeywords: DEFAULT_PERMANENT_KEYWORDS.join('\n'),
-    AutoModelTransientKeywords: DEFAULT_TRANSIENT_KEYWORDS.join('\n'),
+    AutoModelPermanentKeywords: '',
+    AutoModelTransientKeywords: '',
   });
   const refForm = useRef();
   const [inputsRow, setInputsRow] = useState(inputs);
@@ -214,15 +173,6 @@ export default function SettingsAutoModelPolicy(props) {
         currentInputs[key] = inputs[key];
         continue;
       }
-      // 关键词表是文本:后端未配置时回显空串,直接采用会把前端预填清掉,
-      // 管理员打开看到空框、以为没有内置判据。空串一律保留预填值。
-      if (
-        AUTO_MODEL_KEYWORD_KEYS.includes(key) &&
-        String(fromApi).trim() === ''
-      ) {
-        currentInputs[key] = inputs[key];
-        continue;
-      }
       currentInputs[key] = String(fromApi);
     }
     setInputs(currentInputs);
@@ -242,7 +192,7 @@ export default function SettingsAutoModelPolicy(props) {
           <Banner
             type='info'
             description={t(
-              '判据只影响 auto 请求真实失败的冷却时长,作用域是「模型 + 渠道」组合,不会禁用渠道。',
+              '确定性关键词命中后会把该模型从这条渠道里直接删除(渠道被删空时自动禁用);其余失败按普通冷却阶梯处理。作用域是「模型 + 渠道」组合,不会禁用渠道本身。',
             )}
             style={{ marginBottom: 16 }}
           />
@@ -286,22 +236,6 @@ export default function SettingsAutoModelPolicy(props) {
                   setInputs({
                     ...inputs,
                     AutoModelCooldownMaxHours: String(value),
-                  })
-                }
-              />
-            </Col>
-            <Col xs={24} sm={12} md={8} lg={8} xl={8}>
-              <Form.InputNumber
-                field={'AutoModelPermanentCooldownHours'}
-                label={t('确定性失败冷却时长(小时)')}
-                min={1}
-                extraText={t(
-                  '默认 24。确定性失败(模型不存在/无权/不支持)首犯冷却这么久,再犯直接把该模型从渠道里删除,不再逐级延长',
-                )}
-                onChange={(value) =>
-                  setInputs({
-                    ...inputs,
-                    AutoModelPermanentCooldownHours: String(value),
                   })
                 }
               />
@@ -350,7 +284,7 @@ export default function SettingsAutoModelPolicy(props) {
                   '一行一个,不区分大小写;中文文案、英文词语、状态码都可以',
                 )}
                 extraText={t(
-                  '在错误正文、错误码、错误类型里做子串匹配。命中后:首犯按「确定性失败冷却时长」冷却(默认 24 小时),再犯直接把该模型从这条渠道里删除(不删渠道)。上文已预填本机在用的判据。上下文超长永远按抖动处理,不受此处影响。',
+                  '在错误正文、错误码、错误类型里做大小写不敏感的子串匹配。命中后:直接把该模型从这条渠道里删除(不删渠道),不再有冷却等待。上下文超长永远按抖动处理,不受此处影响。',
                 )}
                 autosize={{ minRows: 8, maxRows: 16 }}
                 onChange={(value) =>
@@ -359,7 +293,7 @@ export default function SettingsAutoModelPolicy(props) {
               />
               <Text type='tertiary'>
                 {t(
-                  '三种写法都支持:中文文案(模型不可用)、英文词语(model not found)、状态码(status code: 404)。不建议加入:insufficient_user_quota(余额问题)、ReasoningEffort invalid(请求参数写错,不是模型不可用)。',
+                  '三种写法都支持:中文文案(模型不可用)、英文词语(model not found)、状态码(status code 524)。判据只以这里保存的值为准,源码不内置任何条目。',
                 )}
               </Text>
             </Col>
@@ -373,25 +307,20 @@ export default function SettingsAutoModelPolicy(props) {
                   '一行一个,不区分大小写;中文文案、英文词语、状态码都可以',
                 )}
                 extraText={t(
-                  '优先级最高:命中后这次失败只按普通抖动冷却处理(以「普通冷却起始时间」起步的阶梯),绝不升级成确定性冷却档、也不会删除模型。用来把其实会自愈的错误钉在这一档,防止被上面的确定性判据误伤。上文已预填本机在用的判据。',
+                  '优先级最高:命中后这次失败只按普通抖动冷却处理(以「普通冷却起始时间」起步的阶梯),绝不会命中确定性关键词、也不会删除模型。用来把其实会自愈的错误钉在这一档,防止被上面的确定性关键词误伤。',
                 )}
                 autosize={{ minRows: 6, maxRows: 14 }}
                 onChange={(value) =>
                   setInputs({ ...inputs, AutoModelTransientKeywords: value })
                 }
               />
-              <Text type='tertiary'>
-                {t(
-                  '本机预填:rpm exhausted、token plan entitlement exhausted、all candidates failed、upstream_response_timeout。',
-                )}
-              </Text>
               <Text
                 type='tertiary'
                 size='small'
                 style={{ display: 'block', marginTop: 4 }}
               >
                 {t(
-                  '520/524 等上游网关故障已由后端按状态码直接判为确定性失败(冷却 → 再犯摘除),不要写在这里:那会把它们钉回抖动档,永远删不掉。',
+                  '上游网关类故障(如 520/524)不再由后端状态码内置判定;若想让某个失败只走普通冷却,把它的文案写在这里即可。',
                 )}
               </Text>
             </Col>

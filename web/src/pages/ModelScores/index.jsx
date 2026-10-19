@@ -19,15 +19,17 @@ For licensing inquiries, please open an issue at https://github.com/bitscr/new-a
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Button,
   Card,
   Input,
+  Popconfirm,
   Select,
   Spin,
   Table,
   Tag,
   Typography,
 } from '@douyinfe/semi-ui';
-import { API, showError } from '../../helpers';
+import { API, isRoot, showError, showSuccess } from '../../helpers';
 import { useTranslation } from 'react-i18next';
 
 const { Text } = Typography;
@@ -63,6 +65,7 @@ const ModelScores = () => {
   const [refreshSeconds, setRefreshSeconds] = useState(DEFAULT_REFRESH_SECONDS);
   const [keyword, setKeyword] = useState('');
   const [group, setGroup] = useState('');
+  const [pageSize, setPageSize] = useState(20);
   const timerRef = useRef();
 
   const load = async (showSpinner = true) => {
@@ -103,6 +106,29 @@ const ModelScores = () => {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshSeconds]);
+
+  // 一键清除某个 (分组, 模型, 渠道) 组合的负面效果:得分恢复中立 0.5,冷却解除。
+  // 仅 root 可用:接口挂在 /api/option/ 的 RootAuth 路由组下。
+  const clearNegative = async (record) => {
+    try {
+      const res = await API.delete('/api/option/auto_model_scores', {
+        params: {
+          group: record.group,
+          model: record.model,
+          channel_id: record.channel_id,
+        },
+      });
+      const { success, message } = res.data;
+      if (!success) {
+        showError(message || t('清除失败'));
+        return;
+      }
+      showSuccess(t('已恢复中立得分'));
+      await load(false);
+    } catch (error) {
+      showError(t('清除失败'));
+    }
+  };
 
   const groupOptions = useMemo(() => {
     const set = new Set(rows.map((row) => row.group).filter(Boolean));
@@ -167,10 +193,8 @@ const ModelScores = () => {
       dataIndex: 'cooling',
       render: (value, record) => {
         if (!value) return <Tag color='grey'>{t('正常')}</Tag>;
-        const text = record.permanent
-          ? t('永久级 Lv.{{level}}', { level: record.cooldown_level })
-          : t('冷却 Lv.{{level}}', { level: record.cooldown_level });
-        return <Tag color={record.permanent ? 'red' : 'orange'}>{text}</Tag>;
+        const text = t('冷却 Lv.{{level}}', { level: record.cooldown_level });
+        return <Tag color='orange'>{text}</Tag>;
       },
     },
     {
@@ -179,6 +203,23 @@ const ModelScores = () => {
       render: (value) => formatTime(value),
     },
   ];
+
+  // 只有 root 能清除负面效果;普通用户看不到这一列。
+  if (isRoot()) {
+    columns.push({
+      title: t('操作'),
+      dataIndex: 'op',
+      render: (_, record) => (
+        <Popconfirm
+          title={t('确定清除该组合的负面效果？')}
+          content={t('得分将恢复中立 0.5,并解除冷却')}
+          onConfirm={() => clearNegative(record)}
+        >
+          <Button size='small'>{t('清除负面效果')}</Button>
+        </Popconfirm>
+      ),
+    });
+  }
 
   return (
     <div className='mt-[60px] px-2'>
@@ -218,7 +259,12 @@ const ModelScores = () => {
           <Table
             columns={columns}
             dataSource={filteredRows}
-            pagination={{ pageSize: 20 }}
+            pagination={{
+              pageSize,
+              pageSizeOpts: [10, 20, 50, 100],
+              showSizeChanger: true,
+              onPageSizeChange: setPageSize,
+            }}
             rowKey={(record) =>
               `${record.group}\u0000${record.model}\u0000${record.channel_id}`
             }
