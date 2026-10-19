@@ -142,6 +142,38 @@ func TestAutoModelCooldownExpiry(t *testing.T) {
 	require.Empty(t, cooldownRows(t), "过期记录应被清掉")
 }
 
+// GetAutoModelCooldown 暴露给报错日志读取当前冷却等级与类别。
+func TestGetAutoModelCooldown(t *testing.T) {
+	setupAutoModelCooldownTestDB(t)
+	group := "default"
+	now := time.Now()
+
+	// 抖动冷却:失败一次 → level 1, permanent=false
+	applyAutoModelCooldown(group, "m", 1, false, 100)
+	info, ok := GetAutoModelCooldown(group, "m", 1, now)
+	require.True(t, ok)
+	require.Equal(t, 1, info.Level)
+	require.False(t, info.Permanent)
+	require.Greater(t, info.RemainingSeconds, int64(0))
+
+	// 再失败一次 → level 2
+	applyAutoModelCooldown(group, "m", 1, false, 100)
+	info, ok = GetAutoModelCooldown(group, "m", 1, now)
+	require.True(t, ok)
+	require.Equal(t, 2, info.Level)
+
+	// 永久冷却:首犯 → level 1, permanent=true
+	RecordAutoModelPermanentFailure(group, "p", 2, "模型不存在")
+	info, ok = GetAutoModelCooldown(group, "p", 2, now)
+	require.True(t, ok)
+	require.True(t, info.Permanent)
+	require.Equal(t, 1, info.Level)
+
+	// 不存在的组合
+	_, ok = GetAutoModelCooldown(group, "nope", 9, now)
+	require.False(t, ok)
+}
+
 // 候选过滤：严格剔除"所有渠道都在冷却"的模型；全部被剔除时保持空。
 func TestExcludeCoolingCandidates(t *testing.T) {
 	candidates := []string{"model-a", "slow-model", "model-c"}

@@ -45,6 +45,8 @@ const (
 	// 记忆就该留多久,否则最高几档解冻时扣分已经是 0,冷却只剩"等时间"。
 	// 这两者的关系由配置校验强制(见 controller/option.go)。
 	autoModelDefaultScoreDecayMinutes = 360
+	// autoModelDefaultScoreRefreshSeconds 是"模型得分"前台页面的自动刷新间隔(秒)。
+	autoModelDefaultScoreRefreshSeconds = 60
 )
 
 // AutoModelCapabilityText 是一条"上游明说这个模型不提供某种能力"的判据。
@@ -198,6 +200,7 @@ var (
 	autoModelCooldownMaxHours       = autoModelDefaultCooldownMaxHours
 	autoModelCooldownBaseMinutes    = autoModelDefaultCooldownBaseMinutes
 	autoModelScoreDecayMinutes      = autoModelDefaultScoreDecayMinutes
+	autoModelScoreRefreshSeconds    = autoModelDefaultScoreRefreshSeconds
 	// autoModelPermanentKeywords 是管理员补充的确定性失败关键词(一行一个)。
 	// 命中即把该失败升级为长冷却,作用域仍是单个 (group, model, channel)。
 	//
@@ -229,6 +232,8 @@ func InitAutoModelSettingsFromEnv() {
 		common.GetEnvOrDefault("AUTO_MODEL_COOLDOWN_BASE_MINUTES", autoModelDefaultCooldownBaseMinutes), 1)
 	autoModelScoreDecayMinutes = sanitizePositive(
 		common.GetEnvOrDefault("AUTO_MODEL_SCORE_DECAY_MINUTES", autoModelDefaultScoreDecayMinutes), 1)
+	autoModelScoreRefreshSeconds = sanitizePositive(
+		common.GetEnvOrDefault("AUTO_MODEL_SCORE_REFRESH_SECONDS", autoModelDefaultScoreRefreshSeconds), 1)
 }
 
 // sanitizePositive 把不可能的数值收敛到默认值,避免面板写进 0 或负数。
@@ -360,6 +365,20 @@ func SetAutoModelScoreDecayMinutes(value int) {
 	autoModelSettingsMutex.Lock()
 	defer autoModelSettingsMutex.Unlock()
 	autoModelScoreDecayMinutes = sanitizePositive(value, 1)
+}
+
+// AutoModelScoreRefreshSeconds 是"模型得分"前台页面的自动刷新间隔(秒,至少 1)。
+func AutoModelScoreRefreshSeconds() int {
+	autoModelSettingsMutex.RLock()
+	defer autoModelSettingsMutex.RUnlock()
+	return autoModelScoreRefreshSeconds
+}
+
+// SetAutoModelScoreRefreshSeconds 面板写入路径(秒,至少 1)。
+func SetAutoModelScoreRefreshSeconds(value int) {
+	autoModelSettingsMutex.Lock()
+	defer autoModelSettingsMutex.Unlock()
+	autoModelScoreRefreshSeconds = sanitizePositive(value, 1)
 }
 
 // AutoModelTransientKeywords 返回"按普通冷却处理"判据的副本。

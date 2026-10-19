@@ -373,7 +373,7 @@ func UpdateOption(c *gin.Context) {
 			return
 		}
 	case "AutoModelMaxAttempts", "AutoModelPermanentCooldownHours", "AutoModelCooldownMaxHours",
-		"AutoModelCooldownBaseMinutes", "AutoModelScoreDecayMinutes":
+		"AutoModelCooldownBaseMinutes", "AutoModelScoreDecayMinutes", "AutoModelScoreRefreshSeconds":
 		// 这些都是"至少 1"的正整数;写 0 或负数会直接让 auto 不可用。
 		// (确定性失败已无"封顶天数"选项:首犯 24h、再犯直接摘除模型。)
 		parsed, parseErr := strconv.Atoi(strings.TrimSpace(option.Value.(string)))

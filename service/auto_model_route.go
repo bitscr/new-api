@@ -26,6 +26,52 @@ type AutoModelRoute struct {
 }
 
 const autoModelRoutePlanContextKey = "auto_model_route_plan"
+const autoModelFailedModelsContextKey = "auto_model_failed_models"
+
+func autoModelFailedModelKey(group, modelName string) string {
+	return strings.TrimSpace(group) + "\x00" + strings.TrimSpace(modelName)
+}
+
+// MarkAutoModelModelFailed records a model-scoped retry failure for this request.
+// The exclusion is intentionally request-local and group-scoped: persistent
+// cooldowns remain per (group, model, channel), while a model-scoped upstream
+// error must not send this request to the same model on another channel.
+func MarkAutoModelModelFailed(c *gin.Context, group, modelName string) {
+	group = strings.TrimSpace(group)
+	modelName = strings.TrimSpace(modelName)
+	if c == nil || group == "" || modelName == "" {
+		return
+	}
+	excluded := getAutoModelFailedModels(c)
+	excluded[autoModelFailedModelKey(group, modelName)] = true
+	c.Set(autoModelFailedModelsContextKey, excluded)
+}
+
+// IsAutoModelModelFailed reports whether this request has already seen a
+// model-scoped failure for the concrete group/model pair.
+func IsAutoModelModelFailed(c *gin.Context, group, modelName string) bool {
+	group = strings.TrimSpace(group)
+	modelName = strings.TrimSpace(modelName)
+	if c == nil || group == "" || modelName == "" {
+		return false
+	}
+	return getAutoModelFailedModels(c)[autoModelFailedModelKey(group, modelName)]
+}
+
+func getAutoModelFailedModels(c *gin.Context) map[string]bool {
+	result := make(map[string]bool)
+	if c == nil {
+		return result
+	}
+	value, _ := c.Get(autoModelFailedModelsContextKey)
+	source, _ := value.(map[string]bool)
+	for key, failed := range source {
+		if failed {
+			result[key] = true
+		}
+	}
+	return result
+}
 
 // This tolerance absorbs floating-point noise only. Genuinely different scores
 // (for example 0.60 and 0.59) never share a weighted-random selection band.
@@ -121,6 +167,9 @@ type autoModelRouteSnapshot struct {
 	// "本次请求已经打过的那一条路"。重试时用它,让新计划天然从"还没试过的最优路"开头。
 	// nil 表示不额外排除任何路由。
 	ExcludedRoutes map[AutoModelRoute]bool
+	// ExcludedModels drops all routes for a request-scoped model failure in
+	// the concrete group, without changing persistent cooldown granularity.
+	ExcludedModels map[string]bool
 	Now            time.Time
 }
 
@@ -152,7 +201,8 @@ func BuildAutoModelRoutesForRequest(c *gin.Context, group string) ([]AutoModelRo
 }
 
 // RebuildAutoModelRoutePlanForRetry re-derives the ordered plan for the same
-// request group from a fresh health snapshot, dropping every route in attempted.
+// request group from a fresh health snapshot, dropping every route in attempted
+// and every model marked failed by a model-scoped retry decision.
 //
 // Why a retry must re-plan rather than advance the plan it was given: the plan is
 // ordered from the health visible when middleware ran. Any feedback produced by
@@ -161,10 +211,10 @@ func BuildAutoModelRoutesForRequest(c *gin.Context, group string) ([]AutoModelRo
 // one sits further down — and with AutoModelMaxAttempts at 4, "further down" is
 // often unreachable.
 //
-// This is a pure re-ordering, never a loss: the plan is a permutation of the whole
-// candidate route set (every eligible 模型×渠道 pair appears exactly once), so the
-// rebuilt list contains every route the old one had, minus what is now attempted,
-// cooling or hard-excluded. Those are exactly the routes a retry must not reuse.
+// This is a re-ordering of the still-eligible route set: every eligible 模型×渠道
+// pair appears at most once, while attempted routes, request-failed models, cooling
+// routes and hard-excluded channels are removed. A model-scoped failure therefore
+// cannot return through another channel during the same request.
 //
 // It returns nil when the plan cannot be rebuilt — auto disabled, no request group
 // recorded, nothing attempted yet, or nothing left to try — and callers must then
@@ -225,6 +275,7 @@ func buildAutoModelRoutesForRequest(c *gin.Context, group string, exclude map[Au
 	}
 	snapshot := newAutoModelRouteSnapshot(GetAutoModelHardExcludedChannelIDs(c))
 	snapshot.ExcludedRoutes = exclude
+	snapshot.ExcludedModels = getAutoModelFailedModels(c)
 	var routes []AutoModelRoute
 	hasCandidates, hasAuthorizedCandidates := false, false
 	seenGroups := make(map[string]bool, len(groups))
@@ -357,6 +408,9 @@ func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapsho
 			continue
 		}
 		seenModels[name] = true
+		if snapshot.ExcludedModels[autoModelFailedModelKey(group, name)] {
+			continue
+		}
 		modelWeight := autoModelRouteWeight(group, name, snapshot.ModelWeights)
 		if !positiveAutoModelWeight(modelWeight) {
 			continue

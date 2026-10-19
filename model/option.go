@@ -198,6 +198,7 @@ func InitOptionMap() {
 	common.OptionMap["AutoModelCooldownMaxHours"] = strconv.Itoa(operation_setting.AutoModelCooldownMaxHours())
 	common.OptionMap["AutoModelCooldownBaseMinutes"] = strconv.Itoa(operation_setting.AutoModelCooldownBaseMinutes())
 	common.OptionMap["AutoModelScoreDecayMinutes"] = strconv.Itoa(operation_setting.AutoModelScoreDecayMinutes())
+	common.OptionMap["AutoModelScoreRefreshSeconds"] = strconv.Itoa(operation_setting.AutoModelScoreRefreshSeconds())
 	common.OptionMap["AutoModelPermanentKeywords"] = operation_setting.AutoModelPermanentKeywordsToString()
 	common.OptionMap["AutoModelTransientKeywords"] = operation_setting.AutoModelTransientKeywordsToString()
 	common.OptionMap["AutoModelPriorityOverrideMargin"] = strconv.FormatFloat(
@@ -624,6 +625,8 @@ func updateOptionMap(key string, value string) (err error) {
 		autoModelSetIntOption(value, operation_setting.SetAutoModelCooldownBaseMinutes)
 	case "AutoModelScoreDecayMinutes":
 		autoModelSetIntOption(value, operation_setting.SetAutoModelScoreDecayMinutes)
+	case "AutoModelScoreRefreshSeconds":
+		autoModelSetIntOption(value, operation_setting.SetAutoModelScoreRefreshSeconds)
 	case "AutoModelPermanentKeywords":
 		operation_setting.SetAutoModelPermanentKeywords(value)
 	case "AutoModelTransientKeywords":

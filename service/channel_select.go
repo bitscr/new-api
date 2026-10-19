@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 )
 
@@ -115,6 +116,22 @@ func GetChannelSelectionExcludedIDs(c *gin.Context) map[int]bool {
 		}
 	}
 	return excluded
+}
+
+// mergeCoolingAutoModelChannelIDs 把 (分组,模型) 当前处于冷却中的渠道 ID 合并进
+// 排除集合。具名请求与 auto 共用同一份惩罚记录:命中确定性判据的长冷却和抖动
+// 阶梯都会让具名选路跳过该组合。分组解析与路由一致(令牌分组,退回用户分组;
+// auto 分组按候选分组逐个合并)。
+func mergeCoolingAutoModelChannelIDs(c *gin.Context, tokenGroup, modelName string, excluded map[int]bool) {
+	if c == nil || modelName == "" || excluded == nil {
+		return
+	}
+	userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
+	for _, group := range GetRequestGroupCandidates(c, userGroup, tokenGroup) {
+		for channelID := range GetAutoModelCoolingChannelIDs(group, modelName) {
+			excluded[channelID] = true
+		}
+	}
 }
 
 // countChannelAttempts 统计本次请求里每个渠道已经被尝试的次数（数据来自 use_channel）。
@@ -338,6 +355,12 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	selectGroup := param.TokenGroup
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 	excludedChannelIDs := GetChannelSelectionExcludedIDs(param.Ctx)
+	// 具名请求(固定模型)也尊重 auto 冷却:冷却中的 (分组,模型,渠道) 组合不再被
+	// 选中——已知坏的组合没必要再打一遍。与 auto 规划的严格排除对齐;候选全部
+	// 冷却时按"无可用渠道"处理。合并进排除集后,具名请求的选择/重试逻辑不变。
+	if operation_setting.AutoModelEnabled {
+		mergeCoolingAutoModelChannelIDs(param.Ctx, param.TokenGroup, param.ModelName, excludedChannelIDs)
+	}
 
 	if param.TokenGroup == "auto" {
 		candidateGroups := GetRequestGroupCandidates(param.Ctx, userGroup, param.TokenGroup)

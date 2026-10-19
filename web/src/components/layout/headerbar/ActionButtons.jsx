@@ -22,6 +22,7 @@ import NewYearButton from './NewYearButton';
 import NotificationButton from './NotificationButton';
 import ThemeToggle from './ThemeToggle';
 import LanguageSelector from './LanguageSelector';
+import ModelScoreButton from './ModelScoreButton';
 import UserArea from './UserArea';
 
 const ActionButtons = ({
@@ -59,6 +60,8 @@ const ActionButtons = ({
         onLanguageChange={onLanguageChange}
         t={t}
       />
+
+      <ModelScoreButton userState={userState} navigate={navigate} t={t} />
 
       <UserArea
         userState={userState}

@@ -268,6 +268,9 @@ func InitResources() error {
 
 	logger.SetupLogger()
 
+	// 启动模型请求报错日志(按天分割,最多保留 7 天)
+	logger.SetupModelErrorLogger()
+
 	// Initialize model settings
 	ratio_setting.InitRatioSettings()
 

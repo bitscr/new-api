@@ -81,6 +81,7 @@ func TestMiMoGatewayBillingAndProtocols(t *testing.T) {
 				}))
 				defer upstream.Close()
 				db, engine, _ := setupMiMoGateway(t, upstream.URL+"/anthropic/v1/", "upstream-test-key")
+				resetAutoModelCooldownState(db)
 				path := "/v1/chat/completions"
 				if claude {
 					path = "/v1/messages"
@@ -117,11 +118,15 @@ func TestMiMoGatewayUpstreamError(t *testing.T) {
 		_, _ = io.WriteString(w, `{"error":{"message":"unsupported parameter","type":"invalid_request_error","code":"invalid_parameter"}}`)
 	}))
 	defer upstream.Close()
-	db, engine, _ := setupMiMoGateway(t, upstream.URL, "upstream-test-key")
+	db, engine, channel := setupMiMoGateway(t, upstream.URL, "upstream-test-key")
+	resetAutoModelCooldownState(db)
 	for _, path := range []string{"/v1/chat/completions", "/v1/messages"} {
 		w := requestMiMo(t, engine, path, `{"model":"mimo-v2.6-pro-ultraspeed","max_tokens":64,"messages":[{"role":"user","content":"Hi"}]}`, mimoGatewayKey)
 		require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 		require.Contains(t, w.Body.String(), "unsupported parameter")
+		// 具名请求的失败现在也会进入 auto 冷却:清掉上一格式路径留下的冷却,
+		// 让两种格式各自独立验证错误映射(冷却行为由专门测试覆盖)。
+		require.NoError(t, service.DeleteAutoModelCooldown("default", "mimo-v2.6-pro-ultraspeed", channel.Id))
 	}
 	assertMiMoQuota(t, db, 0)
 }
@@ -150,7 +155,8 @@ func TestMiMoGatewayPreservesToolHistory(t *testing.T) {
 				_, _ = io.WriteString(w, mimoMockResponse(claude, false))
 			}))
 			defer upstream.Close()
-			_, engine, _ := setupMiMoGateway(t, upstream.URL, "upstream-test-key")
+			dbTH, engine, _ := setupMiMoGateway(t, upstream.URL, "upstream-test-key")
+			resetAutoModelCooldownState(dbTH)
 			body := fmt.Sprintf(`{"model":"%s","max_tokens":64,"messages":%s,"tools":%s}`, mimo.DefaultTestModel, messages, tools)
 			w := requestMiMo(t, engine, path, body, mimoGatewayKey)
 			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -265,7 +271,7 @@ func setupMiMoGateway(t *testing.T, baseURL, upstreamKey string) (*gorm.DB, *gin
 		_ = ratio_setting.UpdateModelPriceByJSONString(oldPrices)
 		require.NoError(t, sqlDB.Close())
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.Log{}, &model.ConversationLog{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.Log{}, &model.ConversationLog{}, &model.AutoModelCooldown{}))
 	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{}`))
 	require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(`{}`))
 	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))

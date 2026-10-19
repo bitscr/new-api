@@ -27,7 +27,13 @@ import {
   Spin,
   Typography,
 } from '@douyinfe/semi-ui';
-import { API, compareObjects, showError, showSuccess, showWarning } from '../../../helpers';
+import {
+  API,
+  compareObjects,
+  showError,
+  showSuccess,
+  showWarning,
+} from '../../../helpers';
 import { useTranslation } from 'react-i18next';
 
 const { Text } = Typography;
@@ -38,6 +44,7 @@ const AUTO_MODEL_OPTION_KEYS = [
   'AutoModelCooldownMaxHours',
   'AutoModelCooldownBaseMinutes',
   'AutoModelScoreDecayMinutes',
+  'AutoModelScoreRefreshSeconds',
   'AutoModelPermanentKeywords',
   'AutoModelTransientKeywords',
 ];
@@ -50,6 +57,7 @@ const AUTO_MODEL_NUMERIC_KEYS = [
   'AutoModelCooldownMaxHours',
   'AutoModelCooldownBaseMinutes',
   'AutoModelScoreDecayMinutes',
+  'AutoModelScoreRefreshSeconds',
 ];
 
 // 关键词键与数值键必须正好构成上面那张总表,漏一个就会出现"存了但不校验"
@@ -67,6 +75,7 @@ const NUMERIC_LABELS = {
   AutoModelCooldownMaxHours: '普通冷却封顶(小时)',
   AutoModelCooldownBaseMinutes: '普通冷却起始时间(分钟)',
   AutoModelScoreDecayMinutes: '评分衰减窗口(分钟)',
+  AutoModelScoreRefreshSeconds: '模型得分页面刷新间隔(秒)',
 };
 
 // 本机在用的"普通冷却"关键词:命中后强制只走抖动冷却(15m 起步的阶梯),
@@ -122,6 +131,7 @@ export default function SettingsAutoModelPolicy(props) {
     AutoModelCooldownMaxHours: '6',
     AutoModelCooldownBaseMinutes: '15',
     AutoModelScoreDecayMinutes: '360',
+    AutoModelScoreRefreshSeconds: '60',
     AutoModelPermanentKeywords: DEFAULT_PERMANENT_KEYWORDS.join('\n'),
     AutoModelTransientKeywords: DEFAULT_TRANSIENT_KEYWORDS.join('\n'),
   });
@@ -133,8 +143,8 @@ export default function SettingsAutoModelPolicy(props) {
     if (!updateArray.length) return showWarning(t('你似乎并没有修改什么'));
 
     // 只有数值项才做"至少 1 的整数"校验:两张关键词表是自由文本,
-// Number('模型不可用') === NaN,漏排除它们就会在改任何数值时报
-// "AutoModelTransientKeywords 必须是大于等于 1 的整数"。
+    // Number('模型不可用') === NaN,漏排除它们就会在改任何数值时报
+    // "AutoModelTransientKeywords 必须是大于等于 1 的整数"。
     for (const key of AUTO_MODEL_NUMERIC_KEYS) {
       const raw = String(inputs[key] ?? '').trim();
       const value = Number(raw);
@@ -142,7 +152,9 @@ export default function SettingsAutoModelPolicy(props) {
         // 曾经这里是 t(`${key} 必须是大于等于 1 的整数`),模板串永远对不上语言包,
         // 英文界面会直接显示中文。用人能看懂的名字,整句走语言包。
         return showError(
-          t('{{name}} 必须是大于等于 1 的整数', { name: t(NUMERIC_LABELS[key] || key) }),
+          t('{{name}} 必须是大于等于 1 的整数', {
+            name: t(NUMERIC_LABELS[key] || key),
+          }),
         );
       }
     }
@@ -174,7 +186,10 @@ export default function SettingsAutoModelPolicy(props) {
         // 直接显示后端给的整句,用户就知道值已保存、只是建议改。
         const advised = res.find(
           (item) =>
-            item && item.data && typeof item.data.message === 'string' && item.data.message,
+            item &&
+            item.data &&
+            typeof item.data.message === 'string' &&
+            item.data.message,
         );
         if (advised) {
           showWarning(advised.data.message);
@@ -201,7 +216,10 @@ export default function SettingsAutoModelPolicy(props) {
       }
       // 关键词表是文本:后端未配置时回显空串,直接采用会把前端预填清掉,
       // 管理员打开看到空框、以为没有内置判据。空串一律保留预填值。
-      if (AUTO_MODEL_KEYWORD_KEYS.includes(key) && String(fromApi).trim() === '') {
+      if (
+        AUTO_MODEL_KEYWORD_KEYS.includes(key) &&
+        String(fromApi).trim() === ''
+      ) {
         currentInputs[key] = inputs[key];
         continue;
       }
@@ -249,7 +267,10 @@ export default function SettingsAutoModelPolicy(props) {
                   '默认 15。普通(抖动)失败的冷却阶梯从这里起步,每犯一次在上一次的基础上翻倍;某次翻倍超出封顶时,以封顶为准。',
                 )}
                 onChange={(value) =>
-                  setInputs({ ...inputs, AutoModelCooldownBaseMinutes: String(value) })
+                  setInputs({
+                    ...inputs,
+                    AutoModelCooldownBaseMinutes: String(value),
+                  })
                 }
               />
             </Col>
@@ -262,7 +283,10 @@ export default function SettingsAutoModelPolicy(props) {
                   '默认 6。普通(抖动)失败的冷却阶梯从「普通冷却起始时间」起步、每犯一次翻倍,翻倍超出封顶时以封顶为准。这里改的就是封顶。抬得太低会让反复出错的组合很快解冻、又回候选池;太高则会长期放弃一条只是暂时抖动的渠道。',
                 )}
                 onChange={(value) =>
-                  setInputs({ ...inputs, AutoModelCooldownMaxHours: String(value) })
+                  setInputs({
+                    ...inputs,
+                    AutoModelCooldownMaxHours: String(value),
+                  })
                 }
               />
             </Col>
@@ -300,13 +324,31 @@ export default function SettingsAutoModelPolicy(props) {
                 }
               />
             </Col>
+            <Col xs={24} sm={12} md={8} lg={8} xl={8}>
+              <Form.InputNumber
+                field={'AutoModelScoreRefreshSeconds'}
+                label={t('模型得分页面刷新间隔(秒)')}
+                min={1}
+                extraText={t(
+                  '默认 60。「模型得分」页面按此间隔自动刷新,登录用户顶部栏「模型得分」入口进入后生效。',
+                )}
+                onChange={(value) =>
+                  setInputs({
+                    ...inputs,
+                    AutoModelScoreRefreshSeconds: String(value),
+                  })
+                }
+              />
+            </Col>
           </Row>
           <Row gutter={16}>
             <Col xs={24} sm={16}>
               <Form.TextArea
                 field={'AutoModelPermanentKeywords'}
                 label={t('确定性失败关键词(自动删除判据)')}
-                placeholder={t('一行一个,不区分大小写;中文文案、英文词语、状态码都可以')}
+                placeholder={t(
+                  '一行一个,不区分大小写;中文文案、英文词语、状态码都可以',
+                )}
                 extraText={t(
                   '在错误正文、错误码、错误类型里做子串匹配。命中后:首犯按「确定性失败冷却时长」冷却(默认 24 小时),再犯直接把该模型从这条渠道里删除(不删渠道)。上文已预填本机在用的判据。上下文超长永远按抖动处理,不受此处影响。',
                 )}
@@ -327,7 +369,9 @@ export default function SettingsAutoModelPolicy(props) {
               <Form.TextArea
                 field={'AutoModelTransientKeywords'}
                 label={t('普通冷却关键词(强制降级为抖动失败)')}
-                placeholder={t('一行一个,不区分大小写;中文文案、英文词语、状态码都可以')}
+                placeholder={t(
+                  '一行一个,不区分大小写;中文文案、英文词语、状态码都可以',
+                )}
                 extraText={t(
                   '优先级最高:命中后这次失败只按普通抖动冷却处理(以「普通冷却起始时间」起步的阶梯),绝不升级成确定性冷却档、也不会删除模型。用来把其实会自愈的错误钉在这一档,防止被上面的确定性判据误伤。上文已预填本机在用的判据。',
                 )}
@@ -341,7 +385,11 @@ export default function SettingsAutoModelPolicy(props) {
                   '本机预填:rpm exhausted、token plan entitlement exhausted、all candidates failed、upstream_response_timeout。',
                 )}
               </Text>
-              <Text type='tertiary' size='small' style={{ display: 'block', marginTop: 4 }}>
+              <Text
+                type='tertiary'
+                size='small'
+                style={{ display: 'block', marginTop: 4 }}
+              >
                 {t(
                   '520/524 等上游网关故障已由后端按状态码直接判为确定性失败(冷却 → 再犯摘除),不要写在这里:那会把它们钉回抖动档,永远删不掉。',
                 )}

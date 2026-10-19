@@ -58,6 +58,7 @@ func TestRelayUnusableAnswerWritesUsageError(t *testing.T) {
 	}))
 	defer upstream.Close()
 	db, engine, channel := setupUsageLogGateway(t, upstream.URL)
+	resetAutoModelCooldownState(db)
 	response := requestTypeSafe(t, engine, "/v1/chat/completions", usageLogRequest, typeSafeGatewayKey)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	require.Contains(t, response.Body.String(), "fixture_error")
@@ -116,6 +117,8 @@ func TestRelayUsageLogControls(t *testing.T) {
 			}))
 			defer upstream.Close()
 			db, engine, _ := setupUsageLogGateway(t, upstream.URL)
+	resetAutoModelCooldownState(db)
+			resetAutoModelCooldownState(db)
 			constant.ErrorLogEnabled = !test.disabled
 			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(usageLogRequest))
 			request.Header.Set("Content-Type", "application/json")
@@ -147,6 +150,7 @@ func TestRelayUsageLogOrdinaryErrorRemainsSingle(t *testing.T) {
 	}))
 	defer upstream.Close()
 	db, engine, _ := setupUsageLogGateway(t, upstream.URL)
+	resetAutoModelCooldownState(db)
 	response := requestTypeSafe(t, engine, "/v1/chat/completions", usageLogRequest, typeSafeGatewayKey)
 	require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
 	var entries []model.Log
@@ -162,6 +166,7 @@ func TestRelayUsageLogOrdinaryErrorRemainsSingle(t *testing.T) {
 
 func TestRelayUsageLogRespectsNoRecordOption(t *testing.T) {
 	db, _, channel := setupUsageLogGateway(t, "http://127.0.0.1")
+	resetAutoModelCooldownState(db)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	c.Set("id", 1)
@@ -182,6 +187,7 @@ func TestRelayUnusableNonstreamWritesUsageError(t *testing.T) {
 	}))
 	defer upstream.Close()
 	db, engine, _ := setupUsageLogGateway(t, upstream.URL)
+	resetAutoModelCooldownState(db)
 	request := strings.Replace(usageLogRequest, `"stream":true`, `"stream":false`, 1)
 	response := requestTypeSafe(t, engine, "/v1/chat/completions", request, typeSafeGatewayKey)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())

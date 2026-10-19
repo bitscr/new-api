@@ -29,6 +29,7 @@ import (
 
 func setupGMICloudImageGateway(t *testing.T, baseURL string) (*gorm.DB, *gin.Engine, *model.Channel) {
 	db, engine, ch := setupTypeSafeGateway(t, baseURL, "upstream-key")
+	resetAutoModelCooldownState(db)
 	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.UserSubscription{}))
 	ch.Type, ch.Models = constant.ChannelTypeGMICloud, gmicloud.HYImageModel+",hy-alias"
 	ch.ModelMapping = common.GetPointer(`{"hy-alias":"hy-image-v3.5-preview"}`)

@@ -588,6 +588,36 @@ func ListAutoModelCooldowns(now time.Time) []AutoModelCooldownInfo {
 	return rows
 }
 
+// GetAutoModelCooldown 返回指定 (分组, 模型, 渠道) 当前仍在冷却中的状态,
+// 供排障日志等只读场景使用。第二个返回值表示是否存在生效中的冷却。
+func GetAutoModelCooldown(group, name string, channelID int, now time.Time) (AutoModelCooldownInfo, bool) {
+	group = strings.TrimSpace(group)
+	name = strings.TrimSpace(name)
+	if group == "" || name == "" || channelID <= 0 {
+		return AutoModelCooldownInfo{}, false
+	}
+	snapshot := autoModelCooldownSnapshot()
+	state, ok := snapshot[autoModelHealthKey(group, name, channelID)]
+	if !ok || !state.Until.After(now) {
+		return AutoModelCooldownInfo{}, false
+	}
+	remaining := int64(state.Until.Sub(now).Seconds())
+	if remaining < 0 {
+		remaining = 0
+	}
+	return AutoModelCooldownInfo{
+		Group:            group,
+		Model:            name,
+		ChannelID:        channelID,
+		Level:            state.Level,
+		Reason:           state.Reason,
+		Permanent:        state.Permanent,
+		Until:            state.Until.Unix(),
+		RemainingSeconds: remaining,
+		UpdatedAt:        state.UpdatedAt.Unix(),
+	}, true
+}
+
 // DeleteAutoModelCooldown 手工解除一条冷却(管理员操作)。
 // 只删指定组合;参数不全时拒绝,避免误删整片冷却。
 func DeleteAutoModelCooldown(group, name string, channelID int) error {

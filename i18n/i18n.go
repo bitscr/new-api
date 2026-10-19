@@ -62,6 +62,9 @@ func Init() error {
 
 // GetLocalizer returns a localizer for the specified language
 func GetLocalizer(lang string) *i18n.Localizer {
+	if !initialized() {
+		return nil
+	}
 	lang = normalizeLang(lang)
 
 	mu.RLock()
@@ -95,6 +98,11 @@ func T(c *gin.Context, key string, args ...map[string]any) string {
 // Translate translates a message key for the specified language
 func Translate(lang, key string, args ...map[string]any) string {
 	loc := GetLocalizer(lang)
+	if loc == nil {
+		// i18n 未初始化(单测环境/启动初始化失败):回退返回 key,
+		// 绝不让一次普通的"无可用渠道"abort 变成整个进程的 panic。
+		return key
+	}
 
 	config := &i18n.LocalizeConfig{
 		MessageID: key,
@@ -110,6 +118,13 @@ func Translate(lang, key string, args ...map[string]any) string {
 		return key
 	}
 	return msg
+}
+
+// initialized 报告翻译包是否已完成初始化。
+func initialized() bool {
+	mu.RLock()
+	defer mu.RUnlock()
+	return bundle != nil
 }
 
 // userLangLoaderFunc is a function that loads user language from database/cache

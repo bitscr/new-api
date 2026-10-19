@@ -119,6 +119,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	defer func() {
 		if newAPIError != nil {
 			logger.LogError(c, fmt.Sprintf("relay error: %s", newAPIError.Error()))
+			logModelRequestError(c, newAPIError)
 			if relayFormat == types.RelayFormatTypeSafe && typesafe.WriteUpstreamError(c, newAPIError) {
 				return
 			}
@@ -359,10 +360,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			// 而调用方每次都拿到假答案（实测渠道 #5 近 7 天 10 次全部如此）。
 			//
 			// 这个判定与是否 auto 无关：直连模型（无 auto 路由）同样会收到
-			// 200 + 零内容，旧逻辑在这里什么都不做，于是该渠道可以被无限次重复选中，
-			// 调用方每次进来都拿到空回答。所以 auto 请求走评分冷却，非 auto 请求
-			// 交给渠道级自动禁用（受 AutomaticDisableChannelEnabled / AutoBan 控制，
-			// 关掉这两个开关就维持旧行为）。
+			// 200 + 零内容。两类请求都会处理：auto 走模型级评分冷却；具名请求
+			// 也并入同一套模型级评分（见 shouldRecordAutoHealthFeedback），同时
+			// 保留渠道级自动禁用（受 AutomaticDisableChannelEnabled / AutoBan
+			// 控制，关掉这两个开关就维持旧行为）。
 			if unusable, reason := relayInfo.ClientAnswerUnusable(); unusable {
 				if isAutoModelRequest(c) {
 					logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 没有给出有效回答（%s），不计成功", relayInfo.OriginModelName, reason))
@@ -406,22 +407,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.LastError = newAPIError
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
-		if autoModelRequestFault(newAPIError) {
-			// 请求体本身有问题(工具消息结构非法等)时,上游 400 不代表"这条渠道/这个模型
-			// 不稳定"。早先这里照记冷却,于是同一个畸形请求重试到任何候选都被
-			// (group, model, channel) 冷却挡住,而真正的病根是调用方发来的 body。
-			// 只跳过冷却/记分,重试与换候选的既有策略不动。
-			logger.LogInfo(c, fmt.Sprintf("auto model: %s 请求自身非法(HTTP %d),不计入渠道/模型冷却", relayInfo.OriginModelName, newAPIError.StatusCode))
-		} else {
-			// 能力不匹配(模型给不了本次请求要的能力,如 tools)必须照常记录:
-			// AutoModelPermanentFailure 把它判成确定性失败(首犯冷却 24 小时,再犯由
-			// RetireAutoModelCombination 摘除)。这里绝不能提前拦截——早先有一版在
-			// recordAutoModelUpstreamFailure 之前把这类错误整个吞掉(不冷却、不记分),
-			// 结果 service 层的"冷却 → 摘除"在真实链路上永远走不到,废组合被反复选中、
-			// 反复白费一次尝试。本网关的 auto 主要用于工具调用,给不了 tools 的组合
-			// 就该按确定性失败退场;重试作用域仍是"换模型"(见 ClassifyAutoModelRetry)。
-			recordAutoModelUpstreamFailure(c, relayInfo, newAPIError)
-		}
+		// 所有失败照常记录并按判据分档——包括请求体错误(400/422 且文本指向请求体):
+		// 它们对"这个组合能不能服务好本次调用方"同样是证据,照常进普通冷却
+		// (400 不在确定性判据里;上下文超长等保护项仍在 AutoModelPermanentFailure
+		// 内部优先处理)。能力不匹配(tools 等)照常走确定性档(首犯长冷却,再犯摘除)。
+		// 早先请求体错误有豁免(不记冷却),已按使用者决策移除:工具负载被拒也是证据,
+		// 豁免会让这类组合永远留在候选池里反复被选中。
+		recordAutoModelUpstreamFailure(c, relayInfo, newAPIError)
 
 		if autoRequest {
 			// Model-specific failures retain sibling-model fallback. Channel-scoped
@@ -708,7 +700,7 @@ func canRetryAutoModelRequest(c *gin.Context, info *relaycommon.RelayInfo) bool 
 		(c.Writer == nil || !c.Writer.Written()) && (info == nil || !info.ClientDeliveryBroken())
 }
 
-// prepareAutoModelRetry applies only a request-scoped channel exclusion. It must
+// prepareAutoModelRetry applies request-scoped model/channel exclusions. It must
 // run after every retry guard, before the existing route-plan advancement.
 func prepareAutoModelRetry(c *gin.Context, info *relaycommon.RelayInfo, err *types.NewAPIError, remaining int) bool {
 	if remaining <= 0 || !canRetryAutoModelRequest(c, info) || err == nil ||
@@ -721,6 +713,12 @@ func prepareAutoModelRetry(c *gin.Context, info *relaycommon.RelayInfo, err *typ
 	}
 	switch service.ClassifyAutoModelRetry(err) {
 	case service.AutoModelRetryNextModel:
+		// A model-scoped failure means this request must move to a different
+		// model, not merely a different channel serving the same model. Keep
+		// the exclusion request-local; persistent cooldowns remain tuple-scoped.
+		if info.UsingGroup != "" && info.OriginModelName != "" {
+			service.MarkAutoModelModelFailed(c, info.UsingGroup, info.OriginModelName)
+		}
 		return true
 	case service.AutoModelRetryNextChannel:
 		if info.ChannelMeta == nil || info.ChannelId <= 0 {
@@ -819,6 +817,9 @@ func getFixedAutoModelChannel(c *gin.Context, info *relaycommon.RelayInfo, route
 	}
 	if attemptedAutoModelRoutes(c)[route] {
 		return nil, newAutoModelRouteError("auto model route was already attempted")
+	}
+	if service.IsAutoModelModelFailed(c, route.Group, route.ModelName) {
+		return nil, newAutoModelRouteError("auto model candidate was already rejected for this request")
 	}
 	// 授权复验必须用绕过缓存的强新鲜查询:这里是"该渠道还挂着这个模型吗"的
 	// 逐次尝试正确性边界,规划路径的 TTL 快照不承担这个职责。
@@ -1061,8 +1062,25 @@ func rewriteAutoModelRequestBody(c *gin.Context, modelName string) (common.BodyS
 
 // recordAutoModelFeedback captures this attempt now; flushing later must not read
 // mutable RelayInfo fields belonging to another model/channel or a later attempt.
+// shouldRecordAutoHealthFeedback 回答"这次请求的成败要不要并入 auto 健康体系"。
+//   - auto 请求:始终记录(原有语义);
+//   - 具名请求(固定模型):同样记录——成败都是 (分组,模型,渠道) 的证据,差异只在
+//     路由行为(auto 失败会换路由,具名不会);需要 AutoModelEnabled 开启。
+//
+// 两种形态的共同前提:本次尝试真的进入了上游派发,且客户端没有提前离场。
+// 记录不影响任何路由行为:具名请求的重试与渠道选择维持原有逻辑。
+func shouldRecordAutoHealthFeedback(c *gin.Context, info *relaycommon.RelayInfo) bool {
+	if info == nil || !info.HasUpstreamDispatch() || autoModelClientAbandoned(c, info) {
+		return false
+	}
+	if isAutoModelRequest(c) {
+		return true
+	}
+	return operation_setting.AutoModelEnabled
+}
+
 func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, success bool) {
-	if !isAutoModelRequest(c) || info == nil || !info.HasUpstreamDispatch() || autoModelClientAbandoned(c, info) {
+	if !shouldRecordAutoHealthFeedback(c, info) {
 		return
 	}
 	queueAutoModelFeedback(c, info, autoModelFeedback{
@@ -1082,7 +1100,7 @@ func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, succes
 // 说话的那个反而被当成"响应快"。耗时走和成功相同的 EWMA,所以它只影响评分排序,
 // 不改变冷却判据。
 func recordAutoModelUpstreamFailure(c *gin.Context, info *relaycommon.RelayInfo, err *types.NewAPIError) {
-	if !isAutoModelRequest(c) || info == nil || !info.HasUpstreamDispatch() || autoModelClientAbandoned(c, info) {
+	if !shouldRecordAutoHealthFeedback(c, info) {
 		return
 	}
 	elapsedMS := observedAutoModelCooldownLatency(info, false)
@@ -1095,81 +1113,6 @@ func recordAutoModelUpstreamFailure(c *gin.Context, info *relaycommon.RelayInfo,
 	})
 }
 
-// autoModelRequestFault 判定一次上游失败是不是"这次请求体写坏了",而不是
-// "这条渠道/这个模型不行"。命中时不记录 auto 冷却与评分:重试换候选解决不了
-// 请求体的错,冷却反而会把好候选一起挡掉(实测:同一份工具消息结构非法的
-// 请求,连续把渠道 26 上 4 个不同模型各自冷却 15 分钟)。
-//
-// 判据(两类,都必须同时满足"状态码 400/422"+"错误文本指向请求体"):
-//
-// 1) 工具消息结构非法:上游明说 tool_call_id 缺失、function call output 找不到
-//    对应的 function call(实测 wusrouter 渠道 26 的 10:13/10:14 三次)。
-// 2) 上游只回裸状态文本:即只透传 HTTP reason phrase(`Bad Request`、`Unprocessable
-//    Entity`)或干脆是空 body。这类含糊 400 说明上游没给结构化原因,把疑点算到
-//    模型头上没有依据;而"请求体合法但模型/渠道不可用"的情况,上游几乎都会给出
-//    可读的原因(模型不可用、无权、上下文超长、限流……),那些走原有冷却。
-//
-// 认证、限流、模型不存在、上下文超长一律不走这里。仅凭 `invalid_request` 这个泛化
-// 错误码也不走:它可能是模型级问题,冷却语义保持原样。
-func autoModelRequestFault(err *types.NewAPIError) bool {
-	if err == nil || (err.StatusCode != http.StatusBadRequest && err.StatusCode != http.StatusUnprocessableEntity) {
-		return false
-	}
-	if autoModelMessagePointsAtRequestBody(err.Error()) {
-		return true
-	}
-	// 裸状态文本兜底:错误正文只剩状态文本或为空。
-	detail := err.ToOpenAIError()
-	for _, line := range []string{err.Error(), detail.Message} {
-		if autoModelBareStatusText(line, err.StatusCode) {
-			return true
-		}
-	}
-	return false
-}
-
-func autoModelMessagePointsAtRequestBody(message string) bool {
-	text := strings.ToLower(message)
-	for _, marker := range []string{
-		"tool_call_id",
-		"tool call id",
-		"function call output",
-		"function_call_output",
-	} {
-		if strings.Contains(text, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-// autoModelBareStatusText 判断一段错误正文是不是"只剩 HTTP 状态文本/为空"。
-// 上游把请求体错误或自身故障都压成 `Bad Request` 时,这里归为请求侧:正文如此
-// 含糊,不足以支撑"这个模型在这条渠道上坏了"的判断。带实义内容的正文(例如
-// `Invalid request field: messages`)不会被误判。
-func autoModelBareStatusText(message string, statusCode int) bool {
-	text := strings.ToLower(strings.TrimSpace(message))
-	if text == "" {
-		return true
-	}
-	text = strings.Trim(strings.TrimSpace(text), ".:;,!?")
-	for _, candidate := range []string{"bad request", "unprocessable entity"} {
-		if text == candidate {
-			return true
-		}
-	}
-	// `bad request (request id: ...)` 一类的包装:去掉括号补充说明后仍是纯状态文本。
-	if strings.HasPrefix(text, "bad request") || strings.HasPrefix(text, "unprocessable entity") {
-		rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "bad request"), "unprocessable entity"))
-		rest = strings.TrimSpace(strings.TrimPrefix(rest, ":"))
-		if rest == "" || strings.HasPrefix(rest, "(request id:") || strings.HasPrefix(rest, "[request id:") {
-			return true
-		}
-	}
-	return false
-}
-
-// autoModelPermanentFailureReason 给出日志/排查用的一句话原因,不参与判定。
 func autoModelPermanentFailureReason(err *types.NewAPIError) string {
 	if err == nil {
 		return ""
@@ -1187,7 +1130,7 @@ func autoModelPermanentFailureReason(err *types.NewAPIError) string {
 
 // An unusable HTTP 200 is the final failure of this combination, not a success.
 func recordAutoModelUnusableAnswer(c *gin.Context, info *relaycommon.RelayInfo, reason string) {
-	if !isAutoModelRequest(c) || info == nil || !info.HasUpstreamDispatch() || autoModelClientAbandoned(c, info) {
+	if !shouldRecordAutoHealthFeedback(c, info) {
 		return
 	}
 	queueAutoModelFeedback(c, info, autoModelFeedback{unusable: true, reason: reason})
@@ -1351,6 +1294,33 @@ func recordRelayErrorLog(c *gin.Context, err *types.NewAPIError) {
 		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, relaycommon.SanitizeModelText(relayInfo, err.MaskSensitiveErrorWithStatusCode()), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
 	}
 
+}
+
+// logModelRequestError 将失败的模型请求写入本地按天分割的报错日志文件。
+// 若本次失败已触发冷却(识别到冷却关键词/确定性判据并加入冷却),一并写出冷却类别与等级。
+func logModelRequestError(c *gin.Context, err *types.NewAPIError) {
+	modelName := c.GetString("original_model")
+	cooldown := ""
+	if relayInfo := relaycommon.GetRelayInfo(c); relayInfo != nil {
+		if relayInfo.IsModelMappingFullActive() {
+			modelName = relayInfo.GetDisplayModelName()
+		}
+		// 冷却粒度与打分一致:(分组, 原始模型名, 渠道)。本地报错日志在
+		// flushAutoModelFeedback 之后写入,此时本次触发的冷却已经生效,可直接读等级。
+		var cooldownChannel int
+		if relayInfo.ChannelMeta != nil {
+			cooldownChannel = relayInfo.ChannelMeta.ChannelId
+		}
+		if info, ok := service.GetAutoModelCooldown(relayInfo.UsingGroup, relayInfo.OriginModelName, cooldownChannel, time.Now()); ok {
+			kind := "transient"
+			if info.Permanent {
+				kind = "permanent"
+			}
+			cooldown = fmt.Sprintf(", cooldown=%s level=%d", kind, info.Level)
+		}
+	}
+	logger.LogModelError(c, fmt.Sprintf("model request failed: model=%s, channel=%d, status=%d, error=%s%s",
+		modelName, c.GetInt("channel_id"), err.StatusCode, err.MaskSensitiveErrorWithStatusCode(), cooldown))
 }
 
 func RelayMidjourney(c *gin.Context) {

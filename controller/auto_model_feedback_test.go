@@ -8,6 +8,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -104,13 +105,25 @@ func TestAutoModelFeedbackUnusableFinalAnswerReplacesFailure(t *testing.T) {
 	require.Equal(t, "empty response", outcome.reason)
 }
 
-func TestAutoModelFeedbackIgnoresNonAutoAndMissingInfo(t *testing.T) {
+// 具名请求(固定模型)的成败也并入健康体系——这是刻意行为:成败都是
+// (分组,模型,渠道) 的证据,差异只在路由行为。但受 AutoModelEnabled 门控,
+// 且 info 缺失时必须安全跳过。
+func TestAutoModelFeedbackNamedRequestsAndMissingInfo(t *testing.T) {
+	operation_setting.AutoModelEnabled = true
+	t.Cleanup(func() { operation_setting.AutoModelEnabled = true })
+
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	info := &relaycommon.RelayInfo{}
 	info.MarkUpstreamDispatch()
 	recordAutoModelFeedback(c, info, true)
+	require.Len(t, takeAutoModelFeedback(c), 1, "具名请求的成败也是健康证据")
+
+	operation_setting.AutoModelEnabled = false
+	recordAutoModelFeedback(c, info, true)
 	recordAutoModelUnusableAnswer(c, info, "empty")
-	require.Empty(t, takeAutoModelFeedback(c))
+	require.Empty(t, takeAutoModelFeedback(c), "auto 关闭时具名请求不并入")
+	operation_setting.AutoModelEnabled = true
+
 	c = newAutoModelFeedbackTestContext()
 	recordAutoModelFeedback(c, nil, true)
 	recordAutoModelUnusableAnswer(c, nil, "empty")

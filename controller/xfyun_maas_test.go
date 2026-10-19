@@ -68,6 +68,7 @@ func TestXfyunMaasImageFailureRefund(t *testing.T) {
 			}))
 			defer upstream.Close()
 			db, engine, ch := setupMiMoGateway(t, upstream.URL, "fixture-key")
+			resetAutoModelCooldownState(db)
 			ch.Type, ch.Models = constant.ChannelTypeXunfeiMaas, "xopzimageturbo"
 			require.NoError(t, ch.Update())
 			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"xopzimageturbo":0.001}`))
