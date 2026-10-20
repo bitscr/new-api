@@ -74,6 +74,19 @@ func (m *RWMap[K, V]) AddAll(other map[K]V) {
 	}
 }
 
+// Replace atomically swaps the entire map for a copy of other. Unlike a
+// Clear() followed by AddAll(), readers can never observe the intermediate
+// empty state, and the published map is owned exclusively by this instance.
+func (m *RWMap[K, V]) Replace(other map[K]V) {
+	replacement := make(map[K]V, len(other))
+	for k, v := range other {
+		replacement[k] = v
+	}
+	m.mutex.Lock()
+	m.data = replacement
+	m.mutex.Unlock()
+}
+
 func (m *RWMap[K, V]) Clear() {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()

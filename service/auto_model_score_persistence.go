@@ -27,10 +27,14 @@ func autoModelScoreRetention() time.Duration {
 type autoModelScorePersistence struct {
 	// Only the lifecycle's worker (or its joined stop callback) owns this state.
 	// The saved map acknowledges exact raw batches, never a newer live map copy.
-	db        *gorm.DB
-	saved     map[autoModelScoreKey]model.AutoModelScore
-	nextPrune time.Time
-	loaded    bool
+	db    *gorm.DB
+	saved map[autoModelScoreKey]model.AutoModelScore
+	// superseded 记录"数据库里已经有更新快照持有这个键"的本地内容。它既不是
+	// 已保存(不能假装确认),也不该被无止境重写:只有本地内容再次变化时才重新
+	// 参与竞争。多实例共享库时,这让落后的实例停止覆盖领先实例的快照。
+	superseded map[autoModelScoreKey]model.AutoModelScore
+	nextPrune  time.Time
+	loaded     bool
 }
 
 type autoModelScoreKey struct {
@@ -113,23 +117,42 @@ func (p *autoModelScorePersistence) flush(ctx context.Context) error {
 		if !validAutoModelScore(row, now) {
 			continue
 		}
-		if previous, ok := p.saved[autoModelScoreKeyFor(row)]; !ok || previous != row {
-			changed = append(changed, row)
+		key := autoModelScoreKeyFor(row)
+		if previous, ok := p.saved[key]; ok && previous == row {
+			continue // 数据库已经接纳这一行(或库内完全相同)
 		}
+		if rejected, ok := p.superseded[key]; ok && rejected == row {
+			// 该键被更新的快照持有,而本地内容没有再变化:不重写,等下一次
+			// 真实反馈产生新快照时再竞争。
+			continue
+		}
+		changed = append(changed, row)
 	}
 	if len(changed) == 0 {
 		return nil
 	}
 	// Keep failed observations dirty; later feedback stays in the online maps
 	// while SQL runs, and comparing against this captured batch retains it.
-	if err := model.SaveAutoModelScores(ctx, p.db, changed); err != nil {
+	outcomes, err := model.SaveAutoModelScores(ctx, p.db, changed)
+	if err != nil {
 		return err
 	}
 	if p.saved == nil {
 		p.saved = make(map[autoModelScoreKey]model.AutoModelScore)
 	}
-	for _, row := range changed {
-		p.saved[autoModelScoreKeyFor(row)] = row
+	for i, row := range changed {
+		key := autoModelScoreKeyFor(row)
+		if i < len(outcomes) && outcomes[i] == model.AutoModelScoreSuperseded {
+			// 单独标记,不伪装成已保存:saved 里绝不能出现数据库没有接纳的行。
+			delete(p.saved, key)
+			if p.superseded == nil {
+				p.superseded = make(map[autoModelScoreKey]model.AutoModelScore)
+			}
+			p.superseded[key] = row
+			continue
+		}
+		delete(p.superseded, key)
+		p.saved[key] = row
 		expires := time.Unix(0, row.ObservedAt).Add(autoModelScoreRetention())
 		if expires.Before(p.nextPrune) {
 			p.nextPrune = expires
@@ -158,13 +181,19 @@ func (p *autoModelScorePersistence) restore(ctx context.Context) error {
 	// Missing/invalid rows cannot acknowledge local feedback, including a
 	// timestamp-rejected batch whose blocking row another instance removed.
 	p.saved = make(map[autoModelScoreKey]model.AutoModelScore, len(rows))
+	p.superseded = make(map[autoModelScoreKey]model.AutoModelScore)
 	autoModelScoreMutex.Lock()
 	for _, row := range rows {
 		if !validAutoModelScore(row, now) {
 			continue
 		}
 		p.saved[autoModelScoreKeyFor(row)] = row
-		outcome := autoModelOutcome{Score: row.Score, LatencyMS: row.LatencyMS, Observations: row.Observations, UpdatedAt: time.Unix(0, row.ObservedAt)}
+		// 旧行可能没有排序元数据(NULL/零值),恢复时按零值兼容:下一次本地
+		// 观测会从它继续递增,而不是回退。
+		outcome := autoModelOutcome{
+			Score: row.Score, LatencyMS: row.LatencyMS, Observations: row.Observations,
+			UpdatedAt: time.Unix(0, row.ObservedAt), ObservationSeq: row.ObservationSeq, WriterID: row.WriterID,
+		}
 		// Restore only missing keys. Any accepted in-process feedback wins,
 		// including feedback saved during an earlier failed-load interval or
 		// accepted while this query ran. Never merge two instances' EWMAs.
@@ -199,6 +228,12 @@ func (p *autoModelScorePersistence) prune(ctx context.Context, now time.Time) er
 			p.nextPrune = expires
 		}
 	}
+	// 被取代的标记同样会过期:过期后本地内容若仍存在,它会按新快照重新竞争。
+	for key, row := range p.superseded {
+		if row.ObservedAt <= cutoff {
+			delete(p.superseded, key)
+		}
+	}
 	return nil
 }
 
@@ -218,6 +253,11 @@ func validAutoModelScore(row model.AutoModelScore, now time.Time) bool {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
 			return false
 		}
+	}
+	// 排序元数据只做兼容校验:旧行的序号/实例标识是零值,依然有效;负序号不可能
+	// 由本地分配产生,视为损坏行。
+	if row.ObservationSeq < 0 {
+		return false
 	}
 	// Reject future clocks conservatively rather than granting extra freshness.
 	// Validation never rewrites timestamps or applies an extra decay fold.
@@ -246,7 +286,8 @@ func snapshotAutoModelScores() []model.AutoModelScore {
 		rows = append(rows, model.AutoModelScore{
 			Scope: model.AutoModelScoreScopeModel, Group: parts[0], Model: parts[1], ChannelID: id,
 			Score: outcome.Score, LatencyMS: outcome.LatencyMS, Observations: outcome.Observations,
-			ObservedAt: outcome.UpdatedAt.UnixNano(), Version: model.AutoModelScoreVersion,
+			ObservedAt: outcome.UpdatedAt.UnixNano(), ObservationSeq: outcome.ObservationSeq,
+			WriterID: outcome.WriterID, Version: model.AutoModelScoreVersion,
 		})
 	}
 	return rows

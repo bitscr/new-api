@@ -203,45 +203,51 @@ func BuildAutoModelRoutesForRequest(c *gin.Context, group string) ([]AutoModelRo
 	return buildAutoModelRoutesForRequest(c, group, nil)
 }
 
+// AutoModelRebuildStatus 把"一次重排"从"有没有路由"提升为有明确语义的结果。
+// 调用方据此决定是单调前进、替换计划,还是立刻停止——而不是把"空候选"与
+// "刷新失败"混为一谈、或继续把未经完整复验的旧计划派发出去。
+type AutoModelRebuildStatus int
+
+const (
+	// AutoModelRebuildSkipped:没有已尝试路线,无需重排;调用方应继续现计划单调前进。
+	AutoModelRebuildSkipped AutoModelRebuildStatus = iota
+	// AutoModelRebuildReplaced:重排成功且有候选;调用方应从新队首开始替换计划。
+	AutoModelRebuildReplaced
+	// AutoModelRebuildEmpty:重排成功但候选为空;调用方必须清空计划并结束候选尝试。
+	AutoModelRebuildEmpty
+	// AutoModelRebuildFailed:重排刷新失败;调用方必须停止,并保留真实最后上游错误。
+	AutoModelRebuildFailed
+)
+
 // RebuildAutoModelRoutePlanForRetry re-derives the ordered plan for the same
 // request group from a fresh health snapshot, dropping every route in attempted
 // and every model marked failed by a model-scoped retry decision.
 //
-// Why a retry must re-plan rather than advance the plan it was given: the plan is
-// ordered from the health visible when middleware ran. Any feedback produced by
-// other requests since then is invisible to that frozen list, so index+1 can walk
-// straight into a route that is currently the worst one available while the best
-// one sits further down — and with AutoModelMaxAttempts at 4, "further down" is
-// often unreachable.
-//
-// This is a re-ordering of the still-eligible route set: every eligible 模型×渠道
-// pair appears at most once, while attempted routes, request-failed models, cooling
-// routes and hard-excluded channels are removed. A model-scoped failure therefore
-// cannot return through another channel during the same request.
-//
-// It returns nil when the plan cannot be rebuilt — auto disabled, no request group
-// recorded, nothing attempted yet, or nothing left to try — and callers must then
-// keep the existing plan. ErrAutoModelNoAuthorizedCandidates is reported the same
-// way: an empty rebuild is a signal to fall back, not a failure to surface to the
-// client.
-//
-// 空 attempted 直接返回 nil,不做"纯重排"。两个理由:
-//  1. 没有已试路由时,冻结计划是几毫秒前刚按同一份健康快照排出来的,重排只会得到
-//     同一批候选的另一次随机抽取,没有信息增量。
-//  2. 更要紧的是终止性。重排后调用方要从队首(index 0)重新走,而调用方在
-//     "渠道在派发前就不可用"这条路径上不会标记 attempted;若空集也重排,那个循环
-//     就失去了"索引单调递增"这个原有的上界保证。空集返回 nil 让调用方退回
-//     index+1,把这条路径的终止性原样保留。
-func RebuildAutoModelRoutePlanForRetry(c *gin.Context, group string, attempted map[AutoModelRoute]bool) []AutoModelRoute {
+// 返回的状态消除了旧的"nil 既是空候选又是失败"歧义:
+//   - 空 attempted 直接返回 Skipped,不做"纯重排":没有已试路由时,冻结计划是几
+//     毫秒前刚按同一份健康快照排出来的,重排只会得到同一批候选的另一次随机抽取,
+//     没有信息增量,而且空集也重排会把"渠道在派发前就不可用"这条路径的索引单调
+//     递增上界打掉。
+//   - ErrAutoModelNoAuthorizedCandidates 与"重排后确无候选"都归为 Empty:这是
+//     结束尝试的信号,不是要抛给客户端的错误。
+//   - 其它错误归为 Failed:调用方必须停止继续派发,不得拿失败结果假充"无候选",
+//     也不得继续未经完整复验的旧计划。
+func RebuildAutoModelRoutePlanForRetry(c *gin.Context, group string, attempted map[AutoModelRoute]bool) ([]AutoModelRoute, AutoModelRebuildStatus) {
 	if c == nil || len(attempted) == 0 {
-		return nil
+		return nil, AutoModelRebuildSkipped
 	}
 	routes, err := buildAutoModelRoutesForRequest(c, group, attempted)
-	if err != nil && !errors.Is(err, ErrAutoModelNoAuthorizedCandidates) {
+	if err != nil {
+		if errors.Is(err, ErrAutoModelNoAuthorizedCandidates) {
+			return nil, AutoModelRebuildEmpty
+		}
 		common.SysError("failed to rebuild auto model routes for retry: " + err.Error())
-		return nil
+		return nil, AutoModelRebuildFailed
 	}
-	return routes
+	if len(routes) == 0 {
+		return nil, AutoModelRebuildEmpty
+	}
+	return routes, AutoModelRebuildReplaced
 }
 
 // ReplaceAutoModelRoutePlan swaps the plan in place without activating a route.
@@ -262,6 +268,50 @@ func ReplaceAutoModelRoutePlan(c *gin.Context, routes []AutoModelRoute) {
 	}
 	common.SetContextKey(c, constant.ContextKeyAutoModelCandidates, names)
 	common.SetContextKey(c, constant.ContextKeyAutoModelIndex, -1)
+}
+
+// ValidateAutoModelRouteCandidate 是派发前的最终资格复验,首次绑定与每次重试共用。
+//
+// 它读取**最新**的候选白名单与模型权重(不是规划时的快照),拒绝名单外模型、
+// 显式空名单、零或非法模型权重、或端点不适配聊天的路线。
+// 它不使用历史评分证明可用,也不重新引入独立的随机选渠;快照时点就是本次调用
+// 读取 operation_setting 配置的那一刻,并明确不承诺"网络调用已经开始之后还能撤单"。
+func ValidateAutoModelRouteCandidate(group, modelName string) bool {
+	group = strings.TrimSpace(group)
+	modelName = strings.TrimSpace(modelName)
+	if group == "" || modelName == "" || operation_setting.IsAutoModelName(modelName) {
+		return false
+	}
+	allowed, configured := operation_setting.GetAutoModelCandidates()[group]
+	if configured {
+		if len(allowed) == 0 {
+			// 分组显式空名单 = 该组禁用 auto 候选。
+			return false
+		}
+		found := false
+		for _, candidate := range allowed {
+			if strings.TrimSpace(candidate) == modelName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	weights := operation_setting.GetAutoModelWeights()
+	if !positiveAutoModelWeight(autoModelRouteWeight(group, modelName, weights)) {
+		return false
+	}
+	// 计费资格不在这里复验:首次派发前 `Relay()` 会为已绑定的路线定价,每次重试
+	// 也在 `bindAutoModelRoute` 里重新定价,缺计费配置的路线在那里必然失败——
+	// 不靠这一道检查静默拒绝已确认的计划路线,也避免它成为单测里手工拼装的计划
+	// 路线的额外前置条件。端点适配在下面复验(未知模型视为兼容,见
+	// autoModelSupportsChat)。
+	if !autoModelSupportsChat(model.GetModelSupportEndpointTypes(modelName)) {
+		return false
+	}
+	return true
 }
 
 func buildAutoModelRoutesForRequest(c *gin.Context, group string, exclude map[AutoModelRoute]bool) ([]AutoModelRoute, error) {

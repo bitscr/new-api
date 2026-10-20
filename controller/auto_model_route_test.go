@@ -422,17 +422,16 @@ func TestAutoModelAttemptBudgetFreezesFirstDispatchOverride(t *testing.T) {
 			}
 			wantAttempts := operation_setting.AutoModelMaxAttempts()
 			var budget autoModelAttemptBudget
-			retry := &service.RetryParam{}
-			require.True(t, budget.beginAttempt(&model.Channel{RetryTimes: tc.override}, retry))
-			// 后续尝试继续拿巨大的渠道 override:预算不能被撑大。
+			// 全部都是真实派发:reserve 后立刻 confirm(true),预算不能超过上限,
+			// 渠道 override / 全局 RetryTimes 都不能放大它。
 			for budget.canAttempt() {
-				require.Less(t, budget.attempts, wantAttempts)
-				require.True(t, budget.beginAttempt(&model.Channel{RetryTimes: common.GetPointer(1000)}, retry))
+				require.Less(t, budget.dispatched, wantAttempts)
+				require.True(t, budget.reserveAttempt())
+				budget.confirmAttempt(true)
 			}
-			require.Equal(t, wantAttempts, budget.attempts)
-			require.Zero(t, budget.remainingRetries)
-			require.Equal(t, wantAttempts-1, retry.GetEffectiveRetryTimes())
-			require.False(t, budget.beginAttempt(&model.Channel{}, retry))
+			require.Equal(t, wantAttempts, budget.dispatched)
+			require.Zero(t, budget.remainingRetries())
+			require.False(t, budget.reserveAttempt())
 		})
 	}
 }

@@ -316,29 +316,7 @@ func filterExcludedAbilitiesForRetry(abilities []Ability, retry int, excludedCha
 }
 
 func (channel *Channel) AddAbilities(tx *gorm.DB) error {
-	models_ := strings.Split(channel.Models, ",")
-	groups_ := strings.Split(channel.Group, ",")
-	abilitySet := make(map[string]struct{})
-	abilities := make([]Ability, 0, len(models_))
-	for _, model := range models_ {
-		for _, group := range groups_ {
-			key := group + "|" + model
-			if _, exists := abilitySet[key]; exists {
-				continue
-			}
-			abilitySet[key] = struct{}{}
-			ability := Ability{
-				Group:     group,
-				Model:     model,
-				ChannelId: channel.Id,
-				Enabled:   channel.Status == common.ChannelStatusEnabled,
-				Priority:  channel.Priority,
-				Weight:    uint(channel.GetWeight()),
-				Tag:       channel.Tag,
-			}
-			abilities = append(abilities, ability)
-		}
-	}
+	abilities := buildChannelAbilities(channel)
 	if len(abilities) == 0 {
 		return nil
 	}
@@ -355,6 +333,41 @@ func (channel *Channel) AddAbilities(tx *gorm.DB) error {
 	}
 	InvalidateAutoModelRoutingTargetsCache()
 	return nil
+}
+
+// buildChannelAbilities 从渠道声明的 models/group 生成 abilities。
+// 空模型名与空组名不生成任何 ability——摘空最后一个模型(或分组为空)时,
+// abilities 表必须是干干净净的空集,而不是一条 model="" 或 group="" 的幽灵行。
+func buildChannelAbilities(channel *Channel) []Ability {
+	models_ := strings.Split(channel.Models, ",")
+	groups_ := strings.Split(channel.Group, ",")
+	abilitySet := make(map[string]struct{})
+	abilities := make([]Ability, 0, len(models_))
+	for _, model := range models_ {
+		if strings.TrimSpace(model) == "" {
+			continue
+		}
+		for _, group := range groups_ {
+			if strings.TrimSpace(group) == "" {
+				continue
+			}
+			key := group + "|" + model
+			if _, exists := abilitySet[key]; exists {
+				continue
+			}
+			abilitySet[key] = struct{}{}
+			abilities = append(abilities, Ability{
+				Group:     group,
+				Model:     model,
+				ChannelId: channel.Id,
+				Enabled:   channel.Status == common.ChannelStatusEnabled,
+				Priority:  channel.Priority,
+				Weight:    uint(channel.GetWeight()),
+				Tag:       channel.Tag,
+			})
+		}
+	}
+	return abilities
 }
 
 func (channel *Channel) DeleteAbilities() error {
@@ -382,63 +395,36 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 			}
 		}()
 	}
-
-	// First delete all abilities of this channel
-	err := tx.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
-	if err != nil {
+	if err := updateAbilitiesInTx(tx, channel); err != nil {
 		if isNewTx {
 			tx.Rollback()
 		}
 		return err
 	}
-
-	// Then add new abilities
-	models_ := strings.Split(channel.Models, ",")
-	groups_ := strings.Split(channel.Group, ",")
-	abilitySet := make(map[string]struct{})
-	abilities := make([]Ability, 0, len(models_))
-	for _, model := range models_ {
-		for _, group := range groups_ {
-			key := group + "|" + model
-			if _, exists := abilitySet[key]; exists {
-				continue
-			}
-			abilitySet[key] = struct{}{}
-			ability := Ability{
-				Group:     group,
-				Model:     model,
-				ChannelId: channel.Id,
-				Enabled:   channel.Status == common.ChannelStatusEnabled,
-				Priority:  channel.Priority,
-				Weight:    uint(channel.GetWeight()),
-				Tag:       channel.Tag,
-			}
-			abilities = append(abilities, ability)
-		}
-	}
-
-	if len(abilities) > 0 {
-		for _, chunk := range lo.Chunk(abilities, 50) {
-			err = tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&chunk).Error
-			if err != nil {
-				if isNewTx {
-					tx.Rollback()
-				}
-				return err
-			}
-		}
-	}
-
-	// 如果是新创建的事务，需要提交
 	if isNewTx {
 		if err := tx.Commit().Error; err != nil {
 			return err
 		}
-		InvalidateAutoModelRoutingTargetsCache()
-		return nil
 	}
-
 	InvalidateAutoModelRoutingTargetsCache()
+	return nil
+}
+
+// updateAbilitiesInTx 在调用方事务里重建该渠道的全部 abilities(先删后插),
+// 不做缓存失效、不开新事务。原子摘除(RetireChannelModel)直接复用它,保证
+// models 更新与 abilities 重建提交在同一个事务里。
+func updateAbilitiesInTx(tx *gorm.DB, channel *Channel) error {
+	if err := tx.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error; err != nil {
+		return err
+	}
+	abilities := buildChannelAbilities(channel)
+	if len(abilities) > 0 {
+		for _, chunk := range lo.Chunk(abilities, 50) {
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&chunk).Error; err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 

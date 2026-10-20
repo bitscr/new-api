@@ -93,6 +93,7 @@ func ListAutoModelScores(now time.Time) []AutoModelScoreInfo {
 //
 // 持久化无需特殊处理:快照按固定周期把重置后的值 upsert 覆盖旧行,重启后
 // restore 读到的就是中性值(restore 只合并内存缺失的键,不覆盖在线值)。
+// 覆盖依赖排序元数据(observed_at + 序号 + 实例标识),不是"等到时间前进"。
 func ClearAutoModelNegativeEffects(group, name string, channelID int) bool {
 	group = strings.TrimSpace(group)
 	name = strings.TrimSpace(name)
@@ -106,7 +107,13 @@ func ClearAutoModelNegativeEffects(group, name string, channelID int) bool {
 	// 那会在没有观测数据时凭空造出一条零分记录。
 	autoModelScoreMutex.Lock()
 	if current, exists := autoModelHealth.Get(key); exists {
-		autoModelHealth.Set(key, autoModelOutcome{Score: 0.5, Observations: current.Observations, UpdatedAt: now})
+		// 清除本身也是一次真实的评分更新:必须走同一套排序元数据分配,
+		// 否则它与同刻度的普通反馈之间没有确定的先后。
+		sequence, writerID := nextAutoModelObservationSeq(current)
+		autoModelHealth.Set(key, autoModelOutcome{
+			Score: 0.5, Observations: current.Observations, UpdatedAt: now,
+			ObservationSeq: sequence, WriterID: writerID,
+		})
 		cleared = true
 	}
 	autoModelScoreMutex.Unlock()

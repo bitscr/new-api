@@ -39,3 +39,37 @@ AUTO_MODEL_TODO.md
 
 # session-local task notes
 *_TODO.md
+
+
+# ---- 本地密钥与敏感文件防误提交 ----
+# 任何带后缀的 env 文件都可能是真实密钥;保留明确的模板 .env.example。
+.env.*
+!.env.example
+
+# 私钥 / 证书 / 服务账号 / 凭据导出
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+id_rsa*
+id_ed25519*
+id_ecdsa*
+service-account*.json
+credentials*.json
+
+# 本地数据库 / 备份 / 日志 / HAR / 工具数据库与打包缓存
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.bak
+*.backup
+*.har
+.codeartsdoer
+.codearts
+.cursor
+.cursorindex
+.sonarlint
+tiktoken_cache

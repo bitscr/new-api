@@ -1,7 +1,7 @@
 package service
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -329,82 +329,34 @@ func RecordAutoModelAbandonedAttempt(group, name string, channelID int, elapsedM
 // RetireAutoModelCombination 把一个命中确定性关键词的 (分组, 模型, 渠道) 组合从
 // 候选池里彻底摘掉:从渠道声明的 models 里移除该模型,并同步重建 abilities。
 //
-// 不删除整条渠道(渠道上还有别的模型,凭据与配置都是复用的),
-// 只摘掉这个不可用的模型。摘除后:
-//   - 该模型不再出现在渠道的 models 里,auto 路由不会再挑中它;
-//   - abilities 表同步失效,显式请求也会立刻得到"无可用渠道",不再打到上游;
-//   - 冷却记录同时清除(它已不在候选池里,留着没有意义)。
+// 不删除整条渠道(渠道上还有别的模型,凭据与配置都是复用的),只摘掉这个不可用的
+// 模型。读改写、abilities 重建与摘空后的渠道状态变更都在 model 层的原子入口里
+// 作为一个数据库事务完成;这里只负责失败分类、调用和确认成功后的冷却清理与日志。
 //
-// 幂等:模型已经不在 models 里时直接返回 nil,不重复写库。
+// 幂等:模型已经不在 models 里时,model 层会核对并修复遗留 ability,不再重复更新
+// models;并发摘除由 CAS + 有限重试保证互不覆盖,最终不会复活任何一个被摘模型。
 func RetireAutoModelCombination(group, name string, channelID int, reason string) error {
 	group = strings.TrimSpace(group)
 	name = strings.TrimSpace(name)
+	reason = strings.TrimSpace(reason)
 	if group == "" || name == "" || channelID <= 0 {
 		return nil
 	}
-	if model.DB == nil {
-		return errors.New("database not initialized")
+	// model.RetireChannelModel 自带 DB 未初始化检查,这里不复述。
+	result, err := model.RetireChannelModel(context.Background(), channelID, name, reason)
+	if err != nil {
+		return fmt.Errorf("retire %s on channel %d failed: %w", name, channelID, err)
 	}
-
-	channel, err := model.GetChannelById(channelID, false)
-	if err != nil || channel == nil {
-		return fmt.Errorf("load channel %d failed: %w", channelID, err)
-	}
-
-	remaining := make([]string, 0, len(channel.GetModels()))
-	removed := false
-	for _, m := range channel.GetModels() {
-		if strings.TrimSpace(m) == name {
-			removed = true
-			continue
-		}
-		remaining = append(remaining, m)
-	}
-	if !removed {
-		// 已经摘过了:不做任何写入,避免并发请求变成重复更新。
-		common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)已不在渠道模型列表中,跳过摘除", name, channelID))
-		return nil
-	}
-	channel.Models = strings.Join(remaining, ",")
-	// 不能用 channel.Update():GORM 的 struct Updates 会跳过零值字段,
-	// 摘空最后一个模型时 Models 为 "" 会被静默忽略,渠道看起来还有模型。
-	if err := channel.UpdateModels(); err != nil {
-		return fmt.Errorf("update channel %d models failed: %w", channelID, err)
-	}
-
-	// 摘掉的是最后一个模型时,这条渠道已经没有可服务的模型了。留着它只会:
-	// 每次选通道都白跑一趟(没有可用模型直接失败),面板上也看不出它的状态。
-	// 所以自动禁用它,把状态显式标出来,让禁用原因可查。
-	if len(remaining) == 0 {
-		autoDisableModelEmptiedChannel(channel, name, reason)
-	}
-
-	// 摘除后冷却没有意义;清除以免残留记录干扰面板显示。
+	// 冷却清理与成功日志放在数据库确认之后:摘除失败必须返回明确错误,不假报成功。
 	clearAutoModelCooldown(group, name, channelID, time.Now())
-	common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)命中确定性失败判据,已从渠道模型列表中删除(原因:%s)",
-		name, channelID, reason))
+	if result.Removed {
+		common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)命中确定性失败判据,已从渠道模型列表删除(原因:%s)",
+			name, channelID, reason))
+	}
+	if result.Emptied {
+		common.SysLog(fmt.Sprintf("auto model: 渠道 %d 已无任何模型,已自动禁用。原因:%s", channelID, reason))
+	}
 	return nil
-}
-
-// autoDisableModelEmptiedChannel 在渠道被摘掉最后一个模型后,把它标记为自动禁用。
-//
-// 为什么不是删除:删除不可逆,而且这个渠道的凭据、代理、分组配置都还在,
-// 上游恢复或补新模型后需要能一键启用。禁用保留全部配置、只是不再参与选路,
-// 状态里带原因,面板上能直接看出"为什么它不干活了"。
-func autoDisableModelEmptiedChannel(channel *model.Channel, removedModel, reason string) {
-	if channel == nil || channel.Id <= 0 {
-		return
-	}
-	disableReason := fmt.Sprintf("模型 %s 确定性失败已被移除,渠道已无可用模型", removedModel)
-	if strings.TrimSpace(reason) != "" {
-		disableReason = fmt.Sprintf("%s(最后一次失败:%s)", disableReason, strings.TrimSpace(reason))
-	}
-	if ok := model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusAutoDisabled, disableReason); ok {
-		common.SysLog(fmt.Sprintf("auto model: 渠道 %d(%s)已无任何模型,已自动禁用。原因:%s",
-			channel.Id, channel.Name, disableReason))
-		return
-	}
-	common.SysError(fmt.Sprintf("auto model: 渠道 %d 已无模型,但自动禁用失败", channel.Id))
 }
 
 func clearAutoModelCooldown(group, name string, channelID int, now time.Time) {

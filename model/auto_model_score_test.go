@@ -51,7 +51,7 @@ func TestAutoModelScoreMigrationRegistersTable(t *testing.T) {
 			for _, column := range columns {
 				names = append(names, column.Name())
 			}
-			require.ElementsMatch(t, []string{"scope", "group", "model", "channel_id", "score", "latency_ms", "observations", "observed_at", "version"}, names)
+			require.ElementsMatch(t, []string{"scope", "group", "model", "channel_id", "score", "latency_ms", "observations", "observed_at", "observation_seq", "writer_id", "version"}, names, "排序元数据必须随 GORM 跨库增列一起迁移")
 		})
 	}
 }
@@ -72,7 +72,12 @@ func TestAutoModelScoreRoundTripPreservesRawFieldsAndSkipsLegacyScope(t *testing
 		{Scope: "channel", Group: "g", Model: "", ChannelID: 1, Score: 0.4, LatencyMS: 321.25, Observations: 12.25, ObservedAt: observed + 4, Version: 1},
 		{Scope: "channel", Group: "vip", Model: "", ChannelID: 1, Score: 0.2, LatencyMS: 900, Observations: 2.75, ObservedAt: observed + 5, Version: 1},
 	}
-	require.NoError(t, SaveAutoModelScores(ctx, db, append(append([]AutoModelScore(nil), want...), legacy...)))
+	outcomes, err := SaveAutoModelScores(ctx, db, append(append([]AutoModelScore(nil), want...), legacy...))
+	require.NoError(t, err)
+	require.Equal(t, []AutoModelScoreSaveOutcome{
+		AutoModelScoreStored, AutoModelScoreStored, AutoModelScoreStored, AutoModelScoreStored,
+		AutoModelScoreStored, AutoModelScoreStored,
+	}, outcomes, "每一条都必须单独确认,批量 RowsAffected 不能代替逐行结论")
 	got, err := LoadAutoModelScores(ctx, db)
 	require.NoError(t, err)
 	require.ElementsMatch(t, want, got, "all raw fields must survive SQL round-trip without re-timestamping, while legacy scope=channel rows stay invisible to reads")
@@ -82,7 +87,8 @@ func TestAutoModelScoreDatabaseFailuresAreReturned(t *testing.T) {
 	row := AutoModelScore{Scope: "model", Group: "g", Model: "m", ChannelID: 1, Observations: 1, ObservedAt: time.Now().UnixNano(), Version: 1}
 	operations := map[string]func(context.Context, *gorm.DB) error{
 		"save": func(ctx context.Context, db *gorm.DB) error {
-			return SaveAutoModelScores(ctx, db, []AutoModelScore{row})
+			_, err := SaveAutoModelScores(ctx, db, []AutoModelScore{row})
+			return err
 		},
 		"load":  func(ctx context.Context, db *gorm.DB) error { _, err := LoadAutoModelScores(ctx, db); return err },
 		"prune": func(ctx context.Context, db *gorm.DB) error { return PruneAutoModelScores(ctx, db, row.ObservedAt) },
@@ -128,7 +134,8 @@ func TestAutoModelScorePruneExpiresOnlyOldSnapshots(t *testing.T) {
 		{Scope: "model", Group: "other", Model: "fresh", ChannelID: 1, ObservedAt: cutoff + 1, Version: 1},
 		{Scope: "channel", Group: "other", ChannelID: 1, ObservedAt: cutoff + 2, Version: 1},
 	}
-	require.NoError(t, SaveAutoModelScores(ctx, db, rows))
+	_, err := SaveAutoModelScores(ctx, db, rows)
+	require.NoError(t, err)
 	require.NoError(t, PruneAutoModelScores(ctx, db, cutoff))
 	got, err := LoadAutoModelScores(ctx, db)
 	require.NoError(t, err)
@@ -143,7 +150,8 @@ func TestAutoModelScoreBatchFailureRollsBackEntireBatch(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(&AutoModelScore{}))
 	ctx := context.Background()
 	original := AutoModelScore{Scope: "model", Group: "g", Model: "m", ChannelID: 1, Score: 0.8, Observations: 4, ObservedAt: time.Now().UnixNano(), Version: 1}
-	require.NoError(t, SaveAutoModelScores(ctx, db, []AutoModelScore{original}))
+	_, err := SaveAutoModelScores(ctx, db, []AutoModelScore{original})
+	require.NoError(t, err)
 	// The second SQL chunk genuinely fails after the first chunk has executed.
 	// The store must own atomicity even when the caller disables GORM's default
 	// per-statement transactions; updating an existing row must roll back too.
@@ -158,7 +166,7 @@ func TestAutoModelScoreBatchFailureRollsBackEntireBatch(t *testing.T) {
 	rejected := original
 	rejected.ChannelID, rejected.ObservedAt = 999, original.ObservedAt+1
 	batch = append(batch, rejected)
-	err := SaveAutoModelScores(ctx, db.Session(&gorm.Session{SkipDefaultTransaction: true, CreateBatchSize: 100}), batch)
+	_, err = SaveAutoModelScores(ctx, db.Session(&gorm.Session{SkipDefaultTransaction: true, CreateBatchSize: 100}), batch)
 	require.ErrorContains(t, err, "reject captured batch")
 	got, err := LoadAutoModelScores(ctx, db)
 	require.NoError(t, err)
@@ -185,20 +193,24 @@ func TestAutoModelScoreSQLDialectsGuardEveryUpdatedField(t *testing.T) {
 				statements = append(statements, tx.Statement.SQL.String())
 				variables = append(variables, append([]any(nil), tx.Statement.Vars...))
 			}))
-			row := AutoModelScore{Scope: "model", Group: "g' OR 1=1 --", Model: "模型'", ChannelID: 4, Score: 0.8, LatencyMS: 123, Observations: 7.5, ObservedAt: time.Now().UnixNano(), Version: 1}
-			require.NoError(t, SaveAutoModelScores(context.Background(), db, []AutoModelScore{row}))
+			row := AutoModelScore{Scope: "model", Group: "g' OR 1=1 --", Model: "模型'", ChannelID: 4, Score: 0.8, LatencyMS: 123, Observations: 7.5, ObservedAt: time.Now().UnixNano(), ObservationSeq: 3, WriterID: "writer-a", Version: 1}
+			outcomes, saveErr := SaveAutoModelScores(context.Background(), db, []AutoModelScore{row})
+			require.NoError(t, saveErr)
+			require.Nil(t, outcomes, "dry-run 只生成 SQL,不回读逐行确认")
 			require.Len(t, statements, 1)
 			sql := statements[0]
 			t.Logf("%s SQL: %s; parameter_count=%d", dialect.Name(), sql, len(variables[0]))
 			require.NotContains(t, sql, row.Group)
 			require.NotContains(t, sql, row.Model)
-			require.Equal(t, []any{row.Scope, row.Group, row.Model, row.ChannelID, row.Score, row.LatencyMS, row.Observations, row.ObservedAt, row.Version}, variables[0])
+			require.Equal(t, []any{row.Scope, row.Group, row.Model, row.ChannelID, row.Score, row.LatencyMS, row.Observations, row.ObservedAt, row.ObservationSeq, row.WriterID, row.Version}, variables[0])
 			if dialect.Name() == "mysql" {
+				guard := "`observed_at` < VALUES(`observed_at`) OR (`observed_at` = VALUES(`observed_at`) AND (COALESCE(`observation_seq`, 0) < COALESCE(VALUES(`observation_seq`), 0) OR (COALESCE(`observation_seq`, 0) = COALESCE(VALUES(`observation_seq`), 0) AND COALESCE(`writer_id`, '') < COALESCE(VALUES(`writer_id`), ''))))"
 				require.Contains(t, sql, "ON DUPLICATE KEY UPDATE")
-				for _, field := range []string{"score", "latency_ms", "observations", "version", "observed_at"} {
-					require.Contains(t, sql, "`"+field+"`=CASE WHEN `observed_at` < VALUES(`observed_at`) THEN VALUES(`"+field+"`) ELSE `"+field+"` END", "MySQL ignores OnConflict.Where; each field must have its own stale-write guard")
+				for _, field := range []string{"score", "latency_ms", "observations", "version", "writer_id", "observation_seq", "observed_at"} {
+					require.Contains(t, sql, "`"+field+"`=CASE WHEN "+guard+" THEN VALUES(`"+field+"`) ELSE `"+field+"` END", "MySQL ignores OnConflict.Where; each field must carry the same ordering guard")
 				}
-				require.True(t, strings.HasSuffix(sql, "`observed_at`=CASE WHEN `observed_at` < VALUES(`observed_at`) THEN VALUES(`observed_at`) ELSE `observed_at` END"), "MySQL must update observed_at last because assignments run left-to-right")
+				require.True(t, strings.HasSuffix(sql, "`observed_at`=CASE WHEN "+guard+" THEN VALUES(`observed_at`) ELSE `observed_at` END"), "MySQL must update observed_at last because assignments run left-to-right")
+				require.True(t, strings.Index(sql, "`writer_id`=CASE") < strings.Index(sql, "`observation_seq`=CASE"), "writer_id must be assigned before observation_seq so its guard still reads the stored sequence")
 			} else {
 				quote := "`"
 				if dialect.Name() == "postgres" {
@@ -207,6 +219,8 @@ func TestAutoModelScoreSQLDialectsGuardEveryUpdatedField(t *testing.T) {
 				q := func(s string) string { return quote + s + quote }
 				require.Contains(t, sql, "ON CONFLICT ("+q("scope")+","+q("group")+","+q("model")+","+q("channel_id")+") DO UPDATE SET")
 				require.Contains(t, sql, "WHERE "+q("auto_model_scores")+"."+q("observed_at")+" < "+q("excluded")+"."+q("observed_at"))
+				require.Contains(t, sql, "COALESCE("+q("auto_model_scores")+"."+q("observation_seq")+", 0) < COALESCE("+q("excluded")+"."+q("observation_seq")+", 0)")
+				require.Contains(t, sql, "COALESCE("+q("auto_model_scores")+"."+q("writer_id")+", '') < COALESCE("+q("excluded")+"."+q("writer_id")+", '')")
 			}
 			statement := &gorm.Statement{DB: db}
 			require.NoError(t, statement.Parse(&AutoModelScore{}))
@@ -264,7 +278,8 @@ func TestAutoModelScoreDeleteSnapshotPreservesReplacement(t *testing.T) {
 			switch change {
 			case "newer_observation":
 				replacement.ObservedAt++
-				require.NoError(t, SaveAutoModelScores(context.Background(), db, []AutoModelScore{replacement}))
+				_, err := SaveAutoModelScores(context.Background(), db, []AutoModelScore{replacement})
+				require.NoError(t, err)
 			case "corrected_clock":
 				replacement.ObservedAt = time.Now().UnixNano()
 				require.NoError(t, db.Model(&writeTarget).Update("observed_at", replacement.ObservedAt).Error)
@@ -301,7 +316,7 @@ func TestAutoModelScoreDeleteSnapshotSQLDialects(t *testing.T) {
 				statements = append(statements, tx.Statement.SQL.String())
 				variables = append(variables, append([]any(nil), tx.Statement.Vars...))
 			}))
-			row := AutoModelScore{Scope: AutoModelScoreScopeModel, Group: "g' OR 1=1 --", Model: "模型'", ChannelID: 4, ObservedAt: time.Now().Add(time.Hour).UnixNano(), Version: 0}
+			row := AutoModelScore{Scope: AutoModelScoreScopeModel, Group: "g' OR 1=1 --", Model: "模型'", ChannelID: 4, ObservedAt: time.Now().Add(time.Hour).UnixNano(), ObservationSeq: 5, WriterID: "w", Version: 0}
 			require.NoError(t, DeleteAutoModelScoreSnapshot(context.Background(), db, row))
 			require.Len(t, statements, 1, "retiring a rejected snapshot must execute a conditional SQL delete")
 			sql := statements[0]
@@ -316,27 +331,51 @@ func TestAutoModelScoreDeleteSnapshotSQLDialects(t *testing.T) {
 				require.Contains(t, sql, q(field)+" = ", "every identity field must be compared, including zero/empty values")
 			}
 			require.NotContains(t, sql, row.Group)
-			require.Equal(t, []any{row.ChannelID, row.Group, row.Model, row.ObservedAt, row.Scope, row.Version}, variables[0])
+			require.Contains(t, sql, "COALESCE("+q("observation_seq")+", 0) = COALESCE(?, 0)")
+			require.Contains(t, sql, "COALESCE("+q("writer_id")+", '') = COALESCE(?, '')")
+			require.Equal(t, []any{row.ChannelID, row.Group, row.Model, row.ObservedAt, row.Scope, row.Version, row.ObservationSeq, row.WriterID}, variables[0], "身份字段与完整排序元数据都必须参与条件删除")
 		})
 	}
 }
 
-func TestAutoModelScoreUpsertRejectsOlderOrEqualObservation(t *testing.T) {
+func TestAutoModelScoreUpsertOrdersByObservationThenSequence(t *testing.T) {
 	db := newAutoModelScoreTestDB(t)
 	require.NoError(t, db.AutoMigrate(&AutoModelScore{}))
 	ctx := context.Background()
-	old := AutoModelScore{Scope: AutoModelScoreScopeModel, Group: "g", Model: "m", ChannelID: 1, Score: 0.7, LatencyMS: 200, Observations: 4, ObservedAt: time.Now().Add(-time.Minute).UnixNano(), Version: 1}
-	unrelated := old
+	base := AutoModelScore{Scope: AutoModelScoreScopeModel, Group: "g", Model: "m", ChannelID: 1, Score: 0.7, LatencyMS: 200, Observations: 4, ObservedAt: time.Now().Add(-time.Minute).UnixNano(), ObservationSeq: 1, WriterID: "a", Version: 1}
+	unrelated := base
 	unrelated.Group = "untouched"
-	require.NoError(t, SaveAutoModelScores(ctx, db, []AutoModelScore{old, unrelated}))
-	fresh := old
-	fresh.Score, fresh.LatencyMS, fresh.Observations, fresh.ObservedAt = 0, 0, 5.5, old.ObservedAt+1
-	require.NoError(t, SaveAutoModelScores(ctx, db, []AutoModelScore{fresh}), "a newer snapshot must replace all numeric fields, including zeros")
-	require.NoError(t, SaveAutoModelScores(ctx, db, []AutoModelScore{old}), "an older batch is a non-destructive no-op")
-	equalTime := old
-	equalTime.ObservedAt = fresh.ObservedAt
-	require.NoError(t, SaveAutoModelScores(ctx, db, []AutoModelScore{equalTime}))
+	_, err := SaveAutoModelScores(ctx, db, []AutoModelScore{base, unrelated})
+	require.NoError(t, err)
+
+	// 更晚时间刻度胜出,哪怕序号/实例标识反而更小:排序先看真实观测时间。
+	fresh := base
+	fresh.Score, fresh.LatencyMS, fresh.Observations, fresh.ObservedAt = 0, 0, 5.5, base.ObservedAt+1
+	fresh.ObservationSeq, fresh.WriterID = 1, "z"
+	outcomes, err := SaveAutoModelScores(ctx, db, []AutoModelScore{fresh})
+	require.NoError(t, err)
+	require.Equal(t, []AutoModelScoreSaveOutcome{AutoModelScoreStored}, outcomes, "更晚的 observed_at 必须胜出,哪怕序号和实例标识更小")
+
+	// 同一时间刻度、更高序号:必须接受,不再依赖墙钟前进。
+	sameTick := fresh
+	sameTick.Score, sameTick.ObservationSeq = 0.31, fresh.ObservationSeq+1
+	outcomes, err = SaveAutoModelScores(ctx, db, []AutoModelScore{sameTick})
+	require.NoError(t, err)
+	require.Equal(t, []AutoModelScoreSaveOutcome{AutoModelScoreStored}, outcomes, "同刻度更高序号必须胜出")
+
+	// 同刻度、同序号、更大实例标识:确定性决胜。
+	sameSeq := sameTick
+	sameSeq.Score, sameSeq.WriterID = 0.32, "zz"
+	outcomes, err = SaveAutoModelScores(ctx, db, []AutoModelScore{sameSeq})
+	require.NoError(t, err)
+	require.Equal(t, []AutoModelScoreSaveOutcome{AutoModelScoreStored}, outcomes, "同刻度同序号按实例标识确定性决胜")
+
+	// 更旧快照是 no-op,并被明确标成 superseded,不产生错误。
+	outcomes, err = SaveAutoModelScores(ctx, db, []AutoModelScore{base})
+	require.NoError(t, err)
+	require.Equal(t, []AutoModelScoreSaveOutcome{AutoModelScoreSuperseded}, outcomes, "旧快照不能伪装成已保存,但也不能覆盖更新证据")
+
 	got, err := LoadAutoModelScores(ctx, db)
 	require.NoError(t, err)
-	require.ElementsMatch(t, []AutoModelScore{fresh, unrelated}, got, "stale/equal snapshots must not replace later evidence or unrelated keys")
+	require.ElementsMatch(t, []AutoModelScore{sameSeq, unrelated}, got, "胜者必须是最新排序元数据对应的那一行")
 }

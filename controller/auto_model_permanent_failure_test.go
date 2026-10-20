@@ -9,7 +9,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/stretchr/testify/require"
@@ -23,24 +22,20 @@ func TestAutoModelBudgetIgnoresGlobalRetryTimes(t *testing.T) {
 	common.RetryTimes = 50
 
 	var budget autoModelAttemptBudget
-	retry := &service.RetryParam{}
-	// 头一次 beginAttempt 冻结预算:与渠道 override、全局 RetryTimes 都无关。
-	require.True(t, budget.beginAttempt(&model.Channel{RetryTimes: common.GetPointer(1000)}, retry))
-	attempts := 1
+	attempts := 0
 	for budget.canAttempt() {
-		require.True(t, budget.beginAttempt(&model.Channel{RetryTimes: common.GetPointer(1000)}, retry))
+		require.True(t, budget.reserveAttempt())
+		budget.confirmAttempt(true)
 		attempts++
 		require.LessOrEqual(t, attempts, operation_setting.AutoModelMaxAttempts(),
 			"auto 不能超过自己的上限")
 	}
 	require.Equal(t, operation_setting.AutoModelMaxAttempts(), attempts,
 		"RetryTimes=50 时 auto 仍只花自己的上限")
-	require.Zero(t, budget.remainingRetries)
-	require.False(t, budget.beginAttempt(&model.Channel{}, retry))
+	require.Zero(t, budget.remainingRetries())
+	require.False(t, budget.reserveAttempt())
 }
 
-// 面板/环境设置的上限必须被采纳。环境变量现在是启动种子(InitAutoModelSettingsFromEnv),
-// 运行时以面板值为准,所以这里走 setter 而不是 t.Setenv。
 func TestAutoModelBudgetHonoursConfiguredLimit(t *testing.T) {
 	oldRetryTimes := common.RetryTimes
 	oldAttempts := operation_setting.AutoModelMaxAttempts()
@@ -53,11 +48,33 @@ func TestAutoModelBudgetHonoursConfiguredLimit(t *testing.T) {
 	require.Equal(t, 2, operation_setting.AutoModelMaxAttempts())
 
 	var budget autoModelAttemptBudget
-	retry := &service.RetryParam{}
-	require.True(t, budget.beginAttempt(&model.Channel{}, retry))
-	require.True(t, budget.beginAttempt(&model.Channel{}, retry))
-	require.False(t, budget.canAttempt(), "配置为 2 时只允许两次 dispatch")
-	require.False(t, budget.beginAttempt(&model.Channel{}, retry))
+	require.True(t, budget.reserveAttempt())
+	budget.confirmAttempt(true)
+	require.True(t, budget.reserveAttempt())
+	budget.confirmAttempt(true)
+	require.False(t, budget.canAttempt(), "配置为 2 时只允许两次真实派发")
+	require.False(t, budget.reserveAttempt())
+}
+
+// 本地拒绝(没有真实派发)不占真实派发预算:前四次本地 RPM 拒绝、第五次才派发,
+// 派发次数只计 1。这也钉住"暂占 → 确认/撤销"两阶段记账:HasUpstreamDispatch 为
+// false 的尝试绝不消耗预算。
+func TestAutoModelBudgetDoesNotConsumeOnLocalRejection(t *testing.T) {
+	oldAttempts := operation_setting.AutoModelMaxAttempts()
+	t.Cleanup(func() { operation_setting.SetAutoModelMaxAttempts(oldAttempts) })
+	operation_setting.SetAutoModelMaxAttempts(4)
+
+	var budget autoModelAttemptBudget
+	for i := 0; i < 4; i++ {
+		require.True(t, budget.reserveAttempt(), "本地拒绝不能被真实预算挡住")
+		budget.confirmAttempt(false)
+	}
+	require.Zero(t, budget.dispatched, "本地拒绝不计真实派发")
+	require.True(t, budget.canAttempt(), "本地拒绝之后仍应能真正派发")
+	require.True(t, budget.reserveAttempt())
+	budget.confirmAttempt(true)
+	require.Equal(t, 1, budget.dispatched)
+	require.Equal(t, 3, budget.remainingRetries())
 }
 
 // 确定性失败的分类要在"入队时"定格:队列是延迟 flush 的,事后读 RelayInfo

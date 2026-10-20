@@ -274,8 +274,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
-			// The plan is channel-block ordered: exhaust this channel's remaining
-			// model routes before trying the next channel, never select at random.
+			// 派发前就拿不到渠道:当前路线同样进本地跳过集合,重排不会把它放回队首。
+			if current, ok := service.GetCurrentAutoModelRoute(c); ok {
+				markAutoModelRouteLocallyRejected(c, current)
+			}
+			// auto 计划按"渠道 priority 降序 → 模型得分分档 → 档内两级加权随机"排好;
+			// 换路 = 对剩余候选重新规划,既不是逐个试完本渠道的剩余模型,也不是随机选渠。
 			if trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
 				continue
 			}
@@ -328,7 +332,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				model.ReleaseChannelDailySuccess(reservation)
 				break
 			}
-			if (autoBudget.attempts > 0 && !canRetryAutoModelRequest(c, relayInfo)) || !autoBudget.beginAttempt(channel, retryParam) {
+			if (autoBudget.attempts > 0 && !canRetryAutoModelRequest(c, relayInfo)) || !autoBudget.reserveAttempt() {
 				model.ReleaseChannelDailySuccess(reservation)
 				break
 			}
@@ -347,6 +351,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = relayHandler(c, relayInfo)
 		}
 		relayInfo.EndAttempt()
+		if autoRequest {
+			// 只有真正进入上游派发的尝试才占用 auto 的真实派发预算。
+			autoBudget.confirmAttempt(relayInfo.HasUpstreamDispatch())
+		}
 
 		if newAPIError == nil {
 			if autoModelClientAbandoned(c, relayInfo) {
@@ -425,7 +433,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			// Model-specific failures retain sibling-model fallback. Channel-scoped
 			// failures skip its remaining models for this request only. Both spend
 			// the same frozen budget and retain pair-only persistent feedback.
-			if prepareAutoModelRetry(c, relayInfo, newAPIError, autoBudget.remainingRetries) &&
+			if prepareAutoModelRetry(c, relayInfo, newAPIError, autoBudget.remainingRetries()) &&
 				trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
 				continue
 			}
@@ -663,41 +671,47 @@ func autoModelCanceledRequestError(c *gin.Context, current *types.NewAPIError) *
 		types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 }
 
-// autoModelAttemptBudget is frozen by the first actual dispatch. Channel/model
-// switches cannot reset or enlarge it, including channel-specific retry overrides.
-// remainingRetries excludes the first attempt, avoiding an overflowing limit+1.
+// autoModelAttemptBudget 只约束**真实进入上游请求回调**的次数(含首次)。连接失败与
+// 上游 429 都是真实派发,必须计数;本地 RPM/每日限额拒绝、派发前资格失效与取消
+// 不占真实派发预算,因此也不能借"不占预算"任意重试——本地遍历、请求取消与路线
+// 去重仍由独立且有限的约束维持。
 //
-// auto 路径不再共用命名请求的 RetryTimes:那个值(本机 50)是为命名模型调优的,
-// auto 的每次重试都会真的换一个上游组合,50 次意味着一次请求能打 50+ 个上游。
-// auto 用自己更小的上限(见 operation_setting.AutoModelMaxAttempts)。
+// 两阶段记账:reserveAttempt 暂占一格 → relay 返回后按 HasUpstreamDispatch 确认或
+// 撤销。预算只在第一次真实派发确认时冻结;渠道 override 与换模型/组不能放大它。
+// remainingRetries 不含下一次派发,避免出现"上限+1"的溢出。
 type autoModelAttemptBudget struct {
-	started          bool
-	attempts         int
-	remainingRetries int
+	started    bool // 是否已有一次真实派发(预算已冻结)
+	attempts   int  // 本次请求已试过的总次数(含本地拒绝),仅用于日志/重试序号
+	dispatched int  // 真实上游派发次数,含首次
+	reserved   bool // 当前是否已暂占一格,relay 返回后必须 confirm 或撤销
 }
 
 func (b *autoModelAttemptBudget) canAttempt() bool {
-	return !b.started || b.remainingRetries > 0
+	return b.dispatched < operation_setting.AutoModelMaxAttempts()
 }
 
-func (b *autoModelAttemptBudget) beginAttempt(channel *model.Channel, retryParam *service.RetryParam) bool {
-	if !b.canAttempt() {
+func (b *autoModelAttemptBudget) reserveAttempt() bool {
+	if !b.canAttempt() || b.reserved {
 		return false
 	}
-	if !b.started {
-		// 记录渠道 override 到 retryParam 只是为了让下游拿到一致的重试序号;
-		// auto 自己的预算来自专用上限,不受它影响。
-		retryParam.SetEffectiveRetryTimesFromChannel(channel)
-		// remainingRetries 不含首次:上限 4 次 dispatch = 1 次首发 + 3 次重试。
-		b.remainingRetries = max(0, operation_setting.AutoModelMaxAttempts()-1)
-		retryParam.SetEffectiveRetryTimes(b.remainingRetries)
-		b.started = true
-	} else {
-		b.remainingRetries--
-	}
-	retryParam.SetRetry(b.attempts)
+	b.reserved = true
 	b.attempts++
 	return true
+}
+
+// confirmAttempt 在 relay 返回后立即调用;只有 dispatches=true 才真正消耗一格预算。
+func (b *autoModelAttemptBudget) confirmAttempt(dispatched bool) {
+	b.reserved = false
+	if !dispatched {
+		return
+	}
+	b.started = true
+	b.dispatched++
+}
+
+// remainingRetries 是当前剩余的真实重试次数(下一次派发不计入)。
+func (b *autoModelAttemptBudget) remainingRetries() int {
+	return max(0, operation_setting.AutoModelMaxAttempts()-b.dispatched)
 }
 
 func canRetryAutoModelRequest(c *gin.Context, info *relaycommon.RelayInfo) bool {
@@ -738,6 +752,15 @@ func prepareAutoModelRetry(c *gin.Context, info *relaycommon.RelayInfo, err *typ
 }
 
 const autoModelAttemptedRoutesKey = "auto_model_attempted_routes"
+const autoModelLocallyRejectedRoutesKey = "auto_model_locally_rejected_routes"
+
+// autoModelMaxLocalRejections 是单次请求允许的"派发前本地拒绝"总数上限。
+//
+// 本地拒绝(RPM 已满、每日限额、资格复验失败、渠道被排除)按设计不占真实派发
+// 预算,所以它必须有自己独立且有限的上界:否则一份在请求进行中被不断扩大的
+// 候选配置,能让单个请求无限遍历下去。跳过集合保证每条三元组最多被评估一次,
+// 这个上限再给"配置持续增长"这种情况一个硬边界。
+const autoModelMaxLocalRejections = 64
 
 // attemptedAutoModelRoutes 返回本次请求已经打过的路由集合。返回的是活跃的 map,
 // 调用方只读;要写入请走 markCurrentAutoModelRouteAttempted。
@@ -761,6 +784,38 @@ func markCurrentAutoModelRouteAttempted(c *gin.Context) {
 	}
 	attempted[route] = true
 	c.Set(autoModelAttemptedRoutesKey, attempted)
+}
+
+// locallyRejectedAutoModelRoutes 返回本次请求在**派发前**就被本地规则拒绝的路线。
+//
+// 它与 attempted 分开记录:attempted 是"真的打过这条三元组",这里是"还没派发
+// 就被否掉"。两者都必须从重排结果里排除,否则重排会把同一条失效路线反复放回
+// 队首,请求在"重排 → 队首被拒 → 再重排"之间空转。返回的是活跃 map,调用方只读。
+func locallyRejectedAutoModelRoutes(c *gin.Context) map[service.AutoModelRoute]bool {
+	if c == nil {
+		return nil
+	}
+	value, _ := c.Get(autoModelLocallyRejectedRoutesKey)
+	rejected, _ := value.(map[service.AutoModelRoute]bool)
+	return rejected
+}
+
+// markAutoModelRouteLocallyRejected 把一条派发前被拒的路线记进本请求的跳过集合。
+// 返回 false 表示本请求的本地拒绝已经到达上限,调用方必须停止继续遍历。
+func markAutoModelRouteLocallyRejected(c *gin.Context, route service.AutoModelRoute) bool {
+	if c == nil || route.ChannelID <= 0 || route.Group == "" || route.ModelName == "" {
+		return true
+	}
+	rejected := locallyRejectedAutoModelRoutes(c)
+	if rejected == nil {
+		rejected = make(map[service.AutoModelRoute]bool)
+	}
+	rejected[route] = true
+	c.Set(autoModelLocallyRejectedRoutesKey, rejected)
+	if len(rejected) >= autoModelMaxLocalRejections {
+		return false
+	}
+	return true
 }
 
 func newAutoModelRouteError(message string) *types.NewAPIError {
@@ -808,6 +863,11 @@ func getFixedAutoModelChannel(c *gin.Context, info *relaycommon.RelayInfo, route
 	if !operation_setting.AutoModelEnabled || !isAutoModelRouteAuthorized(c, info, route) {
 		return nil, types.NewErrorWithStatusCode(errors.New("auto model route is not authorized"),
 			types.ErrorCodeGetChannelFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry())
+	}
+	// 派发前用最新候选白名单+模型权重再复验一次:规划快照与这里之间,管理员
+	// 可能已经改了候选配置或把模型权重置零。首次绑定与每次重试共用这同一道边界。
+	if !service.ValidateAutoModelRouteCandidate(route.Group, route.ModelName) {
+		return nil, newAutoModelRouteError("auto model route is no longer an eligible candidate")
 	}
 	if canceledErr := autoModelCanceledRequestError(c, nil); canceledErr != nil {
 		return nil, canceledErr
@@ -874,11 +934,31 @@ func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam 
 		return false
 	}
 	next := common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex) + 1
-	if routes := service.RebuildAutoModelRoutePlanForRetry(c,
+	// 重排同时排除"已经打过"与"派发前就被本地否掉"的路线:前者防止重复上游尝试,
+	// 后者防止同一条失效路线被反复放回队首。
+	excludedRoutes := make(map[service.AutoModelRoute]bool)
+	for route := range attemptedAutoModelRoutes(c) {
+		excludedRoutes[route] = true
+	}
+	for route := range locallyRejectedAutoModelRoutes(c) {
+		excludedRoutes[route] = true
+	}
+	routes, rebuildStatus := service.RebuildAutoModelRoutePlanForRetry(c,
 		common.GetContextKeyString(c, constant.ContextKeyAutoModelRequestGroup),
-		attemptedAutoModelRoutes(c)); len(routes) > 0 {
+		excludedRoutes)
+	switch rebuildStatus {
+	case service.AutoModelRebuildReplaced:
 		service.ReplaceAutoModelRoutePlan(c, routes)
 		next = 0
+	case service.AutoModelRebuildEmpty:
+		// 重排后确无候选:清空计划并结束,绝不回退旧路线。
+		service.ReplaceAutoModelRoutePlan(c, nil)
+		return false
+	case service.AutoModelRebuildFailed:
+		// 刷新失败:停止继续派发,让调用方保留真实最后上游错误。
+		return false
+	default:
+		// AutoModelRebuildSkipped:没有已尝试路线,继续现计划单调前进。
 	}
 	channel, err := prepareAutoModelRouteFromIndex(c, info, retryParam, tokens, meta, next, true)
 	if err != nil {
@@ -905,6 +985,10 @@ func prepareAutoModelRouteFromIndex(c *gin.Context, info *relaycommon.RelayInfo,
 		channel, routeErr := getFixedAutoModelChannel(c, info, routes[index])
 		if routeErr != nil {
 			lastErr = routeErr
+			// 派发前被拒的路线进入本地跳过集合:重排不会把它放回队首。
+			if !markAutoModelRouteLocallyRejected(c, routes[index]) {
+				return nil, newAutoModelRouteError("auto model local route rejections exceeded the per-request bound")
+			}
 			continue
 		}
 		if routeErr = bindAutoModelRoute(c, info, retryParam, routes[index], index, channel, tokens, meta, reprice); routeErr != nil {
@@ -1222,8 +1306,9 @@ func flushAutoModelFeedback(c *gin.Context) {
 	for key := range pending {
 		keys = append(keys, key)
 	}
-	// Channel EWMA spans model keys and is order-sensitive. Never feed it in
-	// map iteration order, even though each individual model is deduplicated.
+	// 反馈必须按"本次请求内的观察顺序"应用:每个键只保留最后一条(替换语义),
+	// 而替换发生的时间点也要排在其他键的观察之后。绝不能按 map 迭代顺序乱序喂给
+	// 评分与冷却。
 	sort.Slice(keys, func(i, j int) bool {
 		return pending[keys[i]].sequence < pending[keys[j]].sequence
 	})

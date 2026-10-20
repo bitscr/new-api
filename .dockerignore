@@ -8,3 +8,35 @@ docs
 .eslintcache
 .gocache
 /web/node_modules
+
+# 本地密钥与敏感文件:镜像构建上下文绝不携带它们。
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+service-account*.json
+credentials*.json
+
+# 本地数据库 / 备份 / 日志 / HAR / 工具数据库与打包缓存
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+*-journal
+logs
+*.log
+*.har
+.codeartsdoer
+.codearts
+.cursor
+.cursorindex
+.sonarlint
+tiktoken_cache
+.gocache
+.gomodcache

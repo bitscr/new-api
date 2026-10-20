@@ -1,6 +1,7 @@
 package operation_setting
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -47,6 +48,66 @@ func TestAutoModelCandidatesEmptyInputIsValid(t *testing.T) {
 	}
 }
 
+// 发布必须是原子的:并发读只能看到完整旧值或完整新值,永远不能看到
+// "清空之后还没写回"的空中间态(那会让该瞬间的 auto 请求变成"未配置",
+// 从而放行该分组的全部启用模型)。
+func TestAutoModelCandidatesPublicationIsAtomic(t *testing.T) {
+	t.Cleanup(func() { _ = SetAutoModelCandidates("") })
+	require.NoError(t, SetAutoModelCandidates(`{"default": ["a"]}`))
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for reader := 0; reader < 4; reader++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				snapshot := GetAutoModelCandidates()
+				require.Len(t, snapshot, 1, "读到的配置永远是完整的")
+				models, configured := snapshot["default"]
+				require.True(t, configured)
+				require.Len(t, models, 1, "分组键存在时模型列表不能是空中间态")
+				require.Contains(t, []string{"a", "b"}, models[0])
+			}
+		}()
+	}
+	for i := 0; i < 200; i++ {
+		require.NoError(t, SetAutoModelCandidates(`{"default": ["a"]}`))
+		require.NoError(t, SetAutoModelCandidates(`{"default": ["b"]}`))
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// 非法输入必须被拒绝,且不能清掉正在生效的白名单。
+func TestRejectedAutoModelCandidatesLeaveLiveConfigIntact(t *testing.T) {
+	t.Cleanup(func() { _ = SetAutoModelCandidates("") })
+	require.NoError(t, SetAutoModelCandidates(`{"default": ["gpt-4o"]}`))
+	for _, bad := range []string{`not json`, `[]`, `{"default": {}}`} {
+		require.Error(t, ValidateAutoModelCandidates(bad), "%q 必须被拒绝", bad)
+		require.Error(t, SetAutoModelCandidates(bad), "%q 必须被拒绝", bad)
+	}
+	require.Equal(t, []string{"gpt-4o"}, GetAutoModelCandidates()["default"],
+		"校验失败不能清掉正在生效的白名单")
+}
+
+// getter 返回深拷贝:调用方修改返回的 map 或任一模型列表都不能改到在线配置。
+func TestAutoModelCandidatesGetterReturnsDeepCopy(t *testing.T) {
+	t.Cleanup(func() { _ = SetAutoModelCandidates("") })
+	require.NoError(t, SetAutoModelCandidates(`{"default": ["gpt-4o"]}`))
+
+	snapshot := GetAutoModelCandidates()
+	snapshot["default"][0] = "mutated"
+	snapshot["default"] = append(snapshot["default"], "extra")
+	delete(snapshot, "default")
+
+	require.Equal(t, []string{"gpt-4o"}, GetAutoModelCandidates()["default"])
+}
 // 权重:0 与缺省语义不同。0 = 该模型退出 auto;缺省 = 权重 1。
 func TestAutoModelWeightsZeroDisablesWhileAbsentDefaults(t *testing.T) {
 	t.Cleanup(func() { _ = SetAutoModelWeights("") })

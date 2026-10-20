@@ -42,14 +42,20 @@ func TestAutoModelRouteSnapshotDropsOnlyExcludedTriples(t *testing.T) {
 // 派发前就不可用"这条路径不会标记 attempted;空集也重排会让那个循环失去
 // "索引单调递增"这个原有的终止性上界。
 func TestRebuildAutoModelRoutePlanForRetryFallsBackWithoutAttemptsOrGroup(t *testing.T) {
-	require.Nil(t, RebuildAutoModelRoutePlanForRetry(nil, "g", map[AutoModelRoute]bool{
+	routes, status := RebuildAutoModelRoutePlanForRetry(nil, "g", map[AutoModelRoute]bool{
 		{Group: "g", ModelName: "a", ChannelID: 1}: true,
-	}))
+	})
+	require.Nil(t, routes)
+	require.Equal(t, AutoModelRebuildSkipped, status, "没有 gin 上下文时不能重排")
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	require.Nil(t, RebuildAutoModelRoutePlanForRetry(c, "g", nil), "空 attempted 必须退回原计划")
-	require.Nil(t, RebuildAutoModelRoutePlanForRetry(c, "", map[AutoModelRoute]bool{
+	routes, status = RebuildAutoModelRoutePlanForRetry(c, "g", nil)
+	require.Nil(t, routes)
+	require.Equal(t, AutoModelRebuildSkipped, status, "空 attempted 必须退回原计划")
+	routes, status = RebuildAutoModelRoutePlanForRetry(c, "", map[AutoModelRoute]bool{
 		{Group: "g", ModelName: "a", ChannelID: 1}: true,
-	}), "没有请求分组时不能凭空重排")
+	})
+	require.Nil(t, routes)
+	require.Equal(t, AutoModelRebuildEmpty, status, "没有请求分组时没有候选可重排")
 }
 
 // 重排必须用当前模型分重新排序,并丢掉已经打过的路:冻结计划里"还没试过的最优路"
@@ -67,7 +73,8 @@ func TestRebuildAutoModelRoutePlanForRetryReranksAndDropsAttempted(t *testing.T)
 		{Group: "g", ModelName: "route-a", ChannelID: 1}: true,
 	}
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	routes := RebuildAutoModelRoutePlanForRetry(c, "g", attempted)
+	routes, status := RebuildAutoModelRoutePlanForRetry(c, "g", attempted)
+	require.Equal(t, AutoModelRebuildReplaced, status)
 	require.NotEmpty(t, routes)
 	for _, route := range routes {
 		require.NotEqual(t, AutoModelRoute{Group: "g", ModelName: "route-a", ChannelID: 1}, route,

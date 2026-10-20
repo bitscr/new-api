@@ -354,13 +354,10 @@ func UpdateOption(c *gin.Context) {
 		// SetAutoModelCandidates 明确支持的语义。早先这里无条件 Unmarshal,
 		// 空串会被 JSON 解析拒掉——于是面板上把文本框删空再保存就报
 		// "unexpected end of JSON input",管理员没法把白名单改回不限制。
-		// 校验必须接受 setter 接受的输入。
-		if trimmed := strings.TrimSpace(option.Value.(string)); trimmed != "" {
-			var candidates map[string][]string
-			if err = common.Unmarshal([]byte(trimmed), &candidates); err != nil {
-				c.JSON(http.StatusOK, gin.H{"success": false, "message": "无效的 AutoModelCandidates JSON: " + err.Error()})
-				return
-			}
+		// 校验必须与 setter 共用同一份解析规则,不能在这里另写一套。
+		if err = operation_setting.ValidateAutoModelCandidates(option.Value.(string)); err != nil {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": "无效的 AutoModelCandidates JSON: " + err.Error()})
+			return
 		}
 	case "AutoModelWeights":
 		if err = operation_setting.ValidateAutoModelWeights(option.Value.(string)); err != nil {

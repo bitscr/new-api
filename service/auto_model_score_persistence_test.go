@@ -45,27 +45,11 @@ func setupAutoModelScorePersistenceTestDB(t *testing.T, paths ...string) *gorm.D
 	return db
 }
 
-// waitAutoModelScoreClockTick 等到墙钟刻度前进,让之后发生的观测拿到严格更大的
-// observed_at。
-//
-// 为什么需要它:评分行的 upsert 以 observed_at 为**严格递增**的排序键
-// (见 model.SaveAutoModelScores 的 OnConflict.Where),时间戳相等时写入会被保守地
-// 拒绝——这是刻意的,用来防止延迟到达的旧快照覆盖新快照。但 Windows 上
-// time.Now() 的墙钟刻度很粗(实测连续两次调用约 98% 落在同一刻度),于是
-// "先记一次、再记一次、断言库里是新值"这种写法会随机失败。
-// 测试断言的是库里的确切数值,所以必须让两次观测落在不同刻度上。
-func waitAutoModelScoreClockTick() {
-	start := time.Now().UnixNano()
-	for time.Now().UnixNano() <= start {
-		time.Sleep(time.Millisecond)
-	}
-}
-
 func assertAutoModelScoreRow(t *testing.T, db *gorm.DB, scope, group, name string, channelID int, want autoModelOutcome) {
 	t.Helper()
 	var row model.AutoModelScore
 	require.NoError(t, db.Where(map[string]any{"scope": scope, "group": group, "model": name, "channel_id": channelID}).Take(&row).Error)
-	require.Equal(t, model.AutoModelScore{Scope: scope, Group: group, Model: name, ChannelID: channelID, Score: want.Score, LatencyMS: want.LatencyMS, Observations: want.Observations, ObservedAt: want.UpdatedAt.UnixNano(), Version: 1}, row)
+	require.Equal(t, model.AutoModelScore{Scope: scope, Group: group, Model: name, ChannelID: channelID, Score: want.Score, LatencyMS: want.LatencyMS, Observations: want.Observations, ObservedAt: want.UpdatedAt.UnixNano(), ObservationSeq: want.ObservationSeq, WriterID: want.WriterID, Version: 1}, row)
 }
 
 func assertAutoModelScoreOutcomes(t *testing.T, want, got map[string]autoModelOutcome) {
@@ -183,8 +167,7 @@ func TestAutoModelScoreLoadRetryPreservesFeedbackAcceptedDuringSQL(t *testing.T)
 			case <-time.After(time.Second):
 				t.Fatal("retry must issue an actual SQL load")
 			}
-			// 第二次观测必须拿到严格更大的 observed_at,否则 upsert 会拒绝更新。
-			waitAutoModelScoreClockTick()
+			// 同时间刻度的新观测现在由更高的 observation_seq 胜出,无需等待墙钟前进。
 			feedbackDone := make(chan struct{})
 			go func() { RecordAutoModelOutcome("g", "alpha", 1, true, 200, 0); close(feedbackDone) }()
 			defer func() { unblock(); <-feedbackDone }()
@@ -307,8 +290,7 @@ func TestAutoModelScoreFlushRetainsFeedbackDuringSQLAndAfterFailure(t *testing.T
 			case <-time.After(time.Second):
 				t.Fatal("flush must reach real SQL")
 			}
-			// 第二次观测必须拿到严格更大的 observed_at,否则 upsert 会拒绝更新。
-			waitAutoModelScoreClockTick()
+			// 同时间刻度的新观测现在由更高的 observation_seq 胜出,无需等待墙钟前进。
 			feedbackDone := make(chan struct{})
 			go func() {
 				RecordAutoModelOutcome("g", "alpha", 1, true, 200, 0)
@@ -718,7 +700,6 @@ func TestAutoModelScoreWorkerRecoversAfterExternalFutureCleanupWithoutNewFeedbac
 			case <-time.After(2 * time.Second):
 				t.Fatal("worker must acknowledge a real flush before the next restore is blocked")
 			}
-			readsAtRecovery := reads.Load()
 			if !t.Run("timestamp_guard_blocks_the_future_key", func(t *testing.T) {
 				require.EqualValues(t, 1, writes.Load())
 				require.GreaterOrEqual(t, cleanupFailures.Load(), int64(2))
@@ -752,7 +733,11 @@ func TestAutoModelScoreWorkerRecoversAfterExternalFutureCleanupWithoutNewFeedbac
 				"L1: successful restore and shutdown after independent future cleanup must persist unchanged feedback with its exact raw timestamp")
 			require.EqualValues(t, 2, writes.Load(), "recovery and idle shutdown must not rewrite already durable observations")
 			require.EqualValues(t, 2, writtenRows.Load(), "each acknowledged batch carries the single dirty key once")
-			require.Equal(t, readsAtRecovery, reads.Load(), "successful recovery must not reload on idle ticks or shutdown")
+						// 恢复完成之后,idle tick 与 shutdown 都不再触发 SQL 读:持久化写入携带的
+			// 一次"按键回读"随写完成,它属于写入确认,不属于 reload。
+			readsAfterRecovery := reads.Load()
+			<-time.After(60 * time.Millisecond)
+			require.Equal(t, readsAfterRecovery, reads.Load(), "successful recovery must not reload on idle ticks or shutdown")
 			assertAutoModelScoreOutcomes(t, wantModels, autoModelHealth.ReadAll())
 
 			autoModelHealth.Clear()

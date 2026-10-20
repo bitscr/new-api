@@ -1,7 +1,10 @@
 package service
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -17,11 +20,44 @@ import (
 
 // autoModelOutcome 是一个被动健康摘要,粒度为 (分组, 模型, 渠道) 的模型层证据。
 // 数据仅来自真实请求的成功/失败反馈,绝不发送主动测活请求。
+//
+// ObservationSeq/WriterID 是快照排序元数据,与持久化行一一对应:UpdatedAt 保留
+// 真实观测时间(衰减与恢复都读它),而同一时间刻度上的先后由(序号,实例标识)
+// 给出确定性顺序。两者都只在评分锁内更新,见 nextAutoModelObservationSeq。
 type autoModelOutcome struct {
-	Score        float64
-	LatencyMS    float64
-	Observations float64
-	UpdatedAt    time.Time
+	Score          float64
+	LatencyMS      float64
+	Observations   float64
+	UpdatedAt      time.Time
+	ObservationSeq int64
+	WriterID       string
+}
+
+// autoModelWriterID 标识"这个进程",按进程生成一次,整个生命周期不变。
+// 它只用于同刻度快照的确定性冲突规则,不参与任何鉴权,也不写入日志之外的地方。
+var autoModelWriterID = newAutoModelWriterID()
+
+func newAutoModelWriterID() string {
+	buffer := make([]byte, 8)
+	if _, err := rand.Read(buffer); err != nil {
+		// crypto/rand 不可用时退回本地唯一值:标识必须非空且同进程稳定,
+		// 否则同刻度的跨实例冲突规则会退化成"永远平局"。
+		return fmt.Sprintf("local-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buffer)
+}
+
+// nextAutoModelObservationSeq 在评分锁内为一个三元组分配下一次观测的排序元数据。
+//
+// 序号是"同一进程、同一三元组"的单调计数,不是全局时钟:它唯一的职责是让同一
+// 时间刻度上的两次观测有确定的先后,从而不必等墙钟前进就能接纳新快照。
+// 从库里恢复的旧行带着它自己的序号继续递增(见 restore),不会回退。
+func nextAutoModelObservationSeq(previous autoModelOutcome) (int64, string) {
+	sequence := previous.ObservationSeq + 1
+	if sequence <= 0 {
+		sequence = 1
+	}
+	return sequence, autoModelWriterID
 }
 
 // Model evidence is scoped to (group, model, channel) and is the only signal the
@@ -169,6 +205,9 @@ func updateAutoModelOutcome(current autoModelOutcome, exists, success bool, late
 			current.LatencyMS = current.LatencyMS*(1-autoModelLatencyAlpha) + float64(latencyMs)*autoModelLatencyAlpha
 		}
 	}
+	// 每次真实观测都产生一个新快照:即使它落在与上一次相同的时间刻度上,序号
+	// 也让"后来者胜"成立。UpdatedAt 仍是真实观测时间,不在保存时刷新。
+	current.ObservationSeq, current.WriterID = nextAutoModelObservationSeq(current)
 	return current
 }
 
