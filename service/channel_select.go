@@ -3,7 +3,7 @@ package service
 import (
 	"errors"
 	"strconv"
-	"time"
+
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -170,39 +170,16 @@ func GetUsedChannelIDs(c *gin.Context) map[int]bool {
 // selectChannelWithUsedFallback 在完整优先级列表上先确定目标层，再排除已用渠道。
 // 中间层若已无未用渠道，返回 nil 让外层 retry 继续到下一优先级；
 // 只有目标层是最后一层且未用渠道耗尽时，才允许重用已试渠道。
+//
+// 这是具名模型的选渠路径。auto 请求不走这里:初选、重试与所有旁路都绑定
+// 统一规划给出的具体路线(docs/auto-routing-priority-model-bands-plan.md),
+// 缺少可用计划时返回既有错误,不退回普通随机选渠。
 func selectChannelWithUsedFallback(param *RetryParam, group string, modelName string, retry int, hardExcluded map[int]bool) (*model.Channel, error) {
 	used := GetUsedChannelIDs(param.Ctx)
-	var usedIDs map[int]bool
-	if len(used) > 0 {
-		usedIDs = used
-	}
-	// auto 路由：同一优先级层内按健康分优先挑渠道（分数并列的档内按权重加权随机），
-	// 而不是纯权重随机——纯权重会一直给已知很慢的渠道派流量。
-	if scoreFn := autoModelChannelScoreFnForGroup(param.Ctx, group, modelName); scoreFn != nil {
-		cooling := GetAutoModelCoolingChannelIDs(group, modelName)
-		hardExcluded = autoModelChannelExclusions(hardExcluded, cooling, nil)
-		return model.ChooseSatisfiedChannelByScore(group, modelName, retry, hardExcluded, usedIDs, scoreFn, autoScoreTieEpsilon)
-	}
 	if len(used) == 0 {
 		return model.GetRandomSatisfiedChannelWithExclusions(group, modelName, retry, hardExcluded)
 	}
 	return model.GetRandomSatisfiedChannelWithUsedFallback(group, modelName, retry, hardExcluded, used)
-}
-
-// autoModelChannelExclusions always excludes cooling routes before priority
-// selection, including when every route is cooling or no target snapshot exists.
-// The legacy targets argument is retained for callers but cannot relax cooldowns.
-func autoModelChannelExclusions(hardExcluded, cooling map[int]bool, _ []model.AutoModelRoutingTarget) map[int]bool {
-	excluded := make(map[int]bool, len(hardExcluded)+len(cooling))
-	for id, blocked := range hardExcluded {
-		excluded[id] = blocked
-	}
-	for id, blocked := range cooling {
-		if blocked {
-			excluded[id] = true
-		}
-	}
-	return excluded
 }
 
 // ShouldAvoidAutoModelAffinity keeps affinity from bypassing model/channel cooldown.
@@ -210,35 +187,6 @@ func autoModelChannelExclusions(hardExcluded, cooling map[int]bool, _ []model.Au
 func ShouldAvoidAutoModelAffinity(c *gin.Context, group, modelName string, channelID int) bool {
 	return c != nil && common.GetContextKeyString(c, constant.ContextKeyAutoModelClientName) != "" &&
 		GetAutoModelCoolingChannelIDs(group, modelName)[channelID]
-}
-
-// autoModelChannelScoreFn retains the context-based helper for callers with a
-// resolved group. Cross-group selection uses its actual group explicitly.
-func autoModelChannelScoreFn(c *gin.Context, modelName string) func(int) float64 {
-	if c == nil {
-		return nil
-	}
-	return autoModelChannelScoreFnForGroup(c, common.GetContextKeyString(c, constant.ContextKeyUsingGroup), modelName)
-}
-
-// Each channel-selection operation uses one health snapshot, not a request-wide
-// snapshot: retries may observe feedback from other completed requests.
-func autoModelChannelScoreFnForGroup(c *gin.Context, group, modelName string) func(int) float64 {
-	if c == nil || modelName == "" || group == "" {
-		return nil
-	}
-	if common.GetContextKeyString(c, constant.ContextKeyAutoModelClientName) == "" {
-		return nil
-	}
-	health := autoModelHealth.ReadAll()
-	now := time.Now()
-	return func(channelID int) float64 {
-		outcome, ok := health[autoModelHealthKey(group, modelName, channelID)]
-		if !ok {
-			return 0.5
-		}
-		return effectiveScore(outcome, now)
-	}
 }
 
 func getChannelSkippedIDs(c *gin.Context, key string) map[int]bool {

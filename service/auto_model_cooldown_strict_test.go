@@ -8,6 +8,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -16,8 +17,11 @@ func TestAutoModelAllCoolingRoutesAreSkippedInBothSelectors(t *testing.T) {
 	db := setupMultiGroupChannelSelectionTest(t)
 	require.NoError(t, db.AutoMigrate(&model.AutoModelCooldown{}))
 	autoModelTestReset()
-	LoadAutoModelCooldowns()
+	oldEnabled := operation_setting.AutoModelEnabled
+	operation_setting.AutoModelEnabled = true
+	t.Cleanup(func() { operation_setting.AutoModelEnabled = oldEnabled })
 	t.Cleanup(autoModelTestReset)
+	LoadAutoModelCooldowns()
 	high, low := int64(100), int64(0)
 	require.NoError(t, db.Create(&[]model.Channel{
 		{Id: 31, Key: "high", Status: common.ChannelStatusEnabled, Group: "g", Models: "m,other-failed,other-healthy", Priority: &high},
@@ -37,15 +41,25 @@ func TestAutoModelAllCoolingRoutesAreSkippedInBothSelectors(t *testing.T) {
 	common.SetContextKey(c, constant.ContextKeyAutoModelClientName, "auto")
 	common.SetContextKey(c, constant.ContextKeyUsingGroup, "g")
 	c.Set("use_channel", []string{"31", "31", "32", "32"})
+	// 具名选路的真实入口是 CacheGetRandomSatisfiedChannel:它在调用
+	// selectChannelWithUsedFallback 前把冷却组合合并进排除集。这里按同一
+	// 顺序组装,保持对生产调用链的忠实。
+	namedSelection := func(modelName string, retry int) (*model.Channel, error) {
+		excluded := GetAutoModelHardExcludedChannelIDs(c)
+		if operation_setting.AutoModelEnabled {
+			mergeCoolingAutoModelChannelIDs(c, "g", modelName, excluded)
+		}
+		return selectChannelWithUsedFallback(&RetryParam{Ctx: c}, "g", modelName, retry, excluded)
+	}
 
 	for _, memory := range []bool{true, false} {
 		common.MemoryCacheEnabled = memory
 		for _, retry := range []int{0, 1, 20} {
-			selected, err := selectChannelWithUsedFallback(&RetryParam{Ctx: c}, "g", "m", retry, GetAutoModelHardExcludedChannelIDs(c))
+			selected, err := namedSelection("m", retry)
 			require.NoError(t, err)
 			require.Nil(t, selected, "all-cooling routes cannot be revived by priority or used-channel fallback")
 		}
-		selected, err := selectChannelWithUsedFallback(&RetryParam{Ctx: c}, "g", "other-healthy", 0, GetAutoModelHardExcludedChannelIDs(c))
+		selected, err := namedSelection("other-healthy", 0)
 		require.NoError(t, err)
 		require.NotNil(t, selected, "two other failed models must not hard-exclude this healthy model's channel")
 		require.Equal(t, 31, selected.Id)
@@ -58,7 +72,7 @@ func TestAutoModelAllCoolingRoutesAreSkippedInBothSelectors(t *testing.T) {
 	autoModelCooldowns.Set(autoModelHealthKey("g", "m", 32), state)
 	for _, memory := range []bool{true, false} {
 		common.MemoryCacheEnabled = memory
-		selected, err := selectChannelWithUsedFallback(&RetryParam{Ctx: c}, "g", "m", 0, GetAutoModelHardExcludedChannelIDs(c))
+		selected, err := namedSelection("m", 0)
 		require.NoError(t, err)
 		require.NotNil(t, selected)
 		require.Equal(t, 32, selected.Id)

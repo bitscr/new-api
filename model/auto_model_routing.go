@@ -13,10 +13,11 @@ import (
 // on an existing, enabled channel, never a mutable cached Channel reference.
 // Priority is Channel.Priority (nil means zero), not Ability.Priority.
 // Weight is a CHANNEL selection weight, never a per-model selection weight:
-// it is Channel.Weight (nil means zero) in memory-cache mode and Channel.Weight
-// + 10 in DB mode to preserve the existing DB sampling smoothing. Ability.Weight
-// is deliberately ignored. An all-zero memory weight band is sampled uniformly;
-// model-selection weights are configured independently of this snapshot.
+// it is the raw Channel.Weight (nil means zero) in both memory-cache and DB
+// modes — the legacy DB-mode "+10" sampling smoothing is not applied for auto,
+// so both cache modes produce identical plans. Ability.Weight is deliberately
+// ignored. An all-zero weight band is sampled uniformly; model-selection
+// weights are configured independently of this snapshot.
 type AutoModelRoutingTarget struct {
 	ChannelID int
 	Priority  int64
@@ -100,9 +101,6 @@ func queryAutoModelRoutingTargets(group string) (map[string][]AutoModelRoutingTa
 		if row.Weight != nil {
 			target.Weight = float64(*row.Weight)
 		}
-		if !common.MemoryCacheEnabled {
-			target.Weight += 10
-		}
 		result[row.Model] = append(result[row.Model], target)
 	}
 	return result, nil
@@ -129,8 +127,8 @@ func GetAutoModelRoutingTargetsFresh(group string) (map[string][]AutoModelRoutin
 // GetAutoModelRoutingTargets snapshots a group's enabled abilities joined to
 // existing, enabled channels in one batch query, with no per-channel queries.
 // Both cache modes query the database: the legacy channel cache is built from
-// Channel.Models/Group and does not preserve Ability.Enabled. Only the channel
-// weight smoothing differs between modes; eligibility and priorities do not.
+// Channel.Models/Group and does not preserve Ability.Enabled. Weights,
+// eligibility and priorities are identical between modes.
 // The result has no guaranteed order. The returned map is a private deep copy:
 // callers may modify it freely without affecting the cache or other callers.
 func GetAutoModelRoutingTargets(group string) (map[string][]AutoModelRoutingTarget, error) {

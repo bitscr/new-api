@@ -182,3 +182,21 @@ func TestExcludeCoolingCandidates(t *testing.T) {
 
 	require.Empty(t, excludeCoolingCandidates([]string{}, map[string]bool{}))
 }
+
+// 长挂起被取消的尝试要留下冷却证据:派发了却 20 秒+零响应的上游会一直占住
+// 计划头部,不记的话每个客户端超时都死在同一个组合上。短取消(<20s)仍不记录。
+func TestRecordAutoModelAbandonedAttempt(t *testing.T) {
+	setupAutoModelCooldownTestDB(t)
+
+	// 短取消:可能是客户端主动放弃,不算上游的证据
+	RecordAutoModelAbandonedAttempt("default", "m", 1, 3000)
+	require.Empty(t, ListAutoModelCooldowns(time.Now()))
+
+	// 长挂起:记一次抖动冷却
+	RecordAutoModelAbandonedAttempt("default", "m", 1, 120000)
+	rows := ListAutoModelCooldowns(time.Now())
+	require.Len(t, rows, 1)
+	require.Equal(t, 1, rows[0].Level)
+	require.Contains(t, rows[0].Reason, "零响应", "冷却原因要说明这是长挂起")
+	require.Greater(t, rows[0].RemainingSeconds, int64(0))
+}

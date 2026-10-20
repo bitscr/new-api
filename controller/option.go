@@ -434,10 +434,10 @@ func UpdateOption(c *gin.Context) {
 				return
 			}
 		}
-	case "AutoModelPriorityOverrideMargin":
-		// 反超阈值是浮点数,不能走上面那个"至少 1 的整数"分支。
-		// 只拒绝负数与 NaN/Inf:0 和 >= 1 都是合法且有意义的选择
-		// (分别代表"健康分完全接管顺序"和"关闭反超,回到旧行为")。
+	case "AutoModelScoreBandWidth":
+		// 模型得分同档宽度是浮点数,不能走"至少 1 的整数"分支。
+		// 只拒绝负数与 NaN/Inf:0(仅同分随机)和 >= 1(同优先级全部同档)
+		// 都是合法且有意义的选择。
 		parsed, parseErr := strconv.ParseFloat(strings.TrimSpace(option.Value.(string)), 64)
 		if parseErr != nil {
 			c.JSON(http.StatusOK, gin.H{
@@ -446,7 +446,7 @@ func UpdateOption(c *gin.Context) {
 			})
 			return
 		}
-		if message := operation_setting.ValidateAutoModelPriorityOverrideMargin(parsed); message != "" {
+		if message := operation_setting.ValidateAutoModelScoreBandWidth(parsed); message != "" {
 			c.JSON(http.StatusOK, gin.H{"success": false, "message": message})
 			return
 		}

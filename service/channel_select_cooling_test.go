@@ -26,7 +26,8 @@ func TestMergeCoolingAutoModelChannelIDs(t *testing.T) {
 
 	excluded := map[int]bool{}
 	mergeCoolingAutoModelChannelIDs(c, "default", "m1", excluded)
-	require.Empty(t, excluded, "无冷却时排除集为空")	tripAutoModelCooldown("default", "m1", 1, "测试", time.Now())
+	require.Empty(t, excluded, "无冷却时排除集为空")
+	tripAutoModelCooldown("default", "m1", 1, "测试", time.Now())
 	tripAutoModelCooldown("default", "m1", 2, "测试", time.Now())
 	excluded = map[int]bool{}
 	mergeCoolingAutoModelChannelIDs(c, "default", "m1", excluded)

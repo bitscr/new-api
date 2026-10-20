@@ -222,39 +222,6 @@ func chooseAbilityByWeight(abilities []Ability) int {
 	return 0
 }
 
-// chooseAbilityByScore 与 GetChannelWithUsedFallback 相同，但同一层内先看健康分：
-// 分数最高的一档优先，档内才按 ability 权重加权随机。给 auto 路由用（直连数据库路径）。
-func chooseAbilityByScore(group string, model string, retry int, hardExcluded, usedChannelIDs map[int]bool, score func(channelID int) float64, tieEpsilon float64) (*Channel, error) {
-	abilities, err := tierAbilities(group, model, retry, hardExcluded, usedChannelIDs)
-	if err != nil || len(abilities) == 0 {
-		return nil, err
-	}
-	best, haveBest := 0.0, false
-	for _, ability := range abilities {
-		if s := score(ability.ChannelId); !haveBest || s > best {
-			best, haveBest = s, true
-		}
-	}
-	eligible := make([]Ability, 0, len(abilities))
-	for _, ability := range abilities {
-		if !haveBest || score(ability.ChannelId) >= best-tieEpsilon {
-			eligible = append(eligible, ability)
-		}
-	}
-	if len(eligible) == 0 {
-		eligible = abilities
-	}
-	channelID := chooseAbilityByWeight(eligible)
-	if channelID <= 0 {
-		return nil, nil
-	}
-	channel := Channel{}
-	if err := DB.First(&channel, "id = ?", channelID).Error; err != nil {
-		return nil, err
-	}
-	return &channel, nil
-}
-
 func GetChannelWithExclusions(group string, model string, retry int, excludedChannelIDs map[int]bool) (*Channel, error) {
 	var abilities []Ability
 

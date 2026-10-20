@@ -19,8 +19,7 @@ func autoModelRouteTestOutcome(score float64, now time.Time) autoModelOutcome {
 	return autoModelOutcome{Score: score, Observations: 20, UpdatedAt: now}
 }
 
-// autoModelRouteChannelOrder 把计划里的渠道 ID 按出现顺序抽出来。
-// 渠道是"先把一条渠道的所有模型排完再换下一条",所以这里按去重后的首次出现顺序取值。
+// autoModelRouteChannelOrder 把计划里的渠道 ID 按首次出现顺序抽出来。
 func autoModelRouteChannelOrder(routes []AutoModelRoute) []int {
 	var order []int
 	seen := make(map[int]bool, len(routes))
@@ -34,285 +33,304 @@ func autoModelRouteChannelOrder(routes []AutoModelRoute) []int {
 	return order
 }
 
-func TestAutoModelRoutePlanIsTrulyChannelFirst(t *testing.T) {
+// setAutoModelScoreBandWidthForTest 显式设定档宽并在结束时还原,测试不依赖
+// 环境配置的巧合值。
+func setAutoModelScoreBandWidthForTest(t *testing.T, width float64) {
+	t.Helper()
+	old := operation_setting.AutoModelScoreBandWidth()
+	t.Cleanup(func() { operation_setting.SetAutoModelScoreBandWidth(old) })
+	operation_setting.SetAutoModelScoreBandWidth(width)
+}
+
+// priority 是硬边界:高 priority 的 0.4 分候选排在低 priority 的 0.99 前面,
+// 低优先级层的全部路线都排在仍有候选的高优先级层之后。
+func TestAutoModelPriorityIsHardBoundary(t *testing.T) {
+	setAutoModelScoreBandWidthForTest(t, 0.01)
+
 	now := time.Unix(1700000000, 0)
 	snapshot := autoModelRouteSnapshot{
 		Now: now,
 		Targets: map[string][]model.AutoModelRoutingTarget{
-			"a-high": {{ChannelID: 1, Priority: 7, Weight: 1}},
-			"a-low":  {{ChannelID: 1, Priority: 7, Weight: 1}},
-			"b-high": {{ChannelID: 2, Priority: 7, Weight: 10000}},
-		},
-		ChannelHealth: map[string]autoModelOutcome{
-			autoModelChannelHealthKey("g", 1): autoModelRouteTestOutcome(0.9, now),
-			autoModelChannelHealthKey("g", 2): autoModelRouteTestOutcome(0.7, now),
+			"m":     {{ChannelID: 1, Priority: 10, Weight: 1}, {ChannelID: 2, Weight: 1}},
+			"other": {{ChannelID: 1, Priority: 10, Weight: 1}, {ChannelID: 2, Weight: 1}},
 		},
 		ModelHealth: map[string]autoModelOutcome{
-			autoModelHealthKey("g", "a-high", 1): autoModelRouteTestOutcome(0.9, now),
-			autoModelHealthKey("g", "a-low", 1):  autoModelRouteTestOutcome(0.1, now),
-			autoModelHealthKey("g", "b-high", 2): autoModelRouteTestOutcome(1, now),
+			autoModelHealthKey("g", "m", 1):     autoModelRouteTestOutcome(0.4, now),
+			autoModelHealthKey("g", "m", 2):     autoModelRouteTestOutcome(0.99, now),
+			autoModelHealthKey("g", "other", 1): autoModelRouteTestOutcome(0.98, now),
+			autoModelHealthKey("g", "other", 2): autoModelRouteTestOutcome(0.97, now),
 		},
 	}
+	got := buildAutoModelRoutesFromSnapshot("g", []string{"m", "other"}, snapshot, func() float64 { return 0.99 })
+	// priority 10 层(other@1 0.98、m@1 0.4)整层排在 priority 0 层(m@2 0.99、
+	// other@2 0.97)之前——0.99 的高分也越不过优先级硬边界。层内按模型分档,
+	// 各档单条路线,顺序确定。
+	require.Equal(t, []AutoModelRoute{
+		{Group: "g", ModelName: "other", ChannelID: 1},
+		{Group: "g", ModelName: "m", ChannelID: 1},
+		{Group: "g", ModelName: "m", ChannelID: 2},
+		{Group: "g", ModelName: "other", ChannelID: 2},
+	}, got, "the whole priority-10 tier precedes the priority-0 tier even with a 0.99 model there")
+}
+
+// 同 priority 的模型分跨渠道比较:B 渠道上显著更高的模型必须领先;渠道健康分
+// 不参与排序(快照里根本没有渠道层数据也能排)。
+func TestAutoModelRoutesInterleaveAcrossChannelsByModelScore(t *testing.T) {
+	setAutoModelScoreBandWidthForTest(t, 0.01)
+
+	now := time.Unix(1700000000, 0)
+	snapshot := autoModelRouteSnapshot{
+		Now: now,
+		Targets: map[string][]model.AutoModelRoutingTarget{
+			"a-high": {{ChannelID: 1, Weight: 1}},
+			"a-low":  {{ChannelID: 1, Weight: 1}},
+			"b-high": {{ChannelID: 2, Weight: 1}},
+		},
+		ModelHealth: map[string]autoModelOutcome{
+			autoModelHealthKey("g", "a-high", 1): autoModelRouteTestOutcome(0.894, now),
+			autoModelHealthKey("g", "a-low", 1):  autoModelRouteTestOutcome(0.850, now),
+			autoModelHealthKey("g", "b-high", 2): autoModelRouteTestOutcome(0.897, now),
+		},
+	}
+	// 0.897 与 0.894 差 0.003 < 档宽:同档。同档内两级抽样,渠道等权;
+	// 固定随机源下按稳定枚举顺序可复现:draw 0.99 选中渠道 2,先输出 b-high,
+	// 再回到渠道 1 的 a-high(0.894),最后是更低一档的 a-low。
 	got := buildAutoModelRoutesFromSnapshot("g", []string{"b-high", "a-low", "a-high"}, snapshot, func() float64 { return 0.99 })
 	require.Equal(t, []AutoModelRoute{
+		{Group: "g", ModelName: "b-high", ChannelID: 2},
 		{Group: "g", ModelName: "a-high", ChannelID: 1},
 		{Group: "g", ModelName: "a-low", ChannelID: 1},
-		{Group: "g", ModelName: "b-high", ChannelID: 2},
-	}, got, "finish channel A's models before B even when B's model and weight are better")
-
-	// A model cannot promote a channel: only the independent channel summary
-	// changes the selected channel. No maximum/expected model score is involved.
-	snapshot.ChannelHealth[autoModelChannelHealthKey("g", 1)] = autoModelRouteTestOutcome(0.1, now)
-	got = buildAutoModelRoutesFromSnapshot("g", []string{"a-high", "a-low", "b-high"}, snapshot, nil)
-	require.Equal(t, 2, got[0].ChannelID)
-	require.Equal(t, "a-high", got[1].ModelName)
-	require.Equal(t, "a-low", got[2].ModelName)
+	}, got, "equal-priority routes interleave across channels by model score")
 }
 
-// 渠道顺序由"健康分档 + priority"决定:健康分差距小于档宽时 priority 说话,
-// 差距超过档宽时健康分自己分档。这条测试钉住三种情形。
-func TestAutoModelRoutesKeepPriorityUntilHealthOverridesIt(t *testing.T) {
-	oldMargin := operation_setting.AutoModelPriorityOverrideMargin()
-	t.Cleanup(func() { operation_setting.SetAutoModelPriorityOverrideMargin(oldMargin) })
+// 分档锚定在"尚未分档路线里的最高分":有效分相近的三条同档,明显更低的另起一档;
+// 非链式:不能因为相邻差值都小于档宽就串成一档。模型排列的输入顺序不得改变档位。
+// 分数为原始观测分:有效分 = 0.5+(score-0.5)*置信度(observations 封顶 20),
+// 边界值按缩放后的有效分选取(0.900/0.895/0.890 的有效分距锚点 <= 0.0087 同档,
+// 0.850 的有效分距锚点 0.0435 另档)。
+func TestAutoModelScoreBandsAnchorAtBandMaximum(t *testing.T) {
+	setAutoModelScoreBandWidthForTest(t, 0.01)
 
 	now := time.Unix(1700000000, 0)
-	snapshot := autoModelRouteSnapshot{
-		Now: now,
-		Targets: map[string][]model.AutoModelRoutingTarget{
-			"m": {
-				{ChannelID: 1, Priority: 5, Weight: 1},
-				{ChannelID: 2, Priority: 5, Weight: 1e100},
-				{ChannelID: 3, Priority: -1, Weight: 1e200},
+	newSnapshot := func(names []string, scores map[string]float64) autoModelRouteSnapshot {
+		targets := map[string][]model.AutoModelRoutingTarget{}
+		health := map[string]autoModelOutcome{}
+		for _, name := range names {
+			targets[name] = []model.AutoModelRoutingTarget{{ChannelID: 1, Weight: 1}}
+			health[autoModelHealthKey("g", name, 1)] = autoModelRouteTestOutcome(scores[name], now)
+		}
+		return autoModelRouteSnapshot{Now: now, Targets: targets, ModelHealth: health}
+	}
+	// 0.900/0.895/0.890 的有效分(0.848/0.843/0.839)同档,0.850 的有效分(0.804)
+	// 距锚点 > 档宽:另起一档。单渠道同权重,档内顺序随机;能确定的是 m4 必须垫底。
+	got := buildAutoModelRoutesFromSnapshot("g", []string{"m1", "m2", "m3", "m4"}, newSnapshot([]string{"m1", "m2", "m3", "m4"}, map[string]float64{"m1": 0.900, "m2": 0.895, "m3": 0.890, "m4": 0.850}), func() float64 { return 0.5 })
+	require.Len(t, got, 4)
+	require.Equal(t, "m4", got[3].ModelName, "0.850 is a separate band behind 0.900/0.895/0.890")
+	require.ElementsMatch(t, []string{"m1", "m2", "m3"},
+		[]string{got[0].ModelName, got[1].ModelName, got[2].ModelName})
+
+	// 非链式:0.888 的有效分(0.837)距锚点 0.0104 > 档宽另起一档,但距相邻项
+	// 0.895 的有效分(0.843)只差 0.006。若错误地锚定相邻项,三条会串成一档,
+	// m3 不会垫底。
+	got = buildAutoModelRoutesFromSnapshot("g", []string{"m1", "m2", "m3"},
+		newSnapshot([]string{"m1", "m2", "m3"}, map[string]float64{"m1": 0.900, "m2": 0.895, "m3": 0.888}), func() float64 { return 0.5 })
+	require.Len(t, got, 3)
+	require.Equal(t, "m3", got[2].ModelName, "0.888 starts a new band; banding must not chain via the previous item")
+	require.ElementsMatch(t, []string{"m1", "m2"}, []string{got[0].ModelName, got[1].ModelName})
+
+	// 输入顺序不影响档位:候选倒序重排,结论一致。
+	got = buildAutoModelRoutesFromSnapshot("g", []string{"m3", "m2", "m1", "m4"},
+		newSnapshot([]string{"m4", "m3", "m2", "m1"}, map[string]float64{"m1": 0.900, "m2": 0.895, "m3": 0.890, "m4": 0.850}), func() float64 { return 0.5 })
+	require.Len(t, got, 4)
+	require.Equal(t, "m4", got[3].ModelName)
+}
+
+// 档宽端点:0 = 仅同分随机(浮点容差 1e-9);>= 1 = 同优先级全部同档;
+// 非法负数在运行时回退默认值。
+func TestAutoModelScoreBandWidthEndpoints(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	newSnapshot := func() autoModelRouteSnapshot {
+		return autoModelRouteSnapshot{
+			Now: now,
+			Targets: map[string][]model.AutoModelRoutingTarget{
+				"high": {{ChannelID: 1, Weight: 1}},
+				"low":  {{ChannelID: 1, Weight: 1}},
 			},
-		},
-		ChannelHealth: map[string]autoModelOutcome{
-			autoModelChannelHealthKey("g", 1): autoModelRouteTestOutcome(0.4, now),
-			autoModelChannelHealthKey("g", 2): autoModelRouteTestOutcome(0.1, now),
-			autoModelChannelHealthKey("g", 3): autoModelRouteTestOutcome(1, now),
-		},
-	}
-	// 档宽 >= 1.0 时(健康分上限是 1.0)所有渠道同档,priority 完全决定顺序:
-	// 这就是旧行为,也是这个开关的"关闭分档"端点。
-	operation_setting.SetAutoModelPriorityOverrideMargin(1)
-	require.Equal(t, []AutoModelRoute{
-		{Group: "g", ModelName: "m", ChannelID: 1},
-		{Group: "g", ModelName: "m", ChannelID: 2},
-		{Group: "g", ModelName: "m", ChannelID: 3},
-	}, buildAutoModelRoutesFromSnapshot("g", []string{"m"}, snapshot, func() float64 { return 0.99 }),
-		"with the override disabled, priority dominates score and score dominates weight")
-
-	// 默认档宽:渠道 3 的健康分比上面两条高出一整档,于是自己占一档排到最前;
-	// 1 与 2 同档同 priority,仍按分数排。
-	operation_setting.SetAutoModelPriorityOverrideMargin(0.25)
-	require.Equal(t, []AutoModelRoute{
-		{Group: "g", ModelName: "m", ChannelID: 3},
-		{Group: "g", ModelName: "m", ChannelID: 1},
-		{Group: "g", ModelName: "m", ChannelID: 2},
-	}, buildAutoModelRoutesFromSnapshot("g", []string{"m"}, snapshot, func() float64 { return 0.99 }),
-		"a much healthier low-priority channel forms a better band and leads")
-
-	// 分差不足一档时健康分压不过 priority:渠道 3 落到与渠道 1 同档,于是 priority
-	// 把渠道 1 排在前面。渠道 2 虽然与渠道 1 同 priority,但健康分低了一整档,仍排在最后。
-	// 这一条是防抖:档宽本身就是迟滞,临界处不能来回跳。
-	snapshot.ChannelHealth[autoModelChannelHealthKey("g", 3)] = autoModelRouteTestOutcome(0.6, now)
-	require.Equal(t, []AutoModelRoute{
-		{Group: "g", ModelName: "m", ChannelID: 1},
-		{Group: "g", ModelName: "m", ChannelID: 3},
-		{Group: "g", ModelName: "m", ChannelID: 2},
-	}, buildAutoModelRoutesFromSnapshot("g", []string{"m"}, snapshot, func() float64 { return 0.99 }),
-		"a lead smaller than the band width is not enough to outrank a higher priority")
-}
-
-// 分档锚定在"档内最高分",不是"上一条渠道的分数"。锚在相邻项上会让一串接近但
-// 不等的分数被串成一档,把真正不同的健康度混在一起——这里三条渠道的分数正是
-// 这种链式接近,两种规则的最终顺序完全不同,所以这条测试能分辨它们。
-func TestAutoModelHealthBandsAnchorAtBandMaximum(t *testing.T) {
-	oldMargin := operation_setting.AutoModelPriorityOverrideMargin()
-	t.Cleanup(func() { operation_setting.SetAutoModelPriorityOverrideMargin(oldMargin) })
-	operation_setting.SetAutoModelPriorityOverrideMargin(0.25)
-
-	now := time.Unix(1700000000, 0)
-	snapshot := autoModelRouteSnapshot{
-		Now: now,
-		Targets: map[string][]model.AutoModelRoutingTarget{
-			"m": {
-				{ChannelID: 1, Priority: 1, Weight: 1},
-				{ChannelID: 2, Priority: 5, Weight: 1},
-				{ChannelID: 3, Priority: 10, Weight: 1},
+			ModelHealth: map[string]autoModelOutcome{
+				autoModelHealthKey("g", "high", 1): autoModelRouteTestOutcome(0.99, now),
+				autoModelHealthKey("g", "low", 1):  autoModelRouteTestOutcome(0.10, now),
 			},
-		},
-		ChannelHealth: map[string]autoModelOutcome{
-			autoModelChannelHealthKey("g", 1): autoModelRouteTestOutcome(1.0, now),
-			autoModelChannelHealthKey("g", 2): autoModelRouteTestOutcome(0.8, now),
-			autoModelChannelHealthKey("g", 3): autoModelRouteTestOutcome(0.6, now),
-		},
+		}
 	}
-	// 锚定在档内最高分:渠道 1 与 2 同档(0.8 距 1.0 不足一档),渠道 3 低一整档。
-	// 于是渠道 2 凭 priority 领先渠道 1,而 priority 最高的渠道 3 因为低一档垫底。
-	// 若改成锚定上一条(0.8),三条会挤进同一档,顺序会变成 3、2、1。
-	require.Equal(t, []int{2, 1, 3}, autoModelRouteChannelOrder(
-		buildAutoModelRoutesFromSnapshot("g", []string{"m"}, snapshot, func() float64 { return 0.99 })))
+
+	// 档宽 0:不同分各自成档,低分也不能越档。
+	setAutoModelScoreBandWidthForTest(t, 0)
+	got := buildAutoModelRoutesFromSnapshot("g", []string{"high", "low"}, newSnapshot(), func() float64 { return 0.99 })
+	require.Equal(t, []string{"high", "low"}, autoModelRouteModelNames(got),
+		"width 0 keeps strict score order")
+
+	// 档宽 >= 1:同优先级内全部同档,低分候选可以被随机抽到队首。
+	setAutoModelScoreBandWidthForTest(t, 1)
+	got = buildAutoModelRoutesFromSnapshot("g", []string{"high", "low"}, newSnapshot(), func() float64 { return 0.99 })
+	require.Equal(t, []string{"low", "high"}, autoModelRouteModelNames(got),
+		"width >= 1 puts everything into one band where weights decide")
+
+	// 非法负数:运行时回退默认 0.01。
+	setAutoModelScoreBandWidthForTest(t, -1)
+	require.Equal(t, 0.01, operation_setting.AutoModelScoreBandWidth(), "a negative width falls back to the default")
+	got = buildAutoModelRoutesFromSnapshot("g", []string{"high", "low"}, newSnapshot(), nil)
+	require.Equal(t, "high", got[0].ModelName, "with the default width the 0.99 candidate leads its own band")
 }
 
-// 同 priority 的渠道之间不产生"反超":它们本来就在同一档里比分数。
-func TestAutoModelHealthBandsKeepSamePriorityOrderedByScore(t *testing.T) {
-	oldMargin := operation_setting.AutoModelPriorityOverrideMargin()
-	t.Cleanup(func() { operation_setting.SetAutoModelPriorityOverrideMargin(oldMargin) })
-	operation_setting.SetAutoModelPriorityOverrideMargin(0.25)
+// 冷启动没有"未观测渠道强制进最好档"的例外:没有观测的路线按中立 0.5 参与分档。
+// 全中性时 priority 决定顺序;同优先级里被证明的 0.9 领先中性的 0.5。
+func TestAutoModelColdStartUsesNeutralScoreWithoutException(t *testing.T) {
+	setAutoModelScoreBandWidthForTest(t, 0.01)
 
 	now := time.Unix(1700000000, 0)
 	snapshot := autoModelRouteSnapshot{
 		Now: now,
 		Targets: map[string][]model.AutoModelRoutingTarget{
-			"m": {
-				{ChannelID: 1, Priority: 7, Weight: 1},
-				{ChannelID: 2, Priority: 7, Weight: 1},
-			},
-		},
-		ChannelHealth: map[string]autoModelOutcome{
-			autoModelChannelHealthKey("g", 1): autoModelRouteTestOutcome(0.1, now),
-			autoModelChannelHealthKey("g", 2): autoModelRouteTestOutcome(1, now),
-		},
-	}
-	require.Equal(t, []int{2, 1}, autoModelRouteChannelOrder(
-		buildAutoModelRoutesFromSnapshot("g", []string{"m"}, snapshot, func() float64 { return 0.99 })),
-		"within one priority tier the healthier channel still leads")
-}
-
-// 从未观测过的渠道不参与分档:它既不是"健康"也不是"不健康",而是"不知道"。
-// 本系统不做任何主动探测,证据只能来自真实流量;把新渠道按中性分压到健康渠道后面,
-// 它就永远拿不到证据、永远证明不了自己。
-func TestAutoModelHealthBandsExemptUnobservedChannels(t *testing.T) {
-	oldMargin := operation_setting.AutoModelPriorityOverrideMargin()
-	t.Cleanup(func() { operation_setting.SetAutoModelPriorityOverrideMargin(oldMargin) })
-	operation_setting.SetAutoModelPriorityOverrideMargin(0.25)
-
-	now := time.Unix(1700000000, 0)
-	snapshot := autoModelRouteSnapshot{
-		Now: now,
-		Targets: map[string][]model.AutoModelRoutingTarget{
-			"m": {
-				{ChannelID: 1, Priority: 5, Weight: 1}, // 刚加进来、管理员给了高 priority
-				{ChannelID: 2, Priority: 1, Weight: 1}, // 已证明健康
-				{ChannelID: 3, Priority: 9, Weight: 1}, // 已证明很差
-			},
-		},
-		ChannelHealth: map[string]autoModelOutcome{
-			autoModelChannelHealthKey("g", 2): autoModelRouteTestOutcome(1, now),
-			autoModelChannelHealthKey("g", 3): autoModelRouteTestOutcome(0, now),
-		},
-	}
-	// 渠道 3 低一整档垫底;渠道 1 没有证据,留在最好的档里靠 priority 排在渠道 2 前面。
-	require.Equal(t, []int{1, 2, 3}, autoModelRouteChannelOrder(
-		buildAutoModelRoutesFromSnapshot("g", []string{"m"}, snapshot, func() float64 { return 0.99 })))
-}
-
-// 多层优先级下,"最健康的那条"不会被"没比次健康的更高出一整档"卡在中间。
-func TestAutoModelHealthBandsOrderThreeTiersByHealth(t *testing.T) {
-	oldMargin := operation_setting.AutoModelPriorityOverrideMargin()
-	t.Cleanup(func() { operation_setting.SetAutoModelPriorityOverrideMargin(oldMargin) })
-	operation_setting.SetAutoModelPriorityOverrideMargin(0.25)
-
-	now := time.Unix(1700000000, 0)
-	snapshot := autoModelRouteSnapshot{
-		Now: now,
-		Targets: map[string][]model.AutoModelRoutingTarget{
-			"m": {
-				{ChannelID: 1, Priority: 3, Weight: 1},
-				{ChannelID: 2, Priority: 2, Weight: 1},
-				{ChannelID: 3, Priority: 1, Weight: 1},
-			},
-		},
-		ChannelHealth: map[string]autoModelOutcome{
-			// 最高 priority 的渠道 1 最差;渠道 2 与 3 的健康分只差一点。
-			autoModelChannelHealthKey("g", 1): autoModelRouteTestOutcome(0.1, now),
-			autoModelChannelHealthKey("g", 2): autoModelRouteTestOutcome(1, now),
-			autoModelChannelHealthKey("g", 3): autoModelRouteTestOutcome(0.95, now),
-		},
-	}
-	// 渠道 2 与 3 同档(0.95 距 1.0 不足一档),档内按 priority → 2 在前;
-	// 渠道 1 低一整档,垫底。关键在于渠道 3 没有因为"没比渠道 2 高出一档"而
-	// 掉到渠道 1 后面——那正是逐条越级判定会犯的错。
-	require.Equal(t, []int{2, 3, 1}, autoModelRouteChannelOrder(
-		buildAutoModelRoutesFromSnapshot("g", []string{"m"}, snapshot, func() float64 { return 0.99 })))
-}
-
-func TestAutoModelRouteWeightsAreLayerLocal(t *testing.T) {
-	now := time.Unix(1700000000, 0)
-	snapshot := autoModelRouteSnapshot{
-		Now: now,
-		Targets: map[string][]model.AutoModelRoutingTarget{
-			"a": {{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 9}},
-			"b": {{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 9}},
-		},
-		ModelWeights: map[string]map[string]float64{"g": {"a":1, "b":9}},
-	}
-	got := buildAutoModelRoutesFromSnapshot("g", []string{"a", "b"}, snapshot, func() float64 { return 0.5 })
-	require.Equal(t, []AutoModelRoute{
-		{Group: "g", ModelName: "b", ChannelID: 2},
-		{Group: "g", ModelName: "a", ChannelID: 2},
-		{Group: "g", ModelName: "b", ChannelID: 1},
-		{Group: "g", ModelName: "a", ChannelID: 1},
-	}, got)
-	// Changing only model weights changes model order, never the chosen channel.
-	snapshot.ModelWeights["g"] = map[string]float64{"a":9, "b":1}
-	got = buildAutoModelRoutesFromSnapshot("g", []string{"a", "b"}, snapshot, func() float64 { return 0.5 })
-	require.Equal(t, 2, got[0].ChannelID)
-	require.Equal(t, "a", got[0].ModelName)
-	require.Equal(t, "b", got[1].ModelName)
-	// Changing a channel weight cannot change model scores/order in that channel.
-	snapshot.Targets["a"][0].Weight, snapshot.Targets["b"][0].Weight = 100, 100
-	got = buildAutoModelRoutesFromSnapshot("g", []string{"a", "b"}, snapshot, func() float64 { return 0.5 })
-	require.Equal(t, 1, got[0].ChannelID)
-	require.Equal(t, "a", got[0].ModelName)
-}
-
-func TestAutoModelRouteLowerModelScoreCannotWinWithMoreWeight(t *testing.T) {
-	now := time.Unix(1700000000, 0)
-	snapshot := autoModelRouteSnapshot{
-		Now: now,
-		Targets: map[string][]model.AutoModelRoutingTarget{
-			"higher": {{ChannelID: 1, Weight: 1}},
-			"lower": {{ChannelID: 1, Weight: 1}},
+			"fresh":  {{ChannelID: 1, Priority: 5, Weight: 1}},
+			"proven": {{ChannelID: 2, Priority: 5, Weight: 1}},
+			"idle":   {{ChannelID: 3, Priority: 9, Weight: 1}},
 		},
 		ModelHealth: map[string]autoModelOutcome{
-			// observations=3 yields effective scores exactly .60 and .59.
-			autoModelHealthKey("g", "higher", 1): {Score: 0.70, Observations: 3, UpdatedAt: now},
-			autoModelHealthKey("g", "lower", 1): {Score: 0.68, Observations: 3, UpdatedAt: now},
+			autoModelHealthKey("g", "proven", 2): autoModelRouteTestOutcome(0.9, now),
 		},
-		ModelWeights: map[string]map[string]float64{"g": {"higher":1, "lower":math.MaxFloat64}},
 	}
-	for _, draw := range []float64{0, 0.5, 0.99} {
-		got := buildAutoModelRoutesFromSnapshot("g", []string{"lower", "higher"}, snapshot, func() float64 { return draw })
-		require.Equal(t, []string{"higher", "lower"}, autoModelRouteModelNames(got))
-	}
+	got := buildAutoModelRoutesFromSnapshot("g", []string{"fresh", "proven", "idle"}, snapshot, func() float64 { return 0.99 })
+	// idle(p9) 按优先级领先;p5 层里 proven(0.9) 领先中性的 fresh(0.5)。
+	require.Equal(t, []int{3, 2, 1}, autoModelRouteChannelOrder(got),
+		"an all-neutral cold start is ordered by priority; a proven 0.9 beats a neutral 0.5 at equal priority")
+	require.Equal(t, "proven", got[1].ModelName)
+	require.Equal(t, "fresh", got[2].ModelName)
 }
 
-func TestAutoModelRouteLowerChannelScoreCannotWinWithMoreWeight(t *testing.T) {
+// 档内抽样保留渠道份额:渠道权重相同时,A 渠道 10 个候选模型与 B 渠道 1 个
+// 候选模型的总流量约各占 50%,模型数量不放大渠道份额;1:3 的渠道权重对应
+// 25%/75%。
+func TestAutoModelBandSamplingPreservesChannelShare(t *testing.T) {
+	setAutoModelScoreBandWidthForTest(t, 1)
+
+	now := time.Unix(1700000000, 0)
+	newSnapshot := func(channelWeights [2]float64) autoModelRouteSnapshot {
+		targets := map[string][]model.AutoModelRoutingTarget{}
+		for i := 0; i < 10; i++ {
+			name := "a" + string(rune('0'+i))
+			targets[name] = []model.AutoModelRoutingTarget{{ChannelID: 1, Weight: channelWeights[0]}}
+		}
+		targets["solo"] = []model.AutoModelRoutingTarget{{ChannelID: 2, Weight: channelWeights[1]}}
+		return autoModelRouteSnapshot{Now: now, Targets: targets}
+	}
+
+	random := rand.New(rand.NewSource(42))
+	channelHeads, modelHeads := map[int]int{}, map[string]int{}
+	const runs = 4000
+	for i := 0; i < runs; i++ {
+		routes := buildAutoModelRoutesFromSnapshot("g",
+			[]string{"solo", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9"},
+			newSnapshot([2]float64{1, 1}), random.Float64)
+		require.Len(t, routes, 11)
+		unique := make(map[AutoModelRoute]bool, len(routes))
+		for _, route := range routes {
+			unique[route] = true
+		}
+		require.Len(t, unique, 11, "sampling is without replacement")
+		channelHeads[routes[0].ChannelID]++
+		modelHeads[routes[0].ModelName]++
+	}
+	require.InDelta(t, runs/2, channelHeads[1], runs*0.04, "equal channel weights share the band ~50/50 regardless of model count")
+	require.InDelta(t, runs/2, channelHeads[2], runs*0.04)
+	require.InDelta(t, runs/2, modelHeads["solo"], runs*0.04, "the single model on its channel gets ~50%")
+	for i := 0; i < 10; i++ {
+		require.InDelta(t, runs*0.05, modelHeads["a"+string(rune('0'+i))], runs*0.03,
+			"each of the ten equal models gets ~5%")
+	}
+
+	// 渠道权重 1:3 → 25%/75%。
+	random = rand.New(rand.NewSource(43))
+	channelHeads = map[int]int{}
+	for i := 0; i < runs; i++ {
+		routes := buildAutoModelRoutesFromSnapshot("g", []string{"a0", "solo"},
+			autoModelRouteSnapshot{Now: now, Targets: map[string][]model.AutoModelRoutingTarget{
+				"a0":   {{ChannelID: 1, Weight: 1}},
+				"solo": {{ChannelID: 2, Weight: 3}},
+			}}, random.Float64)
+		channelHeads[routes[0].ChannelID]++
+	}
+	require.InDelta(t, runs*0.25, channelHeads[1], runs*0.04, "channel weight 1:3 means 25%/75% heads")
+	require.InDelta(t, runs*0.75, channelHeads[2], runs*0.04)
+}
+
+// 零权重与大权重的边界:渠道零权重在正权重渠道耗尽前不参与,剩余全零等概率;
+// 极大有限权重归一后求和,不会溢出。
+func TestAutoModelBandSamplingWeightEdges(t *testing.T) {
+	setAutoModelScoreBandWidthForTest(t, 1)
+
 	now := time.Unix(1700000000, 0)
 	snapshot := autoModelRouteSnapshot{
 		Now: now,
 		Targets: map[string][]model.AutoModelRoutingTarget{
-			"m": {{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: math.MaxFloat64}},
-		},
-		ChannelHealth: map[string]autoModelOutcome{
-			autoModelChannelHealthKey("g", 1): {Score: 0.70, Observations: 3, UpdatedAt: now},
-			autoModelChannelHealthKey("g", 2): {Score: 0.68, Observations: 3, UpdatedAt: now},
+			"zero": {{ChannelID: 1, Weight: 0}},
+			"solo": {{ChannelID: 2, Weight: 1}},
 		},
 	}
-	got := buildAutoModelRoutesFromSnapshot("g", []string{"m"}, snapshot, func() float64 { return 0.99 })
-	require.Equal(t, 1, got[0].ChannelID, "channel score 0.60 beats 0.59 regardless of weight")
-	require.Equal(t, 2, got[1].ChannelID)
+	got := buildAutoModelRoutesFromSnapshot("g", []string{"zero", "solo"}, snapshot, func() float64 { return 0 })
+	require.Equal(t, []AutoModelRoute{
+		{Group: "g", ModelName: "solo", ChannelID: 2},
+		{Group: "g", ModelName: "zero", ChannelID: 1},
+	}, got, "a zero-weight channel stays as the in-band fallback behind positive ones")
+
+	items := []autoModelWeightedItem{
+		{Index: 0, Weight: math.MaxFloat64},
+		{Index: 1, Weight: math.MaxFloat64},
+	}
+	require.Equal(t, 0, chooseAutoModelWeightedItem(items, func() float64 { return 0.25 }))
+	require.Equal(t, 1, chooseAutoModelWeightedItem(items, func() float64 { return 0.75 }))
+}
+
+// 档宽 0 时分数严格决定档位,任何权重都不能跨档;档宽把两条路线并入同档后,
+// 权重才决定先后。
+func TestAutoModelBandEdgeDecidesWhetherWeightMatters(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	newSnapshot := func() autoModelRouteSnapshot {
+		return autoModelRouteSnapshot{
+			Now: now,
+			Targets: map[string][]model.AutoModelRoutingTarget{
+				"higher": {{ChannelID: 1, Weight: 1}},
+				"lower":  {{ChannelID: 1, Weight: 1}},
+			},
+			ModelHealth: map[string]autoModelOutcome{
+				// observations=3 yields effective scores exactly .60 and .59.
+				autoModelHealthKey("g", "higher", 1): {Score: 0.70, Observations: 3, UpdatedAt: now},
+				autoModelHealthKey("g", "lower", 1):  {Score: 0.68, Observations: 3, UpdatedAt: now},
+			},
+			ModelWeights: map[string]map[string]float64{"g": {"higher": 1, "lower": math.MaxFloat64}},
+		}
+	}
+
+	setAutoModelScoreBandWidthForTest(t, 0)
+	for _, draw := range []float64{0, 0.5, 0.99} {
+		got := buildAutoModelRoutesFromSnapshot("g", []string{"lower", "higher"}, newSnapshot(), func() float64 { return draw })
+		require.Equal(t, []string{"higher", "lower"}, autoModelRouteModelNames(got),
+			"width 0: a 0.60/0.59 difference is a real band edge, weight cannot cross it")
+	}
+
+	setAutoModelScoreBandWidthForTest(t, 0.01)
+	got := buildAutoModelRoutesFromSnapshot("g", []string{"lower", "higher"}, newSnapshot(), func() float64 { return 0.99 })
+	require.Equal(t, []string{"lower", "higher"}, autoModelRouteModelNames(got),
+		"width 0.01 puts 0.60/0.59 into one band where the huge weight wins the draw")
 }
 
 func TestAutoModelRouteWeightsDefaultToOneAndZeroDisables(t *testing.T) {
 	snapshot := autoModelRouteSnapshot{
 		Now: time.Unix(1700000000, 0),
 		Targets: map[string][]model.AutoModelRoutingTarget{
-			"default": {{ChannelID: 1, Weight: 1}},
+			"default":  {{ChannelID: 1, Weight: 1}},
 			"disabled": {{ChannelID: 2, Priority: 100, Weight: 100}},
 		},
-		ModelWeights: map[string]map[string]float64{"g": {"disabled":0}},
+		ModelWeights: map[string]map[string]float64{"g": {"disabled": 0}},
 	}
 	require.Equal(t, 1.0, autoModelRouteWeight("g", "default", snapshot.ModelWeights))
 	require.Equal(t, 1.0, autoModelRouteWeight("other", "disabled", snapshot.ModelWeights))
@@ -323,20 +341,24 @@ func TestAutoModelRouteWeightsDefaultToOneAndZeroDisables(t *testing.T) {
 	require.Len(t, buildAutoModelRoutesFromSnapshot("other", []string{"default", "disabled"}, snapshot, nil), 2)
 }
 
+// 全部渠道零权重时等概率;一旦有正权重渠道,零权重渠道只能做后备。
 func TestAutoModelRouteChannelZeroWeightSemantics(t *testing.T) {
 	snapshot := autoModelRouteSnapshot{
-		Now: time.Unix(1700000000, 0),
+		Now:     time.Unix(1700000000, 0),
 		Targets: map[string][]model.AutoModelRoutingTarget{"m": {{ChannelID: 1}, {ChannelID: 2}}},
 	}
-	for _, tc := range []struct{draw float64; want int}{{0,1},{0.99,2}} {
+	for _, tc := range []struct {
+		draw float64
+		want int
+	}{{0, 1}, {0.99, 2}} {
 		got := buildAutoModelRoutesFromSnapshot("g", []string{"m"}, snapshot, func() float64 { return tc.draw })
 		require.Len(t, got, 2)
 		require.Equal(t, tc.want, got[0].ChannelID, "all-zero channel weights sample uniformly")
 	}
 	snapshot.Targets["m"][1].Weight = 1
 	got := buildAutoModelRoutesFromSnapshot("g", []string{"m"}, snapshot, func() float64 { return 0 })
-	require.Equal(t, 2, got[0].ChannelID, "zero weight cannot beat a positive weight in the same score band")
-	require.Equal(t, 1, got[1].ChannelID, "the remaining all-zero channel band still forms a fallback tier")
+	require.Equal(t, 2, got[0].ChannelID, "zero weight cannot beat a positive weight in the same band")
+	require.Equal(t, 1, got[1].ChannelID, "the remaining all-zero channel still forms a fallback tier")
 }
 
 func TestAutoModelRouteCooldownIsStrictAndTupleScoped(t *testing.T) {
@@ -344,12 +366,12 @@ func TestAutoModelRouteCooldownIsStrictAndTupleScoped(t *testing.T) {
 	snapshot := autoModelRouteSnapshot{
 		Now: now,
 		Targets: map[string][]model.AutoModelRoutingTarget{
-			"m": {{ChannelID: 1, Priority: 10, Weight: 1}, {ChannelID: 2, Weight: 1}},
+			"m":     {{ChannelID: 1, Priority: 10, Weight: 1}, {ChannelID: 2, Weight: 1}},
 			"other": {{ChannelID: 1, Priority: 10, Weight: 1}},
 		},
 		Cooldowns: map[string]autoModelCooldownState{
-			autoModelHealthKey("g", "m", 1): {Until: now.Add(time.Minute)},
-			autoModelHealthKey("vip", "m", 2): {Until: now.Add(time.Minute)},
+			autoModelHealthKey("g", "m", 1):     {Until: now.Add(time.Minute)},
+			autoModelHealthKey("vip", "m", 2):   {Until: now.Add(time.Minute)},
 			autoModelHealthKey("g", "other", 1): {Until: now},
 		},
 	}
@@ -362,18 +384,22 @@ func TestAutoModelRouteCooldownIsStrictAndTupleScoped(t *testing.T) {
 	snapshot.Cooldowns[autoModelHealthKey("g", "m", 2)] = autoModelCooldownState{Until: now.Add(time.Minute)}
 	require.Empty(t, buildAutoModelRoutesFromSnapshot("g", []string{"m", "other"}, snapshot, nil))
 	snapshot.Cooldowns = nil
-	snapshot.ExcludedChannels = map[int]bool{1:true, 2:true}
+	snapshot.ExcludedChannels = map[int]bool{1: true, 2: true}
 	require.Empty(t, buildAutoModelRoutesFromSnapshot("g", []string{"m", "other"}, snapshot, nil), "hard exclusions never fail open either")
 }
 
+// 冷启动全中性时,无放回的两级抽样决定顺序:渠道 1:3 权重对应约 25%/75% 的
+// 队首份额,模型 1:3 亦然;计划仍覆盖全部路线且不重复。
 func TestAutoModelRouteColdStartUsesWeightedDrawsWithoutReplacement(t *testing.T) {
+	setAutoModelScoreBandWidthForTest(t, 1)
+
 	snapshot := autoModelRouteSnapshot{
 		Now: time.Unix(1700000000, 0),
 		Targets: map[string][]model.AutoModelRoutingTarget{
 			"a": {{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 3}},
 			"b": {{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 3}},
 		},
-		ModelWeights: map[string]map[string]float64{"g": {"a":1, "b":3}},
+		ModelWeights: map[string]map[string]float64{"g": {"a": 1, "b": 3}},
 	}
 	random := rand.New(rand.NewSource(7))
 	channelHeads, modelHeads := map[int]int{}, map[string]int{}
@@ -381,25 +407,29 @@ func TestAutoModelRouteColdStartUsesWeightedDrawsWithoutReplacement(t *testing.T
 		routes := buildAutoModelRoutesFromSnapshot("g", []string{"a", "b", "a"}, snapshot, random.Float64)
 		require.Len(t, routes, 4)
 		unique := make(map[AutoModelRoute]bool)
-		for _, route := range routes { unique[route] = true }
+		for _, route := range routes {
+			unique[route] = true
+		}
 		require.Len(t, unique, 4)
-		require.Equal(t, routes[0].ChannelID, routes[1].ChannelID)
-		require.Equal(t, routes[2].ChannelID, routes[3].ChannelID)
 		channelHeads[routes[0].ChannelID]++
 		modelHeads[routes[0].ModelName]++
 	}
+	// 队首渠道 2 的概率 = 3/4;队首模型 b 的概率 = P(ch1)*3/4 + P(ch2)*3/4 = 3/4。
 	require.InDelta(t, 750, channelHeads[2], 70)
 	require.InDelta(t, 750, modelHeads["b"], 70)
 }
 
 func TestAutoModelWeightedDrawHandlesLargeFiniteWeights(t *testing.T) {
-	items := []autoModelScoreItem{
-		{Index:1, Score:0.5, Weight:math.MaxFloat64},
-		{Index:2, Score:0.5, Weight:math.MaxFloat64},
+	items := []autoModelWeightedItem{
+		{Index: 0, Weight: math.MaxFloat64},
+		{Index: 1, Weight: math.MaxFloat64},
 	}
-	for _, tc := range []struct{draw float64; want int}{{0.25,1},{0.75,2}} {
-		got := orderAutoModelScoreBands(items, func() float64 { return tc.draw })
-		require.Equal(t, tc.want, got[0].Index, "normalizing before summation prevents overflow")
+	for _, tc := range []struct {
+		draw float64
+		want int
+	}{{0.25, 0}, {0.75, 1}} {
+		got := chooseAutoModelWeightedItem(items, func() float64 { return tc.draw })
+		require.Equal(t, tc.want, got, "normalizing before summation prevents overflow")
 	}
 }
 
@@ -413,9 +443,9 @@ func TestAutoModelRouteContextCompatibilityAndOwnership(t *testing.T) {
 	_, ok := GetCurrentAutoModelRoute(c)
 	require.False(t, ok)
 	input := []AutoModelRoute{
-		{Group:"g", ModelName:"a", ChannelID:1},
-		{Group:"g", ModelName:"b", ChannelID:1},
-		{Group:"vip", ModelName:"a", ChannelID:2},
+		{Group: "g", ModelName: "a", ChannelID: 1},
+		{Group: "g", ModelName: "b", ChannelID: 1},
+		{Group: "vip", ModelName: "a", ChannelID: 2},
 	}
 	SetAutoModelRoutePlan(c, input)
 	input[0].ChannelID = 900
@@ -423,8 +453,8 @@ func TestAutoModelRouteContextCompatibilityAndOwnership(t *testing.T) {
 	copyPlan[0].ModelName = "mutated"
 	current, ok := GetCurrentAutoModelRoute(c)
 	require.True(t, ok)
-	require.Equal(t, AutoModelRoute{Group:"g", ModelName:"a", ChannelID:1}, current)
-	require.Equal(t, []string{"a","b","a"}, common.GetContextKeyStringSlice(c, constant.ContextKeyAutoModelCandidates))
+	require.Equal(t, AutoModelRoute{Group: "g", ModelName: "a", ChannelID: 1}, current)
+	require.Equal(t, []string{"a", "b", "a"}, common.GetContextKeyStringSlice(c, constant.ContextKeyAutoModelCandidates))
 	require.Equal(t, 0, GetAutoModelRouteIndex(c))
 	require.Equal(t, "g", common.GetContextKeyString(c, constant.ContextKeyUsingGroup))
 	require.Equal(t, "g", common.GetContextKeyString(c, constant.ContextKeyAutoGroup))

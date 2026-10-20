@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
@@ -18,7 +19,8 @@ import (
 
 // AutoModelRoute pins both halves of an auto dispatch. A retry advances through
 // concrete routes, rather than choosing a model and independently redrawing its
-// channel. All remaining models on one channel stay together in the plan.
+// channel. Equal-priority routes interleave across channels by model score:
+// a channel's remaining models never form an impenetrable block.
 type AutoModelRoute struct {
 	Group     string
 	ModelName string
@@ -73,8 +75,10 @@ func getAutoModelFailedModels(c *gin.Context) map[string]bool {
 	return result
 }
 
-// This tolerance absorbs floating-point noise only. Genuinely different scores
-// (for example 0.60 and 0.59) never share a weighted-random selection band.
+// This tolerance absorbs floating-point noise only. It applies at the band
+// boundary (so the documented 0.900/0.890 example stays one band despite
+// 0.900-0.890 being 0.0100...9 in float64); whether genuinely different scores
+// share a band is decided by AutoModelScoreBandWidth, not by this constant.
 const autoModelRouteScoreTieEpsilon = 1e-9
 
 // ErrAutoModelNoAuthorizedCandidates distinguishes a token whitelist rejection
@@ -158,7 +162,6 @@ func ActivateAutoModelRoute(c *gin.Context, index int) bool {
 type autoModelRouteSnapshot struct {
 	Targets          map[string][]model.AutoModelRoutingTarget
 	ModelHealth      map[string]autoModelOutcome
-	ChannelHealth    map[string]autoModelOutcome
 	Cooldowns        map[string]autoModelCooldownState
 	ModelWeights     map[string]map[string]float64
 	ExcludedChannels map[int]bool
@@ -176,7 +179,6 @@ type autoModelRouteSnapshot struct {
 func newAutoModelRouteSnapshot(excluded map[int]bool) autoModelRouteSnapshot {
 	return autoModelRouteSnapshot{
 		ModelHealth:      autoModelHealth.ReadAll(),
-		ChannelHealth:    autoModelChannelHealth.ReadAll(),
 		Cooldowns:        autoModelCooldownSnapshot(),
 		ModelWeights:     operation_setting.GetAutoModelWeights(),
 		ExcludedChannels: excluded,
@@ -185,12 +187,13 @@ func newAutoModelRouteSnapshot(excluded map[int]bool) autoModelRouteSnapshot {
 }
 
 // BuildAutoModelRoutesForRequest takes fresh snapshots for every request. The
-// order is group order, then channel health band, channel priority, channel score
-// band and channel weight, then (inside that channel) model score band and model
-// weight. Channels whose health differs by less than
-// AutoModelPriorityOverrideMargin share a health band, so priority decides among
-// them; a wider gap makes health decide on its own. Cooldown and hard exclusions
-// remove routes before any tier is selected; they never fail open.
+// order is group order, then eligibility filters, then channel priority in
+// descending order as a hard boundary, then model effective-score bands
+// (AutoModelScoreBandWidth) inside each priority tier, then within-band weighted
+// sampling that preserves each channel's share. Channel health takes no part in
+// ordering, banding or cold-start handling — that chain has been removed
+// entirely. Cooldown and
+// hard exclusions remove routes before any tier is selected; they never fail open.
 //
 // For an auto token group, existing group authorization determines the ordered
 // concrete groups. With cross-group retry disabled only the first nonempty
@@ -376,32 +379,23 @@ func autoModelSupportsChat(endpoints []constant.EndpointType) bool {
 	return false
 }
 
-type autoModelRouteChannel struct {
-	ID       int
-	Priority int64
-	// Band 是健康分分档,0 最好。档宽 = AutoModelPriorityOverrideMargin:
-	// 健康分差距小于档宽的渠道视为"一样健康",这时才由 Priority 说话;
-	// 差距超过档宽,健康分自己分出档来。排序与分层都先读 Band 再读 Priority。
-	Band int
-	// Observed 表示这个渠道有近期证据(内存或库里的健康摘要)。没有证据的渠道不参与
-	// 分档,见 assignAutoModelHealthBands:它既不是健康也不是不健康,而是"不知道"。
-	Observed bool
-	Score    float64
-	Weight   float64
-	Models   []autoModelRouteModel
+// autoModelRouteCandidate 是参与排序的一条具体路线 (分组, 渠道, 模型)。
+// 比较单元是路线而不是渠道:同名模型在不同渠道的得分独立,同优先级的模型分
+// 可以跨渠道交错比较。
+type autoModelRouteCandidate struct {
+	ModelName     string
+	ChannelID     int
+	Priority      int64
+	ChannelWeight float64
+	ModelWeight   float64
+	Score         float64 // effectiveScore:成功、延迟、观测置信度与时间衰减的有效分
 }
 
-type autoModelRouteModel struct {
-	Name   string
-	Score  float64
-	Weight float64
-}
-
-func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapshot autoModelRouteSnapshot, random func() float64) []AutoModelRoute {
-	if random == nil {
-		random = rand.Float64
-	}
-	channelsByID := make(map[int]*autoModelRouteChannel)
+// collectAutoModelRouteCandidates 收集参与竞争的路线。候选配置、模型权重、
+// 计费资格与启用状态已在 eligibleAutoModelCandidates 过滤;这里再执行请求级
+// 排除(已试路线、模型级失败)与严格冷却,被拒绝的路线不会进入任何档。
+func collectAutoModelRouteCandidates(group string, candidates []string, snapshot autoModelRouteSnapshot) []autoModelRouteCandidate {
+	var routes []autoModelRouteCandidate
 	seenModels := make(map[string]bool, len(candidates))
 	for _, name := range candidates {
 		if name == "" || operation_setting.IsAutoModelName(name) || seenModels[name] {
@@ -430,175 +424,191 @@ func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapsho
 			if snapshot.Cooldowns[key].Until.After(snapshot.Now) {
 				continue
 			}
-			channel := channelsByID[target.ChannelID]
-			if channel == nil {
-				// The target snapshot supplies actual channel metadata, identical
-				// across its models. Never derive this priority/score from a model.
-				channelHealth, observed := snapshot.ChannelHealth[autoModelChannelHealthKey(group, target.ChannelID)]
-				channel = &autoModelRouteChannel{
-					ID:       target.ChannelID,
-					Priority: target.Priority,
-					Observed: observed,
-					Score:    effectiveScore(channelHealth, snapshot.Now),
-					Weight:   target.Weight,
-				}
-				channelsByID[target.ChannelID] = channel
-			}
-			channel.Models = append(channel.Models, autoModelRouteModel{
-				Name:   name,
-				Score:  effectiveScore(snapshot.ModelHealth[key], snapshot.Now),
-				Weight: modelWeight,
+			routes = append(routes, autoModelRouteCandidate{
+				ModelName:     name,
+				ChannelID:     target.ChannelID,
+				Priority:      target.Priority,
+				ChannelWeight: target.Weight,
+				ModelWeight:   modelWeight,
+				Score:         effectiveScore(snapshot.ModelHealth[key], snapshot.Now),
 			})
 		}
-	}
-	channels := make([]*autoModelRouteChannel, 0, len(channelsByID))
-	for _, channel := range channelsByID {
-		channels = append(channels, channel)
-	}
-	assignAutoModelHealthBands(channels, operation_setting.AutoModelPriorityOverrideMargin())
-	sort.Slice(channels, func(i, j int) bool {
-		// 先比健康分档,再比 priority。档内 priority 说了算,跨档健康分说了算。
-		if channels[i].Band != channels[j].Band {
-			return channels[i].Band < channels[j].Band
-		}
-		if channels[i].Priority != channels[j].Priority {
-			return channels[i].Priority > channels[j].Priority
-		}
-		// 同档同 priority 内先按 ID,给档内挑选一个稳定起点:
-		// orderAutoModelScoreBands 是稳定排序,同分渠道会保持这里的先后。
-		return channels[i].ID < channels[j].ID
-	})
-	var routes []AutoModelRoute
-	for start := 0; start < len(channels); {
-		end := start + 1
-		for end < len(channels) &&
-			channels[end].Band == channels[start].Band &&
-			channels[end].Priority == channels[start].Priority {
-			end++
-		}
-		items := make([]autoModelScoreItem, 0, end-start)
-		for i := start; i < end; i++ {
-			items = append(items, autoModelScoreItem{Index: i, Score: channels[i].Score, Weight: channels[i].Weight})
-		}
-		for _, item := range orderAutoModelScoreBands(items, random) {
-			channel := channels[item.Index]
-			modelItems := make([]autoModelScoreItem, len(channel.Models))
-			for i, candidate := range channel.Models {
-				modelItems[i] = autoModelScoreItem{Index: i, Score: candidate.Score, Weight: candidate.Weight}
-			}
-			for _, modelItem := range orderAutoModelScoreBands(modelItems, random) {
-				routes = append(routes, AutoModelRoute{Group: group, ModelName: channel.Models[modelItem.Index].Name, ChannelID: channel.ID})
-			}
-		}
-		start = end
 	}
 	return routes
 }
 
-// assignAutoModelHealthBands 把渠道按健康分分档,0 是最好的档。
+// buildAutoModelRoutesFromSnapshot 把全部可用路线展平后按新规则排序:
 //
-// 档宽就是 AutoModelPriorityOverrideMargin,分档规则与 orderAutoModelScoreBands
-// 同源:每一档锚定在"还没分档的渠道里的最高分",而不是上一条渠道的分数。锚在相邻项上
-// 会让一串接近但不等的分数被串成一档,把真正不同的健康度混在一起——那正是既有
-// 渠道分档刻意避开的坑。
+//	渠道 priority 降序(硬边界) → 每个优先级内按模型有效得分分档 → 档内保留渠道份额的两级加权随机
 //
-// 为什么用"档"而不是"逐条越级判定":健康分是连续量,真正可调的只有一个阈值。
-// 分档让"健康分差距小于阈值时由 priority 说话,超过阈值时健康分自己说话"这句话
-// 对任意多层同时成立。逐条比较则必须回答"越过谁",而多层场景下这个问题没有好
-// 答案:比相邻的会漏掉更上面的渠道,比最高的又会把已经被越过的渠道算进参照物,
-// 结果是"越级了但没排上去",规则看着生效、实际白做。
-//
-// 两个端点都自然落位,不需要额外的开关:
-//   - margin <= 0:每个不同的分数各占一档,档序 = 分数序,priority 只用于同分,
-//     即"健康分完全接管顺序";
-//   - margin >= 1(健康分上限是 1.0):所有渠道同档,priority 完全决定顺序,
-//     即"关闭分档、回到旧行为"。
-//
-// 两个端点都有一处共同的例外:从未观测过的渠道始终留在 0 档,不参与分档
-// (理由见循环里的注释)。所以更准确的说法是"健康分在有证据的渠道之间决定顺序"。
-//
-// 输入顺序无所谓:函数自己按分数降序复制一份来分档,不改动入参顺序。
-func assignAutoModelHealthBands(channels []*autoModelRouteChannel, margin float64) {
-	if len(channels) == 0 || math.IsNaN(margin) {
-		// NaN 档宽下所有比较都为假,留在 0 档等价于"关闭分档",是安全的一侧。
-		return
+// 渠道聚合健康分的整条链路(状态、更新、持久化、快照、展示)已随本方案整体
+// 移除。没有模型观测的路线按中立有效分 0.5 参与分档,不再有"未观测渠道强制进
+// 最好档"的例外。
+// 冷却与请求级排除在收集阶段完成;它们不会因为高优先级或候选全部不可用而放行。
+func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapshot autoModelRouteSnapshot, random func() float64) []AutoModelRoute {
+	if random == nil {
+		random = rand.Float64
 	}
-	byScore := append([]*autoModelRouteChannel(nil), channels...)
-	sort.SliceStable(byScore, func(i, j int) bool {
-		if byScore[i].Score != byScore[j].Score {
-			return byScore[i].Score > byScore[j].Score
-		}
-		return byScore[i].ID < byScore[j].ID
-	})
-	// anchor 只取"观测到的最高分":未观测渠道的 0.5 是占位值而不是测量值,
-	// 拿它当档锚会把真正的测量值按一个虚构的参照物分档。列表已按分数降序,
-	// 所以遇到的第一个已观测渠道就是观测值里的最高分。
-	band, started, anchor := 0, false, 0.0
-	for _, channel := range byScore {
-		// 从未观测过的渠道不参与分档,留在最好的档里由 priority 决定先后。
-		//
-		// 它既不是"健康"也不是"不健康",而是"不知道":按中性 0.5 分档会让一条刚
-		// 加进来、管理员特意给了高 priority 的渠道,永远排在已证明健康的渠道后面。
-		// 而本系统不做任何主动探测,证据只能来自真实流量——排不上队就永远拿不到证据,
-		// 也就永远证明不了自己。让它按 priority 参与竞争,正是引入分档规则之前的行为。
-		if !channel.Observed {
-			channel.Band = 0
-			continue
-		}
-		if !started {
-			started, anchor = true, channel.Score
-		} else if channel.Score < anchor-margin {
-			band++
-			anchor = channel.Score
-		}
-		channel.Band = band
-	}
-}
-
-func autoModelRouteWeight(group, name string, weights map[string]map[string]float64) float64 {
-	if weight, exists := weights[group][name]; exists {
-		return weight
-	}
-	return operation_setting.DefaultAutoModelWeight
-}
-
-func positiveAutoModelWeight(weight float64) bool {
-	return weight > 0 && !math.IsNaN(weight) && !math.IsInf(weight, 0)
-}
-
-type autoModelScoreItem struct {
-	Index  int
-	Score  float64
-	Weight float64
-}
-
-// Each band is anchored to its highest score, not to the previous item (which
-// would let a chain of near-ties mix genuinely different scores). Sampling is
-// without replacement so each concrete route occurs at most once per plan.
-func orderAutoModelScoreBands(items []autoModelScoreItem, random func() float64) []autoModelScoreItem {
-	ordered := append([]autoModelScoreItem(nil), items...)
-	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Score > ordered[j].Score })
-	result := make([]autoModelScoreItem, 0, len(ordered))
-	for start := 0; start < len(ordered); {
+	routes := collectAutoModelRouteCandidates(group, candidates, snapshot)
+	// priority 是硬边界:降序排列后逐层处理。低优先级候选即使得分更高,也只能
+	// 排在仍有候选的高优先级层之后。
+	sort.SliceStable(routes, func(i, j int) bool { return routes[i].Priority > routes[j].Priority })
+	width := operation_setting.AutoModelScoreBandWidth()
+	var plan []AutoModelRoute
+	var debugAnchor float64
+	for start := 0; start < len(routes); {
 		end := start + 1
-		for end < len(ordered) && ordered[end].Score >= ordered[start].Score-autoModelRouteScoreTieEpsilon {
+		for end < len(routes) && routes[end].Priority == routes[start].Priority {
 			end++
 		}
-		band := append([]autoModelScoreItem(nil), ordered[start:end]...)
-		for len(band) > 0 {
-			index := 0
-			if len(band) > 1 {
-				index = chooseAutoModelWeightedItem(band, random)
+		tier := routes[start:end]
+		plan = append(plan, orderAutoModelScoreBandRoutes(group, tier, width, random)...)
+		if start == 0 {
+			// 队首所在档的锚点 = 首层最高分(band 0 锚定在层内最高分)。
+			debugAnchor = tier[0].Score
+			for _, route := range tier {
+				if route.Score > debugAnchor {
+					debugAnchor = route.Score
+				}
 			}
-			result = append(result, band[index])
-			band = append(band[:index], band[index+1:]...)
 		}
 		start = end
 	}
-	return result
+	if common.DebugEnabled && len(plan) > 0 {
+		head := plan[0]
+		for _, route := range routes {
+			if route.ModelName == head.ModelName && route.ChannelID == head.ChannelID {
+				common.SysLog(fmt.Sprintf(
+					"auto route: group %s plan %d routes, band width %.4f, head %s@%d priority %d score %.4f anchor %.4f channel weight %.1f model weight %.1f",
+					group, len(plan), width, route.ModelName, route.ChannelID, route.Priority,
+					route.Score, debugAnchor, route.ChannelWeight, route.ModelWeight))
+				break
+			}
+		}
+	}
+	return plan
 }
 
-func chooseAutoModelWeightedItem(items []autoModelScoreItem, random func() float64) int {
+// orderAutoModelScoreBandRoutes 把同一渠道优先级内的全部路线按模型有效得分分档,
+// 档内做保留渠道份额的无放回抽样,输出这一层的完整路线顺序。
+//
+// 分档锚定在"尚未分档路线里的最高分",不是相邻项:相邻锚定会把
+// 0.900/0.894/0.888 这样的一串接近分数串成一档。边界包含恰好等于档宽的情况;
+// 浮点比较带 1e-9 容差,否则 0.900-0.890=0.0100…9 的浮点误差会把方案里
+// "0.900/0.895/0.890 同档"的边界例子拆开。档宽 >= 1 时同优先级内所有正常
+// 得分同档;档宽 = 0 时只有同分(含浮点容差)才同档。
+//
+// 同档以后精确分数不再决定先后,也不乘进随机权重:否则流量仍会向微弱领先者
+// 集中,这正是得分分档要解决的问题。
+func orderAutoModelScoreBandRoutes(group string, tier []autoModelRouteCandidate, width float64, random func() float64) []AutoModelRoute {
+	ordered := append([]autoModelRouteCandidate(nil), tier...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].Score != ordered[j].Score {
+			return ordered[i].Score > ordered[j].Score
+		}
+		if ordered[i].ChannelID != ordered[j].ChannelID {
+			return ordered[i].ChannelID < ordered[j].ChannelID
+		}
+		return ordered[i].ModelName < ordered[j].ModelName
+	})
+	var bands [][]autoModelRouteCandidate
+	anchor := 0.0
+	for _, route := range ordered {
+		if len(bands) == 0 || route.Score < anchor-width-autoModelRouteScoreTieEpsilon {
+			bands = append(bands, []autoModelRouteCandidate{route})
+			anchor = route.Score
+			continue
+		}
+		bands[len(bands)-1] = append(bands[len(bands)-1], route)
+	}
+	var plan []AutoModelRoute
+	for _, band := range bands {
+		plan = append(plan, sampleAutoModelBandRoutes(group, band, random)...)
+	}
+	return plan
+}
+
+// sampleAutoModelBandRoutes 在一个得分档内做无放回的两级抽样:先按渠道权重在
+// 剩余渠道里选渠道,再按模型权重在该渠道的剩余路线里选模型。
+//
+// 每抽走一条路线都更新剩余候选与归一化分母,渠道不会被一次抽中后连续输出其
+// 全部模型。渠道权重相同时,10 个候选模型的渠道与 1 个候选模型的渠道总流量
+// 约各占一半;模型权重为 0 的路线在收集阶段已被排除,渠道权重为 0 的渠道在
+// 正权重渠道耗尽前不参与(保留为该档内的后备),剩余渠道全零权重时等概率。
+// 渠道与模型都按稳定顺序枚举,同一随机源下结果可复现。
+func sampleAutoModelBandRoutes(group string, band []autoModelRouteCandidate, random func() float64) []AutoModelRoute {
+	byChannel := make(map[int][]autoModelRouteCandidate, len(band))
+	for _, route := range band {
+		byChannel[route.ChannelID] = append(byChannel[route.ChannelID], route)
+	}
+	channelIDs := make([]int, 0, len(byChannel))
+	for id := range byChannel {
+		channelIDs = append(channelIDs, id)
+	}
+	sort.Ints(channelIDs)
+	remaining := make(map[int][]autoModelRouteCandidate, len(channelIDs))
+	channelWeights := make(map[int]float64, len(channelIDs))
+	for _, id := range channelIDs {
+		models := byChannel[id]
+		sort.Slice(models, func(i, j int) bool { return models[i].ModelName < models[j].ModelName })
+		remaining[id] = models
+		channelWeights[id] = models[0].ChannelWeight
+	}
+	var plan []AutoModelRoute
+	for len(remaining) > 0 {
+		active := make([]int, 0, len(remaining))
+		positive := make([]int, 0, len(remaining))
+		for _, id := range channelIDs {
+			if len(remaining[id]) == 0 {
+				continue
+			}
+			active = append(active, id)
+			if positiveAutoModelWeight(channelWeights[id]) {
+				positive = append(positive, id)
+			}
+		}
+		if len(active) == 0 {
+			break
+		}
+		var chosenChannel int
+		if len(positive) > 0 {
+			items := make([]autoModelWeightedItem, 0, len(positive))
+			for _, id := range positive {
+				items = append(items, autoModelWeightedItem{Index: id, Weight: channelWeights[id]})
+			}
+			chosenChannel = positive[chooseAutoModelWeightedItem(items, random)]
+		} else {
+			chosenChannel = active[int(random()*float64(len(active)))%len(active)]
+		}
+		models := remaining[chosenChannel]
+		items := make([]autoModelWeightedItem, 0, len(models))
+		for i, route := range models {
+			items = append(items, autoModelWeightedItem{Index: i, Weight: route.ModelWeight})
+		}
+		idx := chooseAutoModelWeightedItem(items, random)
+		chosen := models[idx]
+		plan = append(plan, AutoModelRoute{Group: group, ModelName: chosen.ModelName, ChannelID: chosen.ChannelID})
+		if rest := append(models[:idx], models[idx+1:]...); len(rest) > 0 {
+			remaining[chosenChannel] = rest
+		} else {
+			delete(remaining, chosenChannel)
+		}
+	}
+	return plan
+}
+
+
+// autoModelWeightedItem 是一次加权抽样的候选项:Index 是候选项在其切片中的位置,
+// Weight 是渠道权重或模型权重。分数不参与档内抽样——它只决定分档归属。
+type autoModelWeightedItem struct {
+	Index  int
+	Weight float64
+}
+
+// chooseAutoModelWeightedItem 在全部正权重候选项里按权重抽一个,返回下标。
+// 先按最大权重归一再求和,极大有限权重不会溢出;调用方保证不含零/负权重
+// (零权重渠道的后备与全零等概率语义在抽样调用处处理)。
+func chooseAutoModelWeightedItem(items []autoModelWeightedItem, random func() float64) int {
 	maxWeight := 0.0
 	for _, item := range items {
 		if positiveAutoModelWeight(item.Weight) && item.Weight > maxWeight {
@@ -606,9 +616,8 @@ func chooseAutoModelWeightedItem(items []autoModelScoreItem, random func() float
 		}
 	}
 	if maxWeight == 0 {
-		// Preserve channel-weight semantics: an all-zero channel band is
-		// uniform. Zero-weight models were removed before channel construction.
-		return int(random() * float64(len(items)))
+		// 理论上不可达:渠道与模型两级调用都只传正权重。保留等概率兜底。
+		return int(random()*float64(len(items))) % len(items)
 	}
 	total := 0.0
 	lastPositive := 0
@@ -628,6 +637,17 @@ func chooseAutoModelWeightedItem(items []autoModelScoreItem, random func() float
 		}
 	}
 	return lastPositive // floating-point rounding at the upper edge
+}
+
+func autoModelRouteWeight(group, name string, weights map[string]map[string]float64) float64 {
+	if weight, exists := weights[group][name]; exists {
+		return weight
+	}
+	return operation_setting.DefaultAutoModelWeight
+}
+
+func positiveAutoModelWeight(weight float64) bool {
+	return weight > 0 && !math.IsNaN(weight) && !math.IsInf(weight, 0)
 }
 
 func autoModelRouteModelNames(routes []AutoModelRoute) []string {

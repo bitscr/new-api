@@ -15,8 +15,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// autoModelOutcome 是一个被动健康摘要，模型与渠道两层使用相同的计分口径。
-// 数据仅来自真实请求的成功/失败反馈，绝不发送主动测活请求。
+// autoModelOutcome 是一个被动健康摘要,粒度为 (分组, 模型, 渠道) 的模型层证据。
+// 数据仅来自真实请求的成功/失败反馈,绝不发送主动测活请求。
 type autoModelOutcome struct {
 	Score        float64
 	LatencyMS    float64
@@ -24,14 +24,14 @@ type autoModelOutcome struct {
 	UpdatedAt    time.Time
 }
 
-// Model evidence is scoped to (group, model, channel). Channel evidence is
-// independently aggregated across actual outcomes in (group, channel); it must
-// never be approximated by a model's best score or highest channel priority.
+// Model evidence is scoped to (group, model, channel) and is the only signal the
+// auto route planner ranks by. The former channel-aggregated health layer has
+// been removed together with the channel-band ordering
+// (docs/auto-routing-priority-model-bands-plan.md).
 var autoModelHealth = types.NewRWMap[string, autoModelOutcome]()
-var autoModelChannelHealth = types.NewRWMap[string, autoModelOutcome]()
 
-// Serialize dual-layer publication, persistence snapshots and restore merges.
-// Lock order is this mutex -> RWMap; never hold it during SQL/cooldown I/O.
+// Serialize model feedback publication, persistence snapshots and restore
+// merges. Lock order is this mutex -> RWMap; never hold it during SQL/cooldown I/O.
 var autoModelScoreMutex sync.Mutex
 
 // autoModelHalfLifeMs 用于读取时的评分时间衰减。
@@ -50,10 +50,6 @@ const autoModelLatencyAlpha = 0.2
 // 让一条渠道变坏时分数快速下跌，而不是被历史大量成功拖住。
 const autoModelScoreAlpha = 0.30
 
-// autoScoreTieEpsilon retains the legacy channel selector's tolerance. The new
-// channel-first route planner uses its own floating-point-only tie tolerance.
-const autoScoreTieEpsilon = 0.02
-
 func autoModelHealthKey(group, name string, channelID int) string {
 	return group + "\x00" + name + "\x00" + strconv.Itoa(channelID)
 }
@@ -62,12 +58,8 @@ func autoModelHealthPrefix(group, name string) string {
 	return group + "\x00" + name + "\x00"
 }
 
-func autoModelChannelHealthKey(group string, channelID int) string {
-	return group + "\x00" + strconv.Itoa(channelID)
-}
-
-// RecordAutoModelOutcome 记录一次已观察到的请求结果（被动反馈）。
-// 同时更新 (分组, 模型, 渠道) 与 (分组, 渠道) 摘要，latencyMs <= 0 表示未采集到延迟。
+// RecordAutoModelOutcome 记录一次已观察到的请求结果（被动反馈），粒度是
+// (分组, 模型, 渠道)。latencyMs <= 0 表示未采集到延迟。
 // elapsedMs 是本次尝试的冷却信号：成功流式请求用首包延迟，非流式或失败用本次尝试耗时。
 func RecordAutoModelOutcome(group, name string, channelID int, success bool, latencyMs int64, elapsedMs int64) {
 	recordAutoModelOutcome(group, name, channelID, success, latencyMs, elapsedMs, false, "")
@@ -125,10 +117,6 @@ func recordAutoModelOutcome(group, name string, channelID int, success bool, lat
 	autoModelScoreMutex.Lock()
 	now := time.Now()
 	autoModelHealth.Update(key, func(current autoModelOutcome, exists bool) autoModelOutcome {
-		// One observation time under the publication lock belongs to both layers.
-		return updateAutoModelOutcome(current, exists, success, latencyMs, now)
-	})
-	autoModelChannelHealth.Update(autoModelChannelHealthKey(group, channelID), func(current autoModelOutcome, exists bool) autoModelOutcome {
 		return updateAutoModelOutcome(current, exists, success, latencyMs, now)
 	})
 	autoModelScoreMutex.Unlock()
@@ -193,9 +181,10 @@ func effectiveScore(outcome autoModelOutcome, now time.Time) float64 {
 	return score / (1.0 + outcome.LatencyMS/15000.0)
 }
 
-// GetAutoModelCandidates exposes the unique models in a fresh channel-first
-// plan for one concrete group. Models with no enabled, non-cooling route (or an
-// explicit zero model weight) are absent, including when every model is cooling.
+// GetAutoModelCandidates exposes the unique models in a fresh priority →
+// model-score-band plan for one concrete group. Models with no enabled,
+// non-cooling route (or an explicit zero model weight) are absent, including
+// when every model is cooling.
 func GetAutoModelCandidates(group string) []string {
 	if !operation_setting.AutoModelEnabled || strings.TrimSpace(group) == "" {
 		return nil

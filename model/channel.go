@@ -522,6 +522,17 @@ func (channel *Channel) Update() error {
 	return err
 }
 
+// UpdateModels 显式更新 channels.models 列并同步重建 abilities。
+// Update() 走 GORM 的 struct Updates,会跳过零值字段,无法把 models
+// 清空为 "";摘除最后一个模型等清空场景必须用显式列更新。
+func (channel *Channel) UpdateModels() error {
+	if err := DB.Model(channel).Select("models").
+		Update("models", channel.Models).Error; err != nil {
+		return err
+	}
+	return channel.UpdateAbilities(nil)
+}
+
 func (channel *Channel) UpdateResponseTime(responseTime int64) {
 	err := DB.Model(channel).Select("response_time", "test_time").Updates(Channel{
 		TestTime:     common.GetTimestamp(),

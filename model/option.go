@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -200,8 +201,8 @@ func InitOptionMap() {
 	common.OptionMap["AutoModelScoreRefreshSeconds"] = strconv.Itoa(operation_setting.AutoModelScoreRefreshSeconds())
 	common.OptionMap["AutoModelPermanentKeywords"] = operation_setting.AutoModelPermanentKeywordsToString()
 	common.OptionMap["AutoModelTransientKeywords"] = operation_setting.AutoModelTransientKeywordsToString()
-	common.OptionMap["AutoModelPriorityOverrideMargin"] = strconv.FormatFloat(
-		operation_setting.AutoModelPriorityOverrideMargin(), 'f', -1, 64)
+	common.OptionMap["AutoModelScoreBandWidth"] = strconv.FormatFloat(
+		operation_setting.AutoModelScoreBandWidth(), 'f', -1, 64)
 	common.OptionMap["ExposeRatioEnabled"] = strconv.FormatBool(ratio_setting.IsExposeRatioEnabled())
 
 	// 自动添加所有注册的模型配置
@@ -221,12 +222,117 @@ func loadOptionsFromDatabase() {
 		return
 	}
 	options = withEmailDomainExemptionOptions(options)
+	newBandWidth, hasNewBandWidth := "", false
+	legacyBandWidth, hasLegacyBandWidth := "", false
 	for _, option := range options {
+		switch option.Key {
+		case "AutoModelScoreBandWidth":
+			newBandWidth, hasNewBandWidth = option.Value, true
+		case "AutoModelPriorityOverrideMargin":
+			legacyBandWidth, hasLegacyBandWidth = option.Value, true
+		}
 		err := updateOptionMap(option.Key, option.Value)
 		if err != nil {
 			common.SysLog("failed to update option map: " + err.Error())
 		}
 	}
+	migrateAutoModelScoreBandWidthOption(newBandWidth, hasNewBandWidth, legacyBandWidth, hasLegacyBandWidth)
+}
+
+// migrateAutoModelScoreBandWidthOption performs a one-time DB-row migration from
+// the legacy key AutoModelPriorityOverrideMargin to AutoModelScoreBandWidth
+// (docs/auto-routing-priority-model-bands-plan.md §7). Presence is supplied from
+// actual AllOption rows, never inferred from the in-memory default value.
+//
+//   - new key exists: keep it; drop the obsolete legacy row so the option API no
+//     longer lists it;
+//   - new key missing + legacy value valid (explicit 0 included): copy the value
+//     to the new key and delete the legacy row in one transaction;
+//   - legacy value invalid: do not copy, log the error, fall back to the normal
+//     runtime default, and drop the unsupported obsolete row;
+//   - neither present: env/default seed applies, nothing to do.
+//
+// Idempotent: later loads/syncs see the new key and no legacy row. Failures are
+// reported and never silently fall back to the old algorithm.
+func migrateAutoModelScoreBandWidthOption(newRaw string, hasNew bool, oldRaw string, hasOld bool) {
+	const newKey = "AutoModelScoreBandWidth"
+	const legacyKey = "AutoModelPriorityOverrideMargin"
+	if !hasOld {
+		return
+	}
+	if hasNew {
+		parsed, parseErr := strconv.ParseFloat(strings.TrimSpace(newRaw), 64)
+		if parseErr != nil || operation_setting.ValidateAutoModelScoreBandWidth(parsed) != "" {
+			common.SysError("invalid " + newKey + " in database; using runtime default")
+			operation_setting.SetAutoModelScoreBandWidth(0.01)
+			common.OptionMapRWMutex.Lock()
+			common.OptionMap[newKey] = "0.01"
+			common.OptionMapRWMutex.Unlock()
+		}
+		if err := deleteLegacyAutoModelBandWidthOptionRow(legacyKey); err != nil {
+			common.SysError("failed to remove legacy " + legacyKey + " row: " + err.Error())
+			return
+		}
+		common.OptionMapRWMutex.Lock()
+		delete(common.OptionMap, legacyKey)
+		common.OptionMapRWMutex.Unlock()
+		return
+	}
+
+	parsed, parseErr := strconv.ParseFloat(strings.TrimSpace(oldRaw), 64)
+	if parseErr != nil || operation_setting.ValidateAutoModelScoreBandWidth(parsed) != "" {
+		common.SysError("invalid legacy " + legacyKey + " value; not migrated: " + oldRaw)
+		if err := deleteLegacyAutoModelBandWidthOptionRow(legacyKey); err != nil {
+			common.SysError("failed to remove invalid legacy " + legacyKey + " row: " + err.Error())
+			return
+		}
+		common.OptionMapRWMutex.Lock()
+		delete(common.OptionMap, legacyKey)
+		common.OptionMapRWMutex.Unlock()
+		return
+	}
+	value := strconv.FormatFloat(parsed, 'f', -1, 64)
+	storedValue, err := migrateReplaceLegacyBandWidthOption(newKey, legacyKey, value)
+	if err != nil {
+		common.SysError("failed to migrate " + legacyKey + " to " + newKey + ": " + err.Error())
+		return
+	}
+	if storedValue == "" {
+		storedValue = value
+	}
+	parsedStored, err := strconv.ParseFloat(strings.TrimSpace(storedValue), 64)
+	if err != nil || operation_setting.ValidateAutoModelScoreBandWidth(parsedStored) != "" {
+		common.SysError("migrated " + newKey + " row is invalid; using runtime default")
+		parsedStored, storedValue = 0.01, "0.01"
+	}
+	operation_setting.SetAutoModelScoreBandWidth(parsedStored)
+	common.OptionMapRWMutex.Lock()
+	common.OptionMap[newKey] = storedValue
+	delete(common.OptionMap, legacyKey)
+	common.OptionMapRWMutex.Unlock()
+}
+
+// migrateReplaceLegacyBandWidthOption writes the new key without overwriting a
+// concurrently-created new value (Attrs only fills a newly created row) and
+// deletes the legacy row in one transaction.
+func migrateReplaceLegacyBandWidthOption(newKey, legacyKey, value string) (string, error) {
+	var storedValue string
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		option := Option{Key: newKey}
+		if err := tx.Where(commonKeyCol+" = ?", newKey).Attrs(Option{Value: value}).FirstOrCreate(&option).Error; err != nil {
+			return err
+		}
+		storedValue = option.Value
+		return tx.Where(commonKeyCol+" = ?", legacyKey).Delete(&Option{}).Error
+	})
+	return storedValue, err
+}
+
+// deleteLegacyAutoModelBandWidthOptionRow removes the obsolete legacy option row.
+func deleteLegacyAutoModelBandWidthOptionRow(legacyKey string) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		return tx.Where(commonKeyCol+" = ?", legacyKey).Delete(&Option{}).Error
+	})
 }
 
 func SyncOptions(frequency int) {
@@ -628,8 +734,8 @@ func updateOptionMap(key string, value string) (err error) {
 		operation_setting.SetAutoModelPermanentKeywords(value)
 	case "AutoModelTransientKeywords":
 		operation_setting.SetAutoModelTransientKeywords(value)
-	case "AutoModelPriorityOverrideMargin":
-		autoModelSetFloatOption(value, operation_setting.SetAutoModelPriorityOverrideMargin)
+	case "AutoModelScoreBandWidth":
+		autoModelSetFloatOption(value, operation_setting.SetAutoModelScoreBandWidth)
 	case "StreamCacheQueueLength":
 		setting.StreamCacheQueueLength, _ = strconv.Atoi(value)
 	case "PayMethods":

@@ -37,7 +37,7 @@ const OPTION_KEYS = [
   'AutoModelEnabled',
   'AutoModelCandidates',
   'AutoModelWeights',
-  'AutoModelPriorityOverrideMargin',
+  'AutoModelScoreBandWidth',
 ];
 
 /**
@@ -52,10 +52,11 @@ const OPTION_KEYS = [
  *   分组名出现但值是空数组 = 该分组一个模型都不选,auto 在该分组下无路可走。
  * 两者在原始 JSON 里看起来很像,后果完全相反。
  *
- * 「渠道健康分同档宽度」管的是渠道顺序而不是候选范围:健康分差距小于它的渠道算
- * 一样健康,这时由渠道 priority 说话;差距超过它,健康分自己分出档来。没有这条规则
- * 时 priority 是硬分层,一条 priority 高的慢渠道会永远排在健康的低优先级渠道前面,
- * 每 15 分钟冷却到期就回来撞一次。
+ * 「模型得分同档宽度」管的是同一渠道优先级内、模型有效得分的分档:与档内最高分
+ * 差距不超过它的路线算同一档,档内只按权重随机;差距超过它才另起一档。priority 是
+ * 硬边界,高优先级的低分候选也排在低优先级的高分前面。渠道聚合健康分已整体移除,
+ * 不参与排序,也没有仅供诊断的保留形态;「模型得分」页展示的是模型级得分与渠道
+ * 优先级。
  */
 export default function SettingsAutoModelTargeting(props) {
   const { t } = useTranslation();
@@ -64,7 +65,7 @@ export default function SettingsAutoModelTargeting(props) {
     AutoModelEnabled: 'true',
     AutoModelCandidates: '',
     AutoModelWeights: '',
-    AutoModelPriorityOverrideMargin: '0.25',
+    AutoModelScoreBandWidth: '0.01',
   });
   const refForm = useRef();
   const [inputsRow, setInputsRow] = useState(inputs);
@@ -118,16 +119,16 @@ export default function SettingsAutoModelTargeting(props) {
     return parsed;
   };
 
-  // 反超阈值是浮点数,不能套用失败判据面板那套"至少 1 的整数"校验。
-  // 只挡空值、非数字与负数:0 和 >= 1 都是合法且有意义的选择。
-  const parseMargin = (value) => {
+  // 档宽是浮点数,不能套用失败判据面板那套"至少 1 的整数"校验。
+  // 只挡空值、非数字与负数:0(仅同分随机)和 >= 1(同优先级全部同档)都合法。
+  const parseBandWidth = (value) => {
     const raw = String(value ?? '').trim();
-    if (!raw) throw new Error(t('不能为空;默认值是 0.25'));
+    if (!raw) throw new Error(t('不能为空;默认值是 0.01'));
     const parsed = Number(raw);
     if (!Number.isFinite(parsed)) throw new Error(t('必须是数字'));
     if (parsed < 0) {
       throw new Error(
-        t('不能为负数:负值会让健康分更高的渠道反而落到更差的档,顺序被反转'),
+        t('不能为负数:负的档宽会让分档边界反向,得分更高的路线反而落到更差的档'),
       );
     }
     return parsed;
@@ -136,7 +137,7 @@ export default function SettingsAutoModelTargeting(props) {
   const validators = {
     AutoModelCandidates: parseCandidates,
     AutoModelWeights: parseWeights,
-    AutoModelPriorityOverrideMargin: parseMargin,
+    AutoModelScoreBandWidth: parseBandWidth,
   };
 
   const validate = (key, value) => {
@@ -303,16 +304,16 @@ export default function SettingsAutoModelTargeting(props) {
           <Row gutter={16} style={{ marginTop: 16 }}>
             <Col xs={24} sm={12}>
               <Form.Input
-                field={'AutoModelPriorityOverrideMargin'}
-                label={t('渠道健康分同档宽度')}
+                field={'AutoModelScoreBandWidth'}
+                label={t('模型得分同档宽度')}
                 extraText={t(
-                  '默认 0.25。健康分差距小于这个宽度的渠道算「一样健康」,由 priority 决定先后;差距超过它,健康分自己分出档来,priority 压不住。从未被观测过的渠道始终留在最好的档里由 priority 排——本系统不做主动探测,新渠道只有被真实请求用过才能证明自己。健康分量程 1.0、中立点 0.5,所以 0.25 是半个量程的差距,足以区分「明显更好」和「只是抖动」。档宽本身就是迟滞:要跨过一整档才会改变顺序,不会在临界处来回跳。填 0 = 顺序完全等于健康分顺序(priority 只用于同分);填 1 或更大 = 所有渠道永远同档,回到「priority 完全决定顺序」的旧行为。',
+                  '默认 0.01,作用于每个渠道优先级内的模型有效得分分档:同一优先级的全部可用路线一起比较,与档内最高分差距不超过它的算同一档,档内只按权重随机;差距超过它才另起一档(锚定档内最高分,不做相邻链接)。priority 是硬边界:高优先级的低分候选也排在低优先级的高分前面。档内两级抽样保留渠道份额:先按渠道权重选渠道,再按模型权重选模型——渠道权重相同时,10 个候选模型的渠道与 1 个候选模型的渠道总流量约各占一半,模型数量不会放大渠道流量。模型权重 0 = 该模型不参与 auto。填 0 = 仅同分随机;填 1 或更大 = 同优先级内全部同档。',
                 )}
                 rules={[
                   {
                     validator: (rule, value) => {
                       try {
-                        parseMargin(value);
+                        parseBandWidth(value);
                         return true;
                       } catch {
                         return false;
@@ -321,7 +322,7 @@ export default function SettingsAutoModelTargeting(props) {
                   },
                 ]}
                 onChange={(value) =>
-                  setInputs({ ...inputs, AutoModelPriorityOverrideMargin: value })
+                  setInputs({ ...inputs, AutoModelScoreBandWidth: value })
                 }
               />
             </Col>

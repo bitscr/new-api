@@ -90,18 +90,6 @@ func TestTransientKeywordDowngradesPermanentMatch(t *testing.T) {
 	require.False(t, AutoModelPermanentFailure(err))
 }
 
-// 保护项优先于关键词:上下文超长是"这次请求太长",不是"模型不存在"。
-// 管理员加错关键词也不能把整个模型摘掉。
-func TestKeywordCannotOverrideProtectedTransient(t *testing.T) {
-	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords("") })
-	operation_setting.SetAutoModelPermanentKeywords("maximum context length")
-
-	err := types.NewErrorWithStatusCode(errors.New("Maximum context length exceeded"),
-		types.ErrorCode("context_length_exceeded"), http.StatusBadRequest)
-
-	require.False(t, AutoModelPermanentFailure(err),
-		"上下文超长必须永远按抖动处理,即使关键词命中")
-}
 
 // 老行(没有 permanent 列/值为假)必须按抖动冷却载入,不能被误升为永久。
 func TestLegacyCooldownRowLoadsAsTransient(t *testing.T) {

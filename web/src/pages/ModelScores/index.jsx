@@ -173,6 +173,15 @@ const ModelScores = () => {
       width: 90,
     },
     {
+      title: t('优先级'),
+      dataIndex: 'channel_priority',
+      width: 80,
+      sorter: (a, b) =>
+        (Number(a.channel_priority) || 0) - (Number(b.channel_priority) || 0),
+      render: (value) =>
+        value === undefined || value === null ? '-' : Number(value),
+    },
+    {
       title: t('延迟(ms)'),
       dataIndex: 'latency_ms',
       sorter: (a, b) =>
@@ -271,6 +280,15 @@ const ModelScores = () => {
             empty={t('暂无模型得分数据')}
           />
         </Spin>
+        <Text
+          type='tertiary'
+          size='small'
+          style={{ display: 'block', marginTop: 8 }}
+        >
+          {t(
+            '分数是含时间衰减、置信度与延迟惩罚的有效分(0.5 为中立)。auto 请求顺序 = 渠道优先级降序 → 每个优先级内按模型有效得分分档 → 档内按渠道/模型权重随机。此处列表不是实际请求顺序:授权、可用性与随机抽样都会影响每次请求的结果。',
+          )}
+        </Text>
       </Card>
     </div>
   );

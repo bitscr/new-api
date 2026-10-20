@@ -168,16 +168,9 @@ func (p *autoModelScorePersistence) restore(ctx context.Context) error {
 		// Restore only missing keys. Any accepted in-process feedback wins,
 		// including feedback saved during an earlier failed-load interval or
 		// accepted while this query ran. Never merge two instances' EWMAs.
-		if row.Scope == model.AutoModelScoreScopeModel {
-			key := autoModelHealthKey(row.Group, row.Model, row.ChannelID)
-			if _, exists := autoModelHealth.Get(key); !exists {
-				autoModelHealth.Set(key, outcome)
-			}
-		} else if row.Scope == model.AutoModelScoreScopeChannel {
-			key := autoModelChannelHealthKey(row.Group, row.ChannelID)
-			if _, exists := autoModelChannelHealth.Get(key); !exists {
-				autoModelChannelHealth.Set(key, outcome)
-			}
+		key := autoModelHealthKey(row.Group, row.Model, row.ChannelID)
+		if _, exists := autoModelHealth.Get(key); !exists {
+			autoModelHealth.Set(key, outcome)
 		}
 	}
 	autoModelScoreMutex.Unlock()
@@ -214,16 +207,11 @@ func validAutoModelScore(row model.AutoModelScore, now time.Time) bool {
 		row.Group == "" || strings.TrimSpace(row.Group) != row.Group || strings.ContainsRune(row.Group, '\x00') {
 		return false
 	}
-	switch row.Scope {
-	case model.AutoModelScoreScopeModel:
-		if row.Model == "" || strings.TrimSpace(row.Model) != row.Model || strings.ContainsRune(row.Model, '\x00') || operation_setting.IsAutoModelName(row.Model) {
-			return false
-		}
-	case model.AutoModelScoreScopeChannel:
-		if row.Model != "" {
-			return false
-		}
-	default:
+	// 只恢复模型层快照;历史 scope=channel 行不再加载、不再更新,由通用过期清理淘汰。
+	if row.Scope != model.AutoModelScoreScopeModel {
+		return false
+	}
+	if row.Model == "" || strings.TrimSpace(row.Model) != row.Model || strings.ContainsRune(row.Model, '\x00') || operation_setting.IsAutoModelName(row.Model) {
 		return false
 	}
 	for _, value := range []float64{row.Score, row.LatencyMS, row.Observations} {
@@ -239,41 +227,27 @@ func validAutoModelScore(row model.AutoModelScore, now time.Time) bool {
 		row.ObservedAt > now.Add(-autoModelScoreRetention()).UnixNano()
 }
 
-// Snapshot both layers together, but release the publication lock before key
-// conversion, validation or any SQL. Score reads remain entirely in memory.
+// Snapshot the model layer under the publication lock, then release it before
+// key conversion, validation or any SQL. Score reads remain entirely in memory.
 func snapshotAutoModelScores() []model.AutoModelScore {
 	autoModelScoreMutex.Lock()
-	models, channels := autoModelHealth.ReadAll(), autoModelChannelHealth.ReadAll()
+	models := autoModelHealth.ReadAll()
 	autoModelScoreMutex.Unlock()
 	var rows []model.AutoModelScore
-	for _, layer := range []struct {
-		scope    string
-		outcomes map[string]autoModelOutcome
-	}{
-		{model.AutoModelScoreScopeModel, models},
-		{model.AutoModelScoreScopeChannel, channels},
-	} {
-		for key, outcome := range layer.outcomes {
-			parts := strings.Split(key, "\x00")
-			wantParts := 3
-			if layer.scope == model.AutoModelScoreScopeChannel {
-				wantParts = 2
-			}
-			if len(parts) != wantParts {
-				continue
-			}
-			id, err := strconv.Atoi(parts[len(parts)-1])
-			if err != nil {
-				continue
-			}
-			row := model.AutoModelScore{Scope: layer.scope, Group: parts[0], ChannelID: id,
-				Score: outcome.Score, LatencyMS: outcome.LatencyMS, Observations: outcome.Observations,
-				ObservedAt: outcome.UpdatedAt.UnixNano(), Version: model.AutoModelScoreVersion}
-			if layer.scope == model.AutoModelScoreScopeModel {
-				row.Model = parts[1]
-			}
-			rows = append(rows, row)
+	for key, outcome := range models {
+		parts := strings.Split(key, "\x00")
+		if len(parts) != 3 {
+			continue
 		}
+		id, err := strconv.Atoi(parts[2])
+		if err != nil {
+			continue
+		}
+		rows = append(rows, model.AutoModelScore{
+			Scope: model.AutoModelScoreScopeModel, Group: parts[0], Model: parts[1], ChannelID: id,
+			Score: outcome.Score, LatencyMS: outcome.LatencyMS, Observations: outcome.Observations,
+			ObservedAt: outcome.UpdatedAt.UnixNano(), Version: model.AutoModelScoreVersion,
+		})
 	}
 	return rows
 }

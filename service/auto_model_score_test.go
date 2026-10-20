@@ -27,6 +27,7 @@ func TestListAutoModelScores(t *testing.T) {
 	// 给 slow-model 建一条冷却,验证得分明细能带出冷却等级。
 	tripAutoModelCooldown("default", "slow-model", 2, "请求失败", now)
 
+
 	scores := ListAutoModelScores(now)
 	require.Len(t, scores, 2)
 	require.Equal(t, "fast-model", scores[0].Model, "应按得分从高到低排序")
@@ -35,11 +36,12 @@ func TestListAutoModelScores(t *testing.T) {
 	require.Equal(t, "slow-model", scores[1].Model)
 	require.True(t, scores[1].Cooling)
 	require.Equal(t, 1, scores[1].CooldownLevel)
+
 }
 
 
 // 一键清除负面效果:得分恢复中立 0.5、延迟惩罚清零、冷却解除;
-// 没有观测数据的组合是 no-op。渠道层聚合不属于这一行,不受影响。
+// 没有观测数据的组合是 no-op。
 func TestClearAutoModelNegativeEffects(t *testing.T) {
 	setupAutoModelCooldownTestDB(t)
 	// 没有观测数据:无事可做

@@ -6,11 +6,20 @@ retry behavior are unchanged. Effort adaptation is described separately in
 
 ## Selection and budget
 
-The initial plan remains channel-first: group order, channel priority, channel
-health, channel weight, then model health and model weight within the channel.
-Every concrete `(group, model, channel)` route occurs at most once. Token model
-allowlists, billing eligibility, enabled abilities, local daily/RPM limits and
-strict pair cooldowns are checked before dispatch.
+The plan is built as: group order, then eligibility filters, then channel
+priority in descending order as a hard boundary, then model effective-score
+bands inside each priority tier (band width `AutoModelScoreBandWidth`, default
+0.01), then within-band weighted sampling that preserves each channel's share —
+equal channel weights mean ten candidate models on one channel and one on
+another draw roughly 50/50 regardless of model count. The channel-health
+aggregation chain (ordering, banding, cold-start smoothing and its persistence)
+has been removed entirely; there is no channel-level score to keep, not even
+for diagnostics. Every concrete `(group, model, channel)` route occurs at most
+once, and inside one priority tier model effective scores are compared across
+channels. Token model allowlists, billing eligibility, enabled abilities, local
+daily/RPM limits and strict pair cooldowns are checked before dispatch. See
+[auto-routing-priority-model-bands-plan.md](auto-routing-priority-model-bands-plan.md)
+for the full banding and sampling rules.
 
 The first selected channel freezes the retry budget, including its override.
 `RetryTimes` counts extra attempts, not channels. Switching model, channel or group
@@ -84,14 +93,14 @@ mapper is not a promise that every downstream capability validator accepts it.
 Feedback is deduplicated within the request by `(group, model, channel)`, keeping the
 last observation for each key. At request completion, these final observations are
 applied in the order they actually occurred within that request. Replacing an older
-observation also moves its position. Channel EWMA spans model keys, so unordered map
-iteration is not a valid application order. A batch drains only once.
+observation also moves its position, so unordered map iteration is not a valid
+application order. A batch drains only once.
 
 The existing success/latency formula is unchanged. Scores describe observed
 availability and responsiveness, not model reasoning quality. Model scores are
-pair-specific, while a group/channel score also reflects that channel's other models.
-Score state is process-local, decays toward neutral over idle time, and is not a
-persistent reputation record.
+pair-specific; the channel-level aggregate score no longer exists. Score state is
+process-local, decays toward neutral over idle time, and is not a persistent
+reputation record.
 
 ## Persistent cooldown remains pair-scoped
 
@@ -102,29 +111,27 @@ another model succeeding does not clear it. No model-empty channel cooldown rows
 introduced, and no historical cooldowns are deleted by this change.
 
 Jitter failures such as rate limits, timeouts and server errors keep the existing
-ladder: 15 minutes, doubling to a six-hour cap. Deterministic failures use a longer
-ladder because retrying them cannot succeed: a positively identified missing model,
-an authentication/permission rejection (401/403), an unsupported model or model
-feature, and a request rejected specifically on the `model` parameter. The first such
-failure cools for `AutoModelPermanentCooldownHours` (default 24, seeded from
-`AUTO_MODEL_PERMANENT_COOLDOWN_HOURS`), doubling to
-`AutoModelPermanentCooldownMaxDays` (default 30 days). Both ladders share one
-escalation counter, and a row records which ladder it is on so a restart restores the
-same behaviour. A generic bad request, a context-length error, or unrecognised text is
-treated as jitter: an unknown failure is retried rather than permanently banning a
-model that may only be temporarily unavailable.
+ladder: 15 minutes, doubling to a configurable cap. There is no deterministic
+cooldown tier any more: a failure matching an administrator-configured
+deterministic keyword retires the `(group, model, channel)` pair immediately —
+the model is removed from that channel's `models` list and the abilities are
+rebuilt, an emptied channel is auto-disabled — because retrying a deterministic
+failure cannot succeed and a cooldown would only postpone it. A generic bad
+request, a context-length error, or unrecognised text is treated as jitter: an
+unknown failure is retried rather than removing a model that may only be
+temporarily unavailable.
 
-Administrators can extend the built-in criteria with keywords
-(`AutoModelPermanentKeywords`), because the hardcoded list cannot recognise error
-strings a new upstream invents; such failures would otherwise only get the 15-minute
-jitter cooldown and be retried forever. A keyword match upgrades the cooldown, nothing
-else: the scope stays one `(group, model, channel)` pair, the channel's `models`
-configuration is untouched, and no probe is ever sent. Context overflow and generic
-bad requests are deliberately *not* in the built-in criteria, so only an explicit
-administrator keyword can make a 4xx permanent.
+Deterministic keywords are administrator-configured in the panel and stored in
+the database (`AutoModelPermanentKeywords`); nothing is built into the source, so
+an unconfigured deployment has no deterministic criteria at all. A keyword match
+has exactly one effect: the pair is retired immediately. The channel itself is
+kept — credentials and configuration are reused — and no probe is ever sent.
+Transient keywords (`AutoModelTransientKeywords`) outrank deterministic ones and
+pin a self-healing error to the jitter ladder; context overflow is a protected
+transient failure that no keyword can override.
 
 Keyword writes are validated before they reach the database, because a keyword is a
-high-consequence criterion: a match starts a 24-hour cooldown. Entries shorter than
+high-consequence criterion: a match removes the pair immediately. Entries shorter than
 two characters, entries that only describe a protected transient failure (which the
 protected predicate outranks, so they could never take effect), and bare catch-all
 words such as `error` are refused with an explanatory message. Specific upstream
@@ -133,23 +140,22 @@ refusal arrives as HTTP 200 with `success:false`, so a client that only checks t
 transport status would report a rejected keyword as saved; the admin panel reads the
 body's `success` and surfaces the server's message.
 
-This is the reversible reading of "remove the model": the pair is excluded from auto
-routing for the cooldown window only. Deleting the row restores selection, and the
-admin panel exposes both the live cooldown list and a per-row clear. That visibility
-is not optional: the ladder is self-reinforcing (24h, doubling, capped at 30 days)
-while the only automatic clear is one fast successful request on that pair, which can
-never happen while the pair is cooling. Without a visible, clearable list, a single
-mistyped keyword would become a 30-day seal nobody can lift.
+This is the reversible reading of "remove the model": the pair is gone from auto
+routing because the model no longer exists in the channel's `models` list, not
+because of a timer. Re-adding the model to the channel restores selection, and the
+admin panel exposes the live keyword lists. That visibility is not optional: a
+keyword match takes effect immediately and lasts until an administrator acts, so
+the panel must show exactly which criteria are configured.
 
 ## Scoring window and cooldown window
 
-The score decay window (`AutoModelScoreDecayMinutes`, default 30 minutes) must stay
-longer than the transient cooldown window (15 minutes). At the original 10-minute
-decay, a pair's score had already reached neutral 0.5 by the time its cooldown
-expired, so it returned to the candidate pool with no memory of why it was cooled,
-and persisted scores could only ever survive a restart completed within ten minutes.
-Keeping the decay window longer than the cooldown window is what makes the two
-signals complementary instead of contradictory.
+The score decay window (`AutoModelScoreDecayMinutes`, default 360 minutes) must
+stay longer than the early tiers of the transient cooldown ladder (15 minutes,
+doubling). At a decay shorter than the second tier, a pair's score had already
+reached neutral 0.5 by the time its cooldown expired, so it returned to the
+candidate pool with no memory of why it was cooled. Keeping the decay window
+longer than the cooldown ladder is what makes the two signals complementary
+instead of contradictory.
 
 ## Verification
 

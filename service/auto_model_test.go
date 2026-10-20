@@ -4,13 +4,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/stretchr/testify/require"
 )
 
 func autoModelTestReset() {
 	autoModelHealth.Clear()
-	autoModelChannelHealth.Clear()
 	autoModelCooldowns.Clear()
 	_ = operation_setting.SetAutoModelCandidates("{}")
 	_ = operation_setting.SetAutoModelWeights("{}")
@@ -163,27 +163,41 @@ func TestAutoModelRecordIgnoresVirtualName(t *testing.T) {
 	autoModelTestReset()
 	RecordAutoModelOutcome("default", "auto", 1, true, 5, 5)
 	require.Zero(t, autoModelHealth.Len())
-	require.Zero(t, autoModelChannelHealth.Len())
 }
 
-// Only floating-point-equivalent scores tie. Actual score differences must
-// retain their order even when the lower-scoring item has a much larger weight.
-func TestAutoModelTieBandsOrdering(t *testing.T) {
-	items := []autoModelScoreItem{
-		{Index: 0, Score: 0.30, Weight: 1},
-		{Index: 1, Score: 0.60, Weight: 1},
-		{Index: 2, Score: 0.60 + 5e-10, Weight: 1},
-		{Index: 3, Score: 0.59, Weight: 1e100},
+// 档宽 0 时只有浮点等价的分数算同分;实际分差保持先后,大权重不能跨档。
+func TestAutoModelScoreBandWidthZeroKeepsExactTies(t *testing.T) {
+	old := operation_setting.AutoModelScoreBandWidth()
+	t.Cleanup(func() { operation_setting.SetAutoModelScoreBandWidth(old) })
+	operation_setting.SetAutoModelScoreBandWidth(0)
+
+	now := time.Unix(1700000000, 0)
+	snapshot := autoModelRouteSnapshot{
+		Now: now,
+		Targets: map[string][]model.AutoModelRoutingTarget{
+			"s30":  {{ChannelID: 1, Weight: 1}},
+			"s60":  {{ChannelID: 1, Weight: 1}},
+			"s60b": {{ChannelID: 1, Weight: 1}},
+			"s59":  {{ChannelID: 1, Weight: 1}},
+		},
+		ModelHealth: map[string]autoModelOutcome{
+			autoModelHealthKey("g", "s30", 1):  {Score: 0.30, Observations: 20, UpdatedAt: now},
+			autoModelHealthKey("g", "s60", 1):  {Score: 0.60, Observations: 20, UpdatedAt: now},
+			autoModelHealthKey("g", "s60b", 1): {Score: 0.60 + 5e-10, Observations: 20, UpdatedAt: now},
+			autoModelHealthKey("g", "s59", 1):  {Score: 0.59, Observations: 20, UpdatedAt: now},
+		},
+		ModelWeights: map[string]map[string]float64{"g": {"s59": 1e100}},
 	}
-	heads := map[int]bool{}
+	heads := map[string]bool{}
 	for _, draw := range []float64{0, 0.99} {
-		ordered := orderAutoModelScoreBands(items, func() float64 { return draw })
-		require.Len(t, ordered, 4)
-		require.Contains(t, []int{1, 2}, ordered[0].Index)
-		require.Contains(t, []int{1, 2}, ordered[1].Index)
-		require.Equal(t, 3, ordered[2].Index, "0.59 is below 0.60, not a random tie")
-		require.Equal(t, 0, ordered[3].Index)
-		heads[ordered[0].Index] = true
+		got := buildAutoModelRoutesFromSnapshot("g", []string{"s30", "s60", "s60b", "s59"}, snapshot,
+			func() float64 { return draw })
+		require.Len(t, got, 4)
+		require.Contains(t, []string{"s60", "s60b"}, got[0].ModelName)
+		require.Contains(t, []string{"s60", "s60b"}, got[1].ModelName)
+		require.Equal(t, "s59", got[2].ModelName, "0.59 is below 0.60, not a random tie")
+		require.Equal(t, "s30", got[3].ModelName)
+		heads[got[0].ModelName] = true
 	}
 	require.Len(t, heads, 2, "floating-point-equivalent top scores use weighted randomness")
 }

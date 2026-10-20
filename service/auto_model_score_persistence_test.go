@@ -33,16 +33,13 @@ func setupAutoModelScorePersistenceTestDB(t *testing.T, paths ...string) *gorm.D
 	sqlDB.SetMaxOpenConns(1)
 	require.NoError(t, db.AutoMigrate(&model.AutoModelScore{}, &model.AutoModelCooldown{}))
 	oldDB := model.DB
-	oldModels, oldChannels := autoModelHealth.ReadAll(), autoModelChannelHealth.ReadAll()
+	oldModels := autoModelHealth.ReadAll()
 	autoModelHealth.Clear()
-	autoModelChannelHealth.Clear()
 	model.DB = db
 	t.Cleanup(func() {
 		model.DB = oldDB
 		autoModelHealth.Clear()
 		autoModelHealth.AddAll(oldModels)
-		autoModelChannelHealth.Clear()
-		autoModelChannelHealth.AddAll(oldChannels)
 		require.NoError(t, sqlDB.Close())
 	})
 	return db
@@ -91,10 +88,10 @@ func TestAutoModelScoreStartRestoresFreshConnectionBeforeReturning(t *testing.T)
 	RecordAutoModelOutcome("g", "beta", 1, true, 150, 0)
 	RecordAutoModelOutcome("g", "alpha", 2, true, 50, 0)
 	stop()
-	wantModels, wantChannels := autoModelHealth.ReadAll(), autoModelChannelHealth.ReadAll()
+	wantModels := autoModelHealth.ReadAll()
 	snapshot := autoModelRouteSnapshot{
 		Targets:     map[string][]model.AutoModelRoutingTarget{"alpha": {{ChannelID: 1, Weight: 1}, {ChannelID: 2, Weight: 1}}, "beta": {{ChannelID: 1, Weight: 1}}},
-		ModelHealth: wantModels, ChannelHealth: wantChannels, Now: time.Now(),
+		ModelHealth: wantModels, Now: time.Now(),
 	}
 	wantRoutes := buildAutoModelRoutesFromSnapshot("g", []string{"alpha", "beta"}, snapshot, func() float64 { return 0 })
 	require.Equal(t, []AutoModelRoute{{Group: "g", ModelName: "alpha", ChannelID: 1}, {Group: "g", ModelName: "beta", ChannelID: 1}, {Group: "g", ModelName: "alpha", ChannelID: 2}}, wantRoutes)
@@ -102,7 +99,6 @@ func TestAutoModelScoreStartRestoresFreshConnectionBeforeReturning(t *testing.T)
 	require.NoError(t, err)
 	require.NoError(t, sqlDB.Close())
 	autoModelHealth.Clear()
-	autoModelChannelHealth.Clear()
 	reopened, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
 	require.NoError(t, err)
 	reopenedSQL, err := reopened.DB()
@@ -112,8 +108,7 @@ func TestAutoModelScoreStartRestoresFreshConnectionBeforeReturning(t *testing.T)
 	stopReloaded := StartAutoModelScorePersistence()
 	t.Cleanup(stopReloaded)
 	assertAutoModelScoreOutcomes(t, wantModels, autoModelHealth.ReadAll())
-	assertAutoModelScoreOutcomes(t, wantChannels, autoModelChannelHealth.ReadAll())
-	snapshot.ModelHealth, snapshot.ChannelHealth = autoModelHealth.ReadAll(), autoModelChannelHealth.ReadAll()
+	snapshot.ModelHealth = autoModelHealth.ReadAll()
 	require.Equal(t, wantRoutes, buildAutoModelRoutesFromSnapshot("g", []string{"alpha", "beta"}, snapshot, func() float64 { return 0 }))
 }
 
@@ -131,7 +126,7 @@ func TestAutoModelScoreFlushWritesOnlyChangedRawObservations(t *testing.T) {
 	RecordAutoModelOutcome("g", "alpha", 1, true, 100, 0)
 	require.NoError(t, p.flush(context.Background()))
 	require.Equal(t, 1, writes)
-	require.Equal(t, 2, writtenRows)
+	require.Equal(t, 1, writtenRows)
 	original, _ := autoModelHealth.Get(autoModelHealthKey("g", "alpha", 1))
 	for i := 0; i < 4; i++ {
 		_ = effectiveScore(original, original.UpdatedAt.Add(time.Duration(i)*time.Minute))
@@ -141,42 +136,12 @@ func TestAutoModelScoreFlushWritesOnlyChangedRawObservations(t *testing.T) {
 	RecordAutoModelOutcome("g", "beta", 1, true, 200, 0)
 	require.NoError(t, p.flush(context.Background()))
 	require.Equal(t, 2, writes)
-	require.Equal(t, 4, writtenRows, "only the new model and changed shared channel should be saved")
+	require.Equal(t, 2, writtenRows, "only the new model row should be saved")
 	autoModelHealth.Clear()
-	autoModelChannelHealth.Clear()
 	reloaded := &autoModelScorePersistence{db: db}
 	require.NoError(t, reloaded.restore(context.Background()))
 	require.NoError(t, reloaded.flush(context.Background()))
 	require.Equal(t, 2, writes, "restored rows are already durable and must not become dirty merely on load")
-}
-
-func TestAutoModelScoreSnapshotPairsStayConsistentDuringFeedback(t *testing.T) {
-	setupAutoModelScorePersistenceTestDB(t)
-	RecordAutoModelOutcome("g", "alpha", 1, true, 100, 0)
-	checkPair := func() {
-		rows := snapshotAutoModelScores()
-		require.Len(t, rows, 2)
-		a, b := rows[0], rows[1]
-		require.Equal(t, a.ObservedAt, b.ObservedAt, "one actual observation must publish both scoring layers with one observation time")
-		require.Equal(t, a.Score, b.Score, "snapshot must not split a feedback update between its two layers")
-		require.Equal(t, a.LatencyMS, b.LatencyMS)
-		require.Equal(t, a.Observations, b.Observations)
-	}
-	checkPair()
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for n := 0; n < 500; n++ {
-				RecordAutoModelOutcome("g", "alpha", 1, true, int64(100+n), 0)
-			}
-		}()
-	}
-	for i := 0; i < 500; i++ {
-		checkPair()
-	}
 }
 
 func TestAutoModelScoreLoadRetryPreservesFeedbackAcceptedDuringSQL(t *testing.T) {
@@ -184,11 +149,9 @@ func TestAutoModelScoreLoadRetryPreservesFeedbackAcceptedDuringSQL(t *testing.T)
 		t.Run(map[bool]string{false: "unsaved", true: "already_saved"}[flushBeforeRetry], func(t *testing.T) {
 			db := setupAutoModelScorePersistenceTestDB(t)
 			old := model.AutoModelScore{Scope: "model", Group: "g", Model: "alpha", ChannelID: 1, Score: 0.1, LatencyMS: 999, Observations: 8, ObservedAt: time.Now().Add(-time.Minute).UnixNano(), Version: 1}
-			channel := old
-			channel.Scope, channel.Model = "channel", ""
 			untouched := old
 			untouched.Model, untouched.ChannelID = "untouched", 2
-			require.NoError(t, db.Create(&[]model.AutoModelScore{old, channel, untouched}).Error)
+			require.NoError(t, db.Create(&[]model.AutoModelScore{old, untouched}).Error)
 			var fail atomic.Bool
 			fail.Store(true)
 			entered, release := make(chan struct{}), make(chan struct{})
@@ -230,15 +193,13 @@ func TestAutoModelScoreLoadRetryPreservesFeedbackAcceptedDuringSQL(t *testing.T)
 			case <-time.After(time.Second):
 				t.Fatal("SQL load must not hold the score-update lock")
 			}
-			wantModels, wantChannels := autoModelHealth.ReadAll(), autoModelChannelHealth.ReadAll()
+			wantModels := autoModelHealth.ReadAll()
 			unblock()
 			require.NoError(t, <-result)
 			wantModels[autoModelHealthKey("g", "untouched", 2)] = autoModelOutcome{Score: untouched.Score, LatencyMS: untouched.LatencyMS, Observations: untouched.Observations, UpdatedAt: time.Unix(0, untouched.ObservedAt)}
 			assertAutoModelScoreOutcomes(t, wantModels, autoModelHealth.ReadAll())
-			assertAutoModelScoreOutcomes(t, wantChannels, autoModelChannelHealth.ReadAll())
 			require.NoError(t, p.flush(context.Background()))
 			assertAutoModelScoreRow(t, db, "model", "g", "alpha", 1, wantModels[autoModelHealthKey("g", "alpha", 1)])
-			assertAutoModelScoreRow(t, db, "channel", "g", "", 1, wantChannels[autoModelChannelHealthKey("g", 1)])
 		})
 	}
 }
@@ -267,7 +228,7 @@ func TestAutoModelScoreExplicitWorkerFlushesAndStopsIdempotently(t *testing.T) {
 	stop()
 	rows, err := model.LoadAutoModelScores(context.Background(), db)
 	require.NoError(t, err)
-	require.Len(t, rows, 2)
+	require.Len(t, rows, 1)
 	require.EqualValues(t, 1, writes.Load(), "shutdown must not rewrite a just-persisted idle snapshot")
 	RecordAutoModelOutcome("g", "alpha", 1, true, 200, 0)
 	var wg sync.WaitGroup
@@ -303,14 +264,13 @@ func TestAutoModelScoreWorkerRetriesInitialLoadWithoutReplacingFeedback(t *testi
 	t.Cleanup(stop)
 	require.EqualValues(t, 1, attempts.Load(), "initial restore runs before start returns")
 	RecordAutoModelOutcome("g", "alpha", 1, true, 100, 0)
-	wantModels, wantChannels := autoModelHealth.ReadAll(), autoModelChannelHealth.ReadAll()
+	wantModels := autoModelHealth.ReadAll()
 	fail.Store(false)
 	require.Eventually(t, func() bool { _, ok := autoModelHealth.Get(autoModelHealthKey("g", "untouched", 2)); return ok }, time.Second, 5*time.Millisecond, "the worker must retry an initially failed load, not just save new observations")
 	stop()
 	require.EqualValues(t, 2, attempts.Load(), "a successfully restored worker must not reload on every tick/stop")
 	wantModels[autoModelHealthKey("g", "untouched", 2)] = autoModelOutcome{Score: untouched.Score, Observations: untouched.Observations, UpdatedAt: time.Unix(0, untouched.ObservedAt)}
 	assertAutoModelScoreOutcomes(t, wantModels, autoModelHealth.ReadAll())
-	assertAutoModelScoreOutcomes(t, wantChannels, autoModelChannelHealth.ReadAll())
 	assertAutoModelScoreRow(t, db, "model", "g", "alpha", 1, wantModels[autoModelHealthKey("g", "alpha", 1)])
 }
 
@@ -323,7 +283,9 @@ func TestAutoModelScoreFlushRetainsFeedbackDuringSQLAndAfterFailure(t *testing.T
 			RecordAutoModelOutcome("g", "alpha", 1, true, 100, 0)
 			original, _ := autoModelHealth.Get(autoModelHealthKey("g", "alpha", 1))
 			if failFirst {
-				require.NoError(t, db.Exec(`CREATE TRIGGER fail_score_batch BEFORE INSERT ON auto_model_scores WHEN NEW.scope = 'channel' BEGIN SELECT RAISE(ABORT, 'transient score failure'); END`).Error)
+				// 用一个专门的分组行触发批次中途失败,验证事务原子性。
+				RecordAutoModelOutcome("failgroup", "alpha", 1, true, 100, 0)
+				require.NoError(t, db.Exec(`CREATE TRIGGER fail_score_batch BEFORE INSERT ON auto_model_scores WHEN NEW."group" = 'failgroup' BEGIN SELECT RAISE(ABORT, 'transient score failure'); END`).Error)
 			}
 			entered, release := make(chan struct{}), make(chan struct{})
 			var blockOnce, releaseOnce sync.Once
@@ -359,7 +321,7 @@ func TestAutoModelScoreFlushRetainsFeedbackDuringSQLAndAfterFailure(t *testing.T
 			case <-time.After(time.Second):
 				t.Fatal("feedback must not wait for a score SQL write")
 			}
-			wantModels, wantChannels := autoModelHealth.ReadAll(), autoModelChannelHealth.ReadAll()
+			wantModels := autoModelHealth.ReadAll()
 			unblock()
 			err := <-result
 			if failFirst {
@@ -376,7 +338,6 @@ func TestAutoModelScoreFlushRetainsFeedbackDuringSQLAndAfterFailure(t *testing.T
 			for name, key := range map[string]string{"alpha": autoModelHealthKey("g", "alpha", 1), "beta": autoModelHealthKey("g", "beta", 1)} {
 				assertAutoModelScoreRow(t, db, "model", "g", name, 1, wantModels[key])
 			}
-			assertAutoModelScoreRow(t, db, "channel", "g", "", 1, wantChannels[autoModelChannelHealthKey("g", 1)])
 			require.NoError(t, p.flush(context.Background()))
 			require.EqualValues(t, 2, writes.Load(), "ack only the captured successful batch, then remain idle")
 		})
@@ -388,13 +349,12 @@ func TestAutoModelScoreFailedWriteRetriesWithoutAnotherObservation(t *testing.T)
 	p := &autoModelScorePersistence{db: db}
 	require.NoError(t, p.restore(context.Background()))
 	RecordAutoModelOutcome("g", "alpha", 1, true, 100, 0)
-	wantModels, wantChannels := autoModelHealth.ReadAll(), autoModelChannelHealth.ReadAll()
+	wantModels := autoModelHealth.ReadAll()
 	require.NoError(t, db.Exec(`CREATE TRIGGER fail_idle_score BEFORE INSERT ON auto_model_scores BEGIN SELECT RAISE(ABORT, 'retry me'); END`).Error)
 	require.ErrorContains(t, p.flush(context.Background()), "retry me")
 	require.NoError(t, db.Exec("DROP TRIGGER fail_idle_score").Error)
 	require.NoError(t, p.flush(context.Background()))
 	assertAutoModelScoreRow(t, db, "model", "g", "alpha", 1, wantModels[autoModelHealthKey("g", "alpha", 1)])
-	assertAutoModelScoreRow(t, db, "channel", "g", "", 1, wantChannels[autoModelChannelHealthKey("g", 1)])
 }
 
 func TestAutoModelScoreLifecycleUsesCapturedDBAndBoundsSQLWaits(t *testing.T) {
@@ -407,7 +367,7 @@ func TestAutoModelScoreLifecycleUsesCapturedDBAndBoundsSQLWaits(t *testing.T) {
 		stop()
 		rows, err := model.LoadAutoModelScores(context.Background(), original)
 		require.NoError(t, err)
-		require.Len(t, rows, 2, "all worker I/O must use the DB captured at startup")
+		require.Len(t, rows, 1, "all worker I/O must use the DB captured at startup")
 		rows, err = model.LoadAutoModelScores(context.Background(), replacement)
 		require.NoError(t, err)
 		require.Empty(t, rows)
@@ -442,7 +402,7 @@ func TestAutoModelScoreLifecycleUsesCapturedDBAndBoundsSQLWaits(t *testing.T) {
 		restarted()
 		rows, err = model.LoadAutoModelScores(context.Background(), db)
 		require.NoError(t, err)
-		require.Len(t, rows, 2)
+		require.Len(t, rows, 1)
 	})
 }
 
@@ -501,14 +461,12 @@ func TestAutoModelScoreIdleWorkerDoesNotReloadOrRewrite(t *testing.T) {
 func TestAutoModelScoreRestoredHintsCannotCreateRoutingTargets(t *testing.T) {
 	db := setupAutoModelScorePersistenceTestDB(t)
 	ghost := model.AutoModelScore{Scope: "model", Group: "g", Model: "deleted", ChannelID: 99, Score: 1, Observations: 20, ObservedAt: time.Now().UnixNano(), Version: 1}
-	channel := ghost
-	channel.Scope, channel.Model = "channel", ""
-	require.NoError(t, db.Create(&[]model.AutoModelScore{ghost, channel}).Error)
+	require.NoError(t, db.Create(&ghost).Error)
 	p := &autoModelScorePersistence{db: db}
 	require.NoError(t, p.restore(context.Background()))
 	snapshot := autoModelRouteSnapshot{
 		Targets:     map[string][]model.AutoModelRoutingTarget{"live": {{ChannelID: 1, Weight: 1}}},
-		ModelHealth: autoModelHealth.ReadAll(), ChannelHealth: autoModelChannelHealth.ReadAll(), Now: time.Now(),
+		ModelHealth: autoModelHealth.ReadAll(), Now: time.Now(),
 	}
 	require.Equal(t, []AutoModelRoute{{Group: "g", ModelName: "live", ChannelID: 1}}, buildAutoModelRoutesFromSnapshot("g", []string{"deleted", "live"}, snapshot, func() float64 { return 0 }), "historical scores cannot re-enable a deleted/absent routing target")
 }
@@ -519,6 +477,7 @@ func TestAutoModelScoreExpirationPrunesWithoutRevivingIdleEvidence(t *testing.T)
 	// 过期/新鲜的边界跟随可配置的衰减窗口,不写死 11m/5m。
 	window := autoModelScoreRetention()
 	old := model.AutoModelScore{Scope: "model", Group: "g", Model: "old", ChannelID: 1, Score: 0.9, LatencyMS: 300, Observations: 4, ObservedAt: now.Add(-window - time.Minute).UnixNano(), Version: 1}
+	// 历史 scope=channel 行仍可能留在库里:读取忽略它,通用过期清理负责淘汰。
 	oldChannel := old
 	oldChannel.Scope, oldChannel.Model = "channel", ""
 	fresh := old
@@ -528,12 +487,11 @@ func TestAutoModelScoreExpirationPrunesWithoutRevivingIdleEvidence(t *testing.T)
 	require.NoError(t, p.restore(context.Background()))
 	rows, err := model.LoadAutoModelScores(context.Background(), db)
 	require.NoError(t, err)
-	require.Equal(t, []model.AutoModelScore{fresh}, rows, "initial restore must prune expired snapshots from both scopes")
+	require.Equal(t, []model.AutoModelScore{fresh}, rows, "initial restore must prune expired snapshots; legacy channel-scope rows are ignored by reads")
 	// An inactive entry can remain in the existing online maps; it must not
 	// be reinserted by a later flush, nor may invalid floating-point state.
 	outcome := autoModelOutcome{Score: old.Score, LatencyMS: old.LatencyMS, Observations: old.Observations, UpdatedAt: time.Unix(0, old.ObservedAt)}
 	autoModelHealth.Set(autoModelHealthKey("g", "old", 1), outcome)
-	autoModelChannelHealth.Set(autoModelChannelHealthKey("g", 1), outcome)
 	outcome.Score, outcome.UpdatedAt = math.NaN(), now
 	autoModelHealth.Set(autoModelHealthKey("g", "invalid", 3), outcome)
 	var writes, deletes int
@@ -591,15 +549,12 @@ func TestAutoModelScoreRestoreValidatesRawEvidence(t *testing.T) {
 			require.NoError(t, db.Create(&row).Error)
 			p := &autoModelScorePersistence{db: db}
 			require.NoError(t, p.restore(context.Background()))
-			require.Zero(t, autoModelHealth.Len(), "invalid stored model evidence must not enter online scores")
-			require.Zero(t, autoModelChannelHealth.Len(), "invalid stored channel evidence must not enter online scores")
+			require.Zero(t, autoModelHealth.Len(), "invalid stored evidence must not enter online scores")
 		})
 	}
 	t.Run("valid_keeps_raw_age", func(t *testing.T) {
 		db := setupAutoModelScorePersistenceTestDB(t)
-		channel := fresh
-		channel.Scope, channel.Model = "channel", ""
-		require.NoError(t, db.Create(&[]model.AutoModelScore{fresh, channel}).Error)
+		require.NoError(t, db.Create(&fresh).Error)
 		p := &autoModelScorePersistence{db: db}
 		require.NoError(t, p.restore(context.Background()))
 		got, ok := autoModelHealth.Get(autoModelHealthKey("g", "alpha", 1))
@@ -627,212 +582,189 @@ func TestAutoModelScoreRestoreValidatesRawEvidence(t *testing.T) {
 	})
 }
 
+// 未来时间戳的快照必须被拒绝,且不能压制之后真实反馈的持久化。
 func TestAutoModelScoreRejectedFutureSnapshotCannotSuppressDurableFeedback(t *testing.T) {
-	for _, scope := range []string{model.AutoModelScoreScopeModel, model.AutoModelScoreScopeChannel} {
-		t.Run(scope, func(t *testing.T) {
-			db := setupAutoModelScorePersistenceTestDB(t)
-			future := model.AutoModelScore{Scope: scope, Group: "g", ChannelID: 1, Score: 0.1, LatencyMS: 999, Observations: 8, ObservedAt: time.Now().Add(time.Hour).UnixNano(), Version: 1}
-			if scope == model.AutoModelScoreScopeModel {
-				future.Model = "alpha"
-			}
-			require.NoError(t, db.Create(&future).Error)
-			p := &autoModelScorePersistence{db: db}
-			require.NoError(t, p.restore(context.Background()))
-			require.Empty(t, autoModelHealth.ReadAll(), "future model evidence must be rejected")
-			require.Empty(t, autoModelChannelHealth.ReadAll(), "future channel evidence must be rejected")
-			RecordAutoModelOutcome("g", "alpha", 1, true, 123, 0)
-			wantModels, wantChannels := autoModelHealth.ReadAll(), autoModelChannelHealth.ReadAll()
-			require.NoError(t, p.flush(context.Background()))
-			rows, err := model.LoadAutoModelScores(context.Background(), db)
-			require.NoError(t, err)
-			t.Logf("rejected_snapshot=%+v; after_feedback_flush=%+v", future, rows)
-			autoModelHealth.Clear()
-			autoModelChannelHealth.Clear()
-			restored := &autoModelScorePersistence{db: db}
-			require.NoError(t, restored.restore(context.Background()))
-			if scope == model.AutoModelScoreScopeModel {
-				require.Contains(t, autoModelHealth.ReadAll(), autoModelHealthKey("g", "alpha", 1), "rejected future model snapshot must not suppress durable real feedback")
-			} else {
-				require.Contains(t, autoModelChannelHealth.ReadAll(), autoModelChannelHealthKey("g", 1), "rejected future channel snapshot must not suppress durable real feedback")
-			}
-			assertAutoModelScoreOutcomes(t, wantModels, autoModelHealth.ReadAll())
-			assertAutoModelScoreOutcomes(t, wantChannels, autoModelChannelHealth.ReadAll())
-		})
-	}
+	db := setupAutoModelScorePersistenceTestDB(t)
+	future := model.AutoModelScore{Scope: model.AutoModelScoreScopeModel, Group: "g", Model: "alpha",
+		ChannelID: 1, Score: 0.1, LatencyMS: 999, Observations: 8, ObservedAt: time.Now().Add(time.Hour).UnixNano(), Version: 1}
+	require.NoError(t, db.Create(&future).Error)
+	p := &autoModelScorePersistence{db: db}
+	require.NoError(t, p.restore(context.Background()))
+	require.Empty(t, autoModelHealth.ReadAll(), "future evidence must be rejected")
+
+	RecordAutoModelOutcome("g", "alpha", 1, true, 123, 0)
+	wantModels := autoModelHealth.ReadAll()
+	require.NoError(t, p.flush(context.Background()))
+	rows, err := model.LoadAutoModelScores(context.Background(), db)
+	require.NoError(t, err)
+	t.Logf("rejected_snapshot=%+v; after_feedback_flush=%+v", future, rows)
+
+	autoModelHealth.Clear()
+	restored := &autoModelScorePersistence{db: db}
+	require.NoError(t, restored.restore(context.Background()))
+	require.Contains(t, autoModelHealth.ReadAll(), autoModelHealthKey("g", "alpha", 1),
+		"a rejected future snapshot must not suppress durable real feedback")
+	assertAutoModelScoreOutcomes(t, wantModels, autoModelHealth.ReadAll())
 }
 
+// 未来快照清理失败时,worker 必须保持可重试:清理恢复后,未变化的真实反馈要
+// 原样落库,不能因为"已经被确认过"而丢失。
 func TestAutoModelScoreWorkerRetriesFailedFutureCleanupWithoutNewFeedback(t *testing.T) {
-	for _, scope := range []string{model.AutoModelScoreScopeModel, model.AutoModelScoreScopeChannel} {
-		t.Run(scope, func(t *testing.T) {
-			db := setupAutoModelScorePersistenceTestDB(t)
-			future := model.AutoModelScore{Scope: scope, Group: "g", ChannelID: 1, Score: 0.1, LatencyMS: 999, Observations: 8, ObservedAt: time.Now().Add(time.Hour).UnixNano(), Version: 1}
-			if scope == model.AutoModelScoreScopeModel {
-				future.Model = "alpha"
-			}
+	db := setupAutoModelScorePersistenceTestDB(t)
+	future := model.AutoModelScore{Scope: model.AutoModelScoreScopeModel, Group: "g", Model: "alpha",
+		ChannelID: 1, Score: 0.1, LatencyMS: 999, Observations: 8, ObservedAt: time.Now().Add(time.Hour).UnixNano(), Version: 1}
+	require.NoError(t, db.Create(&future).Error)
+	require.NoError(t, db.Exec(`CREATE TRIGGER fail_future_cleanup BEFORE DELETE ON auto_model_scores
+		BEGIN SELECT RAISE(ABORT, 'future cleanup unavailable'); END`).Error)
+	p := &autoModelScorePersistence{db: db}
+	require.ErrorContains(t, p.restore(context.Background()), "future cleanup unavailable")
+	require.False(t, p.loaded, "failed cleanup must keep restore retryable")
+
+	var writes atomic.Int64
+	require.NoError(t, db.Callback().Create().After("gorm:create").Register("test:failed_future_cleanup_write", func(tx *gorm.DB) {
+		if tx.Statement.Table == "auto_model_scores" && tx.Error == nil {
+			writes.Add(1)
+		}
+	}))
+	stop := startAutoModelScorePersistence(db, 20*time.Millisecond, 100*time.Millisecond)
+	t.Cleanup(stop)
+
+	RecordAutoModelOutcome("g", "alpha", 1, true, 123, 0)
+	wantModels := autoModelHealth.ReadAll()
+	require.Eventually(t, func() bool { return writes.Load() > 0 }, time.Second, time.Millisecond,
+		"positive control must observe a real save attempt while cleanup is unavailable")
+	rows, err := model.LoadAutoModelScores(context.Background(), db)
+	require.NoError(t, err)
+	require.Contains(t, rows, future, "the rejected future snapshot must still block this key before cleanup recovers")
+
+	require.NoError(t, db.Exec("DROP TRIGGER fail_future_cleanup").Error)
+	wantObservedAt := wantModels[autoModelHealthKey("g", "alpha", 1)].UpdatedAt.UnixNano()
+	require.Eventually(t, func() bool {
+		stored, loadErr := model.LoadAutoModelScores(context.Background(), db)
+		if loadErr != nil || len(stored) != 1 {
+			return false
+		}
+		return stored[0].ObservedAt == wantObservedAt
+	}, time.Second, 5*time.Millisecond,
+		"cleanup retry must persist unchanged feedback instead of leaving an acknowledged observation absent")
+
+	stop()
+	assertAutoModelScoreRow(t, db, "model", "g", "alpha", 1, wantModels[autoModelHealthKey("g", "alpha", 1)])
+	autoModelHealth.Clear()
+	reloaded := &autoModelScorePersistence{db: db}
+	require.NoError(t, reloaded.restore(context.Background()))
+	assertAutoModelScoreOutcomes(t, wantModels, autoModelHealth.ReadAll())
+}
+
+// 外部实例在 worker 重试读 SQL 之前独立清理了未来快照:恢复必须把"未变更但已被
+// acknowledge 的反馈"补写进库,且保留精确原始时间戳;成功恢复后的 idle/stop 不得
+// 再重复写已持久化的观测。
+func TestAutoModelScoreWorkerRecoversAfterExternalFutureCleanupWithoutNewFeedback(t *testing.T) {
+	for _, recovery := range []string{"worker_tick", "shutdown"} {
+		t.Run(recovery, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "external-cleanup.db")
+			db := setupAutoModelScorePersistenceTestDB(t, path)
+			external, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+			require.NoError(t, err)
+			externalSQL, err := external.DB()
+			require.NoError(t, err)
+			externalSQL.SetMaxOpenConns(1)
+			t.Cleanup(func() { require.NoError(t, externalSQL.Close()) })
+			ctx := context.Background()
+
+			future := model.AutoModelScore{Scope: model.AutoModelScoreScopeModel, Group: "g", Model: "alpha",
+				ChannelID: 1, Score: 0.1, LatencyMS: 999, Observations: 8, ObservedAt: time.Now().Add(time.Hour).UnixNano(), Version: 1}
 			require.NoError(t, db.Create(&future).Error)
-			require.NoError(t, db.Exec(`CREATE TRIGGER fail_future_cleanup BEFORE DELETE ON auto_model_scores
+			require.NoError(t, db.Exec(`CREATE TRIGGER fail_external_future_cleanup BEFORE DELETE ON auto_model_scores
 				BEGIN SELECT RAISE(ABORT, 'future cleanup unavailable'); END`).Error)
-			p := &autoModelScorePersistence{db: db}
-			require.ErrorContains(t, p.restore(context.Background()), "future cleanup unavailable")
-			require.False(t, p.loaded, "failed cleanup must keep restore retryable")
-			var writes atomic.Int64
-			require.NoError(t, db.Callback().Create().After("gorm:create").Register("test:failed_future_cleanup_write", func(tx *gorm.DB) {
+
+			var reads, writes, writtenRows, cleanupFailures atomic.Int64
+			entered, release := make(chan struct{}), make(chan struct{})
+			var blockOnce, releaseOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			defer unblock()
+			require.NoError(t, db.Callback().Create().After("gorm:create").Register("test:external_cleanup_write", func(tx *gorm.DB) {
 				if tx.Statement.Table == "auto_model_scores" && tx.Error == nil {
 					writes.Add(1)
+					writtenRows.Add(int64(tx.Statement.ReflectValue.Len()))
 				}
 			}))
-			stop := startAutoModelScorePersistence(db, 20*time.Millisecond, 100*time.Millisecond)
-			t.Cleanup(stop)
-			RecordAutoModelOutcome("g", "alpha", 1, true, 123, 0)
-			wantModels, wantChannels := autoModelHealth.ReadAll(), autoModelChannelHealth.ReadAll()
-			require.Eventually(t, func() bool { return writes.Load() > 0 }, time.Second, time.Millisecond,
-				"positive control must observe a real save attempt while cleanup is unavailable")
-			rows, err := model.LoadAutoModelScores(context.Background(), db)
-			require.NoError(t, err)
-			require.Contains(t, rows, future, "the rejected future snapshot must still block this key before cleanup recovers")
-			require.NoError(t, db.Exec("DROP TRIGGER fail_future_cleanup").Error)
-			wantObservedAt := wantModels[autoModelHealthKey("g", "alpha", 1)].UpdatedAt.UnixNano()
-			require.Eventually(t, func() bool {
-				stored, loadErr := model.LoadAutoModelScores(context.Background(), db)
-				if loadErr != nil || len(stored) != 2 {
-					return false
+			require.NoError(t, db.Callback().Delete().After("gorm:delete").Register("test:external_cleanup_failure", func(tx *gorm.DB) {
+				if tx.Statement.Table == "auto_model_scores" && tx.Error != nil {
+					cleanupFailures.Add(1)
 				}
-				for _, row := range stored {
-					if row.ObservedAt != wantObservedAt {
-						return false
+			}))
+			require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:external_cleanup_load_barrier", func(tx *gorm.DB) {
+				if tx.Statement.Table == "auto_model_scores" {
+					reads.Add(1)
+					if writes.Load() > 0 {
+						// The previous worker flush has returned and acknowledged
+						// its batch. Hold the next restore before reading SQL.
+						blockOnce.Do(func() { close(entered); <-release })
 					}
 				}
-				return true
-			}, time.Second, 5*time.Millisecond,
-				"cleanup retry must persist unchanged feedback instead of leaving an acknowledged observation absent")
+			}))
+			stop := startAutoModelScorePersistence(db, 20*time.Millisecond, time.Second)
+			t.Cleanup(stop)
+			require.EqualValues(t, 1, cleanupFailures.Load(), "startup must actually fail to retire the future snapshot")
+			require.Empty(t, autoModelHealth.ReadAll())
+			RecordAutoModelOutcome("g", "alpha", 1, true, 123, 0)
+			wantModels := autoModelHealth.ReadAll()
+			wantRows := snapshotAutoModelScores()
+			require.Len(t, wantRows, 1)
+
+			select {
+			case <-entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("worker must acknowledge a real flush before the next restore is blocked")
+			}
+			readsAtRecovery := reads.Load()
+			if !t.Run("timestamp_guard_blocks_the_future_key", func(t *testing.T) {
+				require.EqualValues(t, 1, writes.Load())
+				require.GreaterOrEqual(t, cleanupFailures.Load(), int64(2))
+				rows, err := model.LoadAutoModelScores(ctx, external)
+				require.NoError(t, err)
+				require.ElementsMatch(t, []model.AutoModelScore{future}, rows,
+					"the acknowledged flush must leave the future key unchanged")
+			}) {
+				return
+			}
+			// Another instance cleans up BEFORE the retry reads SQL. The
+			// worker cannot invalidate this key via its own cleanup branch.
+			require.NoError(t, external.Exec("DROP TRIGGER fail_external_future_cleanup").Error)
+			require.NoError(t, model.DeleteAutoModelScoreSnapshot(ctx, external, future))
+			rows, err := model.LoadAutoModelScores(ctx, external)
+			require.NoError(t, err)
+			require.Empty(t, rows, "independent cleanup must retire the future snapshot")
+			t.Logf("external_cleanup_before_retry=%+v; unchanged_feedback=%+v", rows, wantRows)
+
+			unblock()
+			if recovery == "worker_tick" {
+				require.Eventually(t, func() bool { return writes.Load() == 2 }, time.Second, time.Millisecond,
+					"L1: a successful restore after independent future cleanup must retry unchanged feedback before shutdown")
+				<-time.After(60 * time.Millisecond)
+			}
 			stop()
-			assertAutoModelScoreRow(t, db, "model", "g", "alpha", 1, wantModels[autoModelHealthKey("g", "alpha", 1)])
-			assertAutoModelScoreRow(t, db, "channel", "g", "", 1, wantChannels[autoModelChannelHealthKey("g", 1)])
-			autoModelHealth.Clear()
-			autoModelChannelHealth.Clear()
-			reloaded := &autoModelScorePersistence{db: db}
-			require.NoError(t, reloaded.restore(context.Background()))
+			rows, err = model.LoadAutoModelScores(ctx, external)
+			require.NoError(t, err)
+			t.Logf("after_recovery_and_stop=%+v", rows)
+			require.ElementsMatch(t, wantRows, rows,
+				"L1: successful restore and shutdown after independent future cleanup must persist unchanged feedback with its exact raw timestamp")
+			require.EqualValues(t, 2, writes.Load(), "recovery and idle shutdown must not rewrite already durable observations")
+			require.EqualValues(t, 2, writtenRows.Load(), "each acknowledged batch carries the single dirty key once")
+			require.Equal(t, readsAtRecovery, reads.Load(), "successful recovery must not reload on idle ticks or shutdown")
 			assertAutoModelScoreOutcomes(t, wantModels, autoModelHealth.ReadAll())
-			assertAutoModelScoreOutcomes(t, wantChannels, autoModelChannelHealth.ReadAll())
+
+			autoModelHealth.Clear()
+			reloaded := &autoModelScorePersistence{db: external}
+			require.NoError(t, reloaded.restore(ctx))
+			assertAutoModelScoreOutcomes(t, wantModels, autoModelHealth.ReadAll())
 		})
 	}
 }
 
-func TestAutoModelScoreWorkerRecoversAfterExternalFutureCleanupWithoutNewFeedback(t *testing.T) {
-	for _, scope := range []string{model.AutoModelScoreScopeModel, model.AutoModelScoreScopeChannel} {
-		for _, recovery := range []string{"worker_tick", "shutdown"} {
-			t.Run(scope+"/"+recovery, func(t *testing.T) {
-				path := filepath.Join(t.TempDir(), "external-cleanup.db")
-				db := setupAutoModelScorePersistenceTestDB(t, path)
-				external, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
-				require.NoError(t, err)
-				externalSQL, err := external.DB()
-				require.NoError(t, err)
-				externalSQL.SetMaxOpenConns(1)
-				t.Cleanup(func() { require.NoError(t, externalSQL.Close()) })
-				ctx := context.Background()
-				future := model.AutoModelScore{Scope: scope, Group: "g", ChannelID: 1, Score: 0.1, LatencyMS: 999, Observations: 8, ObservedAt: time.Now().Add(time.Hour).UnixNano(), Version: 1}
-				if scope == model.AutoModelScoreScopeModel {
-					future.Model = "alpha"
-				}
-				require.NoError(t, db.Create(&future).Error)
-				require.NoError(t, db.Exec(`CREATE TRIGGER fail_external_future_cleanup BEFORE DELETE ON auto_model_scores
-					BEGIN SELECT RAISE(ABORT, 'future cleanup unavailable'); END`).Error)
-
-				var reads, writes, writtenRows, cleanupFailures atomic.Int64
-				entered, release := make(chan struct{}), make(chan struct{})
-				var blockOnce, releaseOnce sync.Once
-				unblock := func() { releaseOnce.Do(func() { close(release) }) }
-				defer unblock()
-				require.NoError(t, db.Callback().Create().After("gorm:create").Register("test:external_cleanup_write", func(tx *gorm.DB) {
-					if tx.Statement.Table == "auto_model_scores" && tx.Error == nil {
-						writes.Add(1)
-						writtenRows.Add(int64(tx.Statement.ReflectValue.Len()))
-					}
-				}))
-				require.NoError(t, db.Callback().Delete().After("gorm:delete").Register("test:external_cleanup_failure", func(tx *gorm.DB) {
-					if tx.Statement.Table == "auto_model_scores" && tx.Error != nil {
-						cleanupFailures.Add(1)
-					}
-				}))
-				require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:external_cleanup_load_barrier", func(tx *gorm.DB) {
-					if tx.Statement.Table == "auto_model_scores" {
-						reads.Add(1)
-						if writes.Load() > 0 {
-							// The previous worker flush has returned and acknowledged
-							// its batch. Hold the next restore before reading SQL.
-							blockOnce.Do(func() { close(entered); <-release })
-						}
-					}
-				}))
-				stop := startAutoModelScorePersistence(db, 20*time.Millisecond, time.Second)
-				t.Cleanup(stop)
-				require.EqualValues(t, 1, cleanupFailures.Load(), "startup must actually fail to retire the future snapshot")
-				require.Empty(t, autoModelHealth.ReadAll())
-				require.Empty(t, autoModelChannelHealth.ReadAll())
-				RecordAutoModelOutcome("g", "alpha", 1, true, 123, 0)
-				wantModels, wantChannels := autoModelHealth.ReadAll(), autoModelChannelHealth.ReadAll()
-				wantRows := snapshotAutoModelScores()
-				require.Len(t, wantRows, 2)
-				var other model.AutoModelScore
-				for _, row := range wantRows {
-					if row.Scope != scope {
-						other = row
-					}
-				}
-				select {
-				case <-entered:
-				case <-time.After(2 * time.Second):
-					t.Fatal("worker must acknowledge a real flush before the next restore is blocked")
-				}
-				readsAtRecovery := reads.Load()
-				if !t.Run("timestamp_guard_and_other_scope_positive_control", func(t *testing.T) {
-					require.EqualValues(t, 1, writes.Load())
-					require.GreaterOrEqual(t, cleanupFailures.Load(), int64(2))
-					rows, err := model.LoadAutoModelScores(ctx, external)
-					require.NoError(t, err)
-					require.ElementsMatch(t, []model.AutoModelScore{future, other}, rows,
-						"the acknowledged flush must leave the future key unchanged but durably save the other scope")
-				}) {
-					return
-				}
-				// Another instance cleans up BEFORE the retry reads SQL. The
-				// worker cannot invalidate this key via its own cleanup branch.
-				require.NoError(t, external.Exec("DROP TRIGGER fail_external_future_cleanup").Error)
-				require.NoError(t, model.DeleteAutoModelScoreSnapshot(ctx, external, future))
-				rows, err := model.LoadAutoModelScores(ctx, external)
-				require.NoError(t, err)
-				require.Equal(t, []model.AutoModelScore{other}, rows, "independent cleanup must preserve the durable other scope")
-				t.Logf("external_cleanup_before_retry=%+v; unchanged_feedback=%+v", rows, wantRows)
-				unblock()
-				if recovery == "worker_tick" {
-					require.Eventually(t, func() bool { return writes.Load() == 2 }, time.Second, time.Millisecond,
-						"L1: a successful restore after independent future cleanup must retry unchanged feedback before shutdown")
-					<-time.After(60 * time.Millisecond)
-				}
-				stop()
-				rows, err = model.LoadAutoModelScores(ctx, external)
-				require.NoError(t, err)
-				t.Logf("after_recovery_and_stop=%+v", rows)
-				require.ElementsMatch(t, wantRows, rows,
-					"L1: successful restore and shutdown after independent future cleanup must persist unchanged feedback with its exact raw timestamp")
-				require.EqualValues(t, 2, writes.Load(), "recovery and idle shutdown must not rewrite already durable observations")
-				require.EqualValues(t, 3, writtenRows.Load(), "only the missing scope is dirty after recovery")
-				require.Equal(t, readsAtRecovery, reads.Load(), "successful recovery must not reload on idle ticks or shutdown")
-				assertAutoModelScoreOutcomes(t, wantModels, autoModelHealth.ReadAll())
-				assertAutoModelScoreOutcomes(t, wantChannels, autoModelChannelHealth.ReadAll())
-				autoModelHealth.Clear()
-				autoModelChannelHealth.Clear()
-				reloaded := &autoModelScorePersistence{db: external}
-				require.NoError(t, reloaded.restore(ctx))
-				assertAutoModelScoreOutcomes(t, wantModels, autoModelHealth.ReadAll())
-				assertAutoModelScoreOutcomes(t, wantChannels, autoModelChannelHealth.ReadAll())
-			})
-		}
-	}
-}
-
-func TestAutoModelScoreStopPersistsBothRawFeedbackLayers(t *testing.T) {
+// stop 只冲刷一次:未落库的模型反馈必须在退出前全部持久化,且不得重复写已落库的行。
+func TestAutoModelScoreStopPersistsRawModelFeedback(t *testing.T) {
 	db := setupAutoModelScorePersistenceTestDB(t)
 	stop := StartAutoModelScorePersistence()
 	t.Cleanup(stop)
@@ -846,7 +778,7 @@ func TestAutoModelScoreStopPersistsBothRawFeedbackLayers(t *testing.T) {
 	stop()
 	rows, err := model.LoadAutoModelScores(context.Background(), db)
 	require.NoError(t, err)
-	require.Len(t, rows, 7, "four model keys and three independently aggregated channel keys must persist")
+	require.Len(t, rows, 4, "four model keys must persist")
 	for _, key := range []struct {
 		group, name string
 		channelID   int
@@ -856,13 +788,5 @@ func TestAutoModelScoreStopPersistsBothRawFeedbackLayers(t *testing.T) {
 		outcome, ok := autoModelHealth.Get(autoModelHealthKey(key.group, key.name, key.channelID))
 		require.True(t, ok)
 		assertAutoModelScoreRow(t, db, "model", key.group, key.name, key.channelID, outcome)
-	}
-	for _, key := range []struct {
-		group     string
-		channelID int
-	}{{"g", 1}, {"vip", 1}, {"g", 2}} {
-		outcome, ok := autoModelChannelHealth.Get(autoModelChannelHealthKey(key.group, key.channelID))
-		require.True(t, ok)
-		assertAutoModelScoreRow(t, db, "channel", key.group, "", key.channelID, outcome)
 	}
 }

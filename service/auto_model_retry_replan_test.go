@@ -52,19 +52,16 @@ func TestRebuildAutoModelRoutePlanForRetryFallsBackWithoutAttemptsOrGroup(t *tes
 	}), "没有请求分组时不能凭空重排")
 }
 
-// 重排必须用当前健康分重新排序,并丢掉已经打过的路:冻结计划里"还没试过的最优路"
-// 可能排在预算之外,重排把它提到队首。
+// 重排必须用当前模型分重新排序,并丢掉已经打过的路:冻结计划里"还没试过的最优路"
+// 可能排在预算之外,重排把它提到队首。模型分跨渠道比较,渠道健康分不再参与。
 func TestRebuildAutoModelRoutePlanForRetryReranksAndDropsAttempted(t *testing.T) {
 	db := setupAutoModelRouteRequestTest(t)
 	seedAutoModelRouteRequestChannels(t, db)
 
-	// 两条渠道 priority 相同,所以顺序完全由健康分决定。
-	// 渠道 1 被观测成很差,渠道 2 很好。
+	// 两条渠道 priority 相同;route-b@2 被证明最好,其余路线全中性 0.5。
 	now := time.Now()
-	autoModelChannelHealth.Set(autoModelChannelHealthKey("g", 1),
-		autoModelOutcome{Score: 0, Observations: 20, UpdatedAt: now})
-	autoModelChannelHealth.Set(autoModelChannelHealthKey("g", 2),
-		autoModelOutcome{Score: 1, Observations: 20, UpdatedAt: now})
+	autoModelHealth.Set(autoModelHealthKey("g", "route-b", 2),
+		autoModelOutcome{Score: 0.9, Observations: 20, UpdatedAt: now})
 
 	attempted := map[AutoModelRoute]bool{
 		{Group: "g", ModelName: "route-a", ChannelID: 1}: true,
@@ -76,12 +73,13 @@ func TestRebuildAutoModelRoutePlanForRetryReranksAndDropsAttempted(t *testing.T)
 		require.NotEqual(t, AutoModelRoute{Group: "g", ModelName: "route-a", ChannelID: 1}, route,
 			"已经打过的路不能回到重排后的计划里")
 	}
-	require.Equal(t, 2, routes[0].ChannelID, "重排后队首应该是当前最健康渠道上的路")
+	require.Equal(t, AutoModelRoute{Group: "g", ModelName: "route-b", ChannelID: 2}, routes[0],
+		"重排后队首是当前模型分最高的路线,同优先级内跨渠道比较")
 	require.Len(t, routes, 3, "两条渠道共 4 条路,减去已试过的 1 条")
 
-	// 对照:同一个分组用"还没有任何健康数据"的快照排,两条渠道同分,
-	// 队首会是 ID 更小的渠道 1——那正是 middleware 当初冻结下来的顺序,
-	// 也正是重排要修的场景。
+	// 对照:同一分组没有任何模型观测时,四条路线全部中性同档,队首由两级加权
+	// 随机决定(渠道权重相同,固定随机源下按稳定枚举顺序可复现:draw 0 先取
+	// 渠道 1,再取其中按名排序的第一个模型 route-a)。
 	fresh := autoModelRouteSnapshot{
 		Now:     now,
 		Targets: map[string][]model.AutoModelRoutingTarget{
@@ -89,8 +87,9 @@ func TestRebuildAutoModelRoutePlanForRetryReranksAndDropsAttempted(t *testing.T)
 			"route-b": {{ChannelID: 1, Weight: 10}, {ChannelID: 2, Weight: 10}},
 		},
 	}
-	require.Equal(t, 1, buildAutoModelRoutesFromSnapshot("g", []string{"route-a", "route-b"}, fresh,
-		func() float64 { return 0 })[0].ChannelID)
+	require.Equal(t, AutoModelRoute{Group: "g", ModelName: "route-a", ChannelID: 1},
+		buildAutoModelRoutesFromSnapshot("g", []string{"route-a", "route-b"}, fresh,
+			func() float64 { return 0 })[0])
 }
 
 // 换计划不能顺手换分组:只有真正 bind 成功的那次提交才允许把请求挪到别的分组。

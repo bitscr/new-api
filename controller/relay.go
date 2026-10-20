@@ -392,6 +392,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if canceledErr := autoModelCanceledRequestError(c, newAPIError); canceledErr != nil && autoModelClientAbandoned(c, relayInfo) {
 			// The client disappearing is not evidence against this upstream. Keep
 			// earlier real failures queued, but do not penalize or retry this attempt.
+			// 例外:派发了却 20 秒+零响应的长挂起是上游自己的证据。不记的话,挂死的
+			// 组合永远不留痕,每个客户端超时都死在同一个组合上,健康的候选永远轮不到。
+			if relayInfo.HasUpstreamDispatch() && relayInfo.ChannelMeta != nil {
+				service.RecordAutoModelAbandonedAttempt(relayInfo.UsingGroup, relayInfo.OriginModelName,
+					relayInfo.ChannelMeta.ChannelId, relayInfo.AttemptElapsed().Milliseconds())
+			}
 			newAPIError = canceledErr
 			break
 		}

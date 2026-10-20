@@ -23,7 +23,7 @@ func setupAutoModelRouteRequestTest(t *testing.T) *gorm.DB {
 	oldEnabled, oldSelfUse := operation_setting.AutoModelEnabled, operation_setting.SelfUseModeEnabled
 	oldCandidates, oldWeights := operation_setting.AutoModelCandidatesToJSONString(), operation_setting.AutoModelWeightsToJSONString()
 	oldRatios := ratio_setting.ModelRatio2JSONString()
-	oldHealth, oldChannelHealth, oldCooldowns := autoModelHealth.ReadAll(), autoModelChannelHealth.ReadAll(), autoModelCooldowns.ReadAll()
+	oldHealth, oldCooldowns := autoModelHealth.ReadAll(), autoModelCooldowns.ReadAll()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	sqlDB, err := db.DB()
@@ -47,8 +47,6 @@ func setupAutoModelRouteRequestTest(t *testing.T) *gorm.DB {
 		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(oldRatios))
 		autoModelHealth.Clear()
 		autoModelHealth.AddAll(oldHealth)
-		autoModelChannelHealth.Clear()
-		autoModelChannelHealth.AddAll(oldChannelHealth)
 		autoModelCooldowns.Clear()
 		autoModelCooldowns.AddAll(oldCooldowns)
 		autoModelCooldownLoadOnce = sync.Once{}
@@ -183,8 +181,6 @@ func TestBuildAutoModelRoutesReranksEachRequestWithoutStickyChannel(t *testing.T
 	db := setupAutoModelRouteRequestTest(t)
 	seedAutoModelRouteRequestChannels(t, db)
 	now := time.Now()
-	autoModelChannelHealth.Set(autoModelChannelHealthKey("g", 1), autoModelRouteTestOutcome(0.9, now))
-	autoModelChannelHealth.Set(autoModelChannelHealthKey("g", 2), autoModelRouteTestOutcome(0.2, now))
 	autoModelHealth.Set(autoModelHealthKey("g", "route-a", 1), autoModelRouteTestOutcome(0.9, now))
 	autoModelHealth.Set(autoModelHealthKey("g", "route-b", 1), autoModelRouteTestOutcome(0.2, now))
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -193,14 +189,16 @@ func TestBuildAutoModelRoutesReranksEachRequestWithoutStickyChannel(t *testing.T
 	require.Equal(t, AutoModelRoute{Group:"g", ModelName:"route-a", ChannelID:1}, routes[0])
 	SetAutoModelRoutePlan(c, routes)
 	c.Set("use_channel", []string{"1","1","1","1"})
-	// Same chosen channel, new model evidence: rerank models inside it again.
+	// route-a@1 掉到 0.1 后,两条中性 0.5 的路(route-a@2、route-b@2)组成更好的
+	// 档跨渠道领先——排序不再受渠道健康分或"渠道整块"约束。同档内两条路都在
+	// 渠道 2 上,具体先哪个由权重随机决定。
 	autoModelHealth.Set(autoModelHealthKey("g", "route-a", 1), autoModelRouteTestOutcome(0.1, time.Now()))
 	routes, err = BuildAutoModelRoutesForRequest(c, "g")
 	require.NoError(t, err)
-	require.Equal(t, AutoModelRoute{Group:"g", ModelName:"route-b", ChannelID:1}, routes[0])
-	// Independent channel evidence then changes the channel; a prior plan and
-	// used-channel history cannot manufacture a sticky last-used preference.
-	autoModelChannelHealth.Set(autoModelChannelHealthKey("g", 2), autoModelRouteTestOutcome(1, time.Now()))
+	require.Equal(t, 2, routes[0].ChannelID, "中性 0.5 档领先 0.1/0.2 档,跨渠道交错")
+	require.Len(t, routes, 4)
+	// route-a@2 的新模型证据把它提到全场第一;先前的计划与 used-channel 历史
+	// 不能制造"粘在上一次用过的组合"的偏好。
 	autoModelHealth.Set(autoModelHealthKey("g", "route-a", 2), autoModelRouteTestOutcome(1, time.Now()))
 	routes, err = BuildAutoModelRoutesForRequest(c, "g")
 	require.NoError(t, err)
@@ -244,41 +242,4 @@ func TestAutoModelChatCompatibilityFilter(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) { require.Equal(t, tc.want, autoModelSupportsChat(tc.endpoints)) })
 	}
-}
-
-func TestAutoModelChannelHealthAggregatesModelsAndDecaysIndependently(t *testing.T) {
-	setupAutoModelRouteRequestTest(t)
-	RecordAutoModelOutcome("g", "route-a", 7, true, 100, 0)
-	RecordAutoModelOutcome("g", "route-b", 7, false, 0, 0)
-	channel, exists := autoModelChannelHealth.Get(autoModelChannelHealthKey("g", 7))
-	require.True(t, exists)
-	require.InDelta(t, 0.455, channel.Score, 0.001, "channel EWMA combines the outcomes of both actual models")
-	require.InDelta(t, 2, channel.Observations, 0.01)
-	modelA, exists := autoModelHealth.Get(autoModelHealthKey("g", "route-a", 7))
-	require.True(t, exists)
-	require.InDelta(t, 0.65, modelA.Score, 0.001, "sibling model feedback does not overwrite model evidence")
-	RecordAutoModelOutcome("vip", "route-a", 7, true, 100, 0)
-	otherGroup, exists := autoModelChannelHealth.Get(autoModelChannelHealthKey("vip", 7))
-	require.True(t, exists)
-	require.InDelta(t, 0.65, otherGroup.Score, 0.001)
-	now := time.Now()
-	// 衰减窗口是可配置的(默认 6 小时),断言必须跟着窗口走而不是写死一小时:
-	// 不变式是"超过窗口即完全中立"。写死 1 小时会在默认窗口下只衰减 1/6,
-	// 分数远不是 0.5。
-	window := time.Duration(autoModelHalfLifeMs()) * time.Millisecond
-	autoModelChannelHealth.Set(autoModelChannelHealthKey("g", 7), autoModelOutcome{
-		Score:1, Observations:1000, LatencyMS:75000, UpdatedAt:now.Add(-window),
-	})
-	stale, _ := autoModelChannelHealth.Get(autoModelChannelHealthKey("g", 7))
-	require.Equal(t, 0.5, effectiveScore(stale, now), "channel cold start uses the same neutral decay as models")
-	RecordAutoModelOutcome("g", "route-a", 7, true, 100, 0)
-	fresh, _ := autoModelChannelHealth.Get(autoModelChannelHealthKey("g", 7))
-	require.Equal(t, 1.0, fresh.Observations)
-	require.Equal(t, 100.0, fresh.LatencyMS)
-	require.InDelta(t, 0.65, fresh.Score, 1e-9)
-	count := autoModelChannelHealth.Len()
-	RecordAutoModelOutcome("g", "auto", 999, true, 5, 0)
-	RecordAutoModelOutcome("", "route-a", 999, true, 5, 0)
-	RecordAutoModelOutcome("g", "route-a", 0, true, 5, 0)
-	require.Equal(t, count, autoModelChannelHealth.Len(), "invalid and virtual outcomes cannot create channel evidence")
 }

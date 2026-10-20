@@ -305,6 +305,27 @@ func RecordAutoModelPermanentFailure(group, name string, channelID int, reason s
 	}
 }
 
+// RecordAutoModelAbandonedAttempt 记录一次"客户端取消前,上游长时间零响应"的挂起。
+//
+// 客户端取消本身不是上游的证据(它可能只是等不及一个慢而正常的流式响应),所以
+// 取消路径默认不记任何东西。但有一个例外必须处理:本次尝试确实派发了,却整整
+// 20 秒(autoModelSlowLatencyMs)以上一个字节都没写出来——挂死的上游会一直占住
+// 计划头部,每个请求都死在它身上,健康的候选永远轮不到;而取消路径不留任何证据,
+// 下一批请求会原样再撞一遍。这类长挂起按抖动冷却处理(只冷却,不动评分),让
+// 计划头尽快让位;短取消(<20s)仍然不记,保护"用户主动停止"的正常场景。
+func RecordAutoModelAbandonedAttempt(group, name string, channelID int, elapsedMs int64) {
+	group = strings.TrimSpace(group)
+	name = strings.TrimSpace(name)
+	if group == "" || name == "" || channelID <= 0 {
+		return
+	}
+	if elapsedMs < autoModelSlowLatencyMs {
+		return
+	}
+	reason := fmt.Sprintf("客户端取消(上游 %dms 零响应)", elapsedMs)
+	tripAutoModelCooldown(group, name, channelID, reason, time.Now())
+}
+
 // RetireAutoModelCombination 把一个命中确定性关键词的 (分组, 模型, 渠道) 组合从
 // 候选池里彻底摘掉:从渠道声明的 models 里移除该模型,并同步重建 abilities。
 //
@@ -345,7 +366,9 @@ func RetireAutoModelCombination(group, name string, channelID int, reason string
 		return nil
 	}
 	channel.Models = strings.Join(remaining, ",")
-	if err := channel.Update(); err != nil {
+	// 不能用 channel.Update():GORM 的 struct Updates 会跳过零值字段,
+	// 摘空最后一个模型时 Models 为 "" 会被静默忽略,渠道看起来还有模型。
+	if err := channel.UpdateModels(); err != nil {
 		return fmt.Errorf("update channel %d models failed: %w", channelID, err)
 	}
 

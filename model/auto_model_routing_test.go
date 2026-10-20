@@ -34,12 +34,11 @@ func setupAutoModelRoutingSnapshotTestDB(t *testing.T) *gorm.DB {
 
 func TestAutoModelRoutingTargetsSnapshot(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		memory    bool
-		smoothing float64
+		name   string
+		memory bool
 	}{
 		{name: "memory", memory: true},
-		{name: "database", smoothing: 10},
+		{name: "database", memory: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := setupAutoModelRoutingSnapshotTestDB(t)
@@ -93,11 +92,11 @@ func TestAutoModelRoutingTargetsSnapshot(t *testing.T) {
 				queries++
 			}))
 			t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove(callbackName)) })
-			want := map[string][]AutoModelRoutingTarget{
-				"m":        {{ChannelID: 1, Priority: 7, Weight: 3 + tc.smoothing}},
-				"other":    {{ChannelID: 1, Priority: 7, Weight: 3 + tc.smoothing}},
-				"defaults": {{ChannelID: 4, Weight: tc.smoothing}},
-			}
+		want := map[string][]AutoModelRoutingTarget{
+			"m":        {{ChannelID: 1, Priority: 7, Weight: 3}},
+			"other":    {{ChannelID: 1, Priority: 7, Weight: 3}},
+			"defaults": {{ChannelID: 4, Weight: 0}},
+		}
 			targets, err := GetAutoModelRoutingTargets("g")
 			require.NoError(t, err)
 			require.Equal(t, want, targets, "ability metadata must never override channel metadata")

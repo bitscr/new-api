@@ -134,3 +134,8 @@ For request structs that are parsed from client JSON and then re-marshaled to up
 ### Rule 7: Billing Expression System — Read `pkg/billingexpr/expr.md`
 
 When working on tiered/dynamic billing (expression-based pricing), you MUST read `pkg/billingexpr/expr.md` first. It documents the design philosophy, expression language (variables, functions, examples), full system architecture (editor → storage → pre-consume → settlement → log display), token normalization rules (`p`/`c` auto-exclusion), quota conversion, and expression versioning. All code changes to the billing expression system must follow the patterns described in that document.
+
+## 用户方案编写偏好
+
+- 以后编写方案时，不列构建、运行测试或执行回归脚本的步骤和命令。方案聚焦功能要求、代码修改、旧代码清理和交付标准。
+- 上述偏好针对方案内容；必要的失效源码引用清理仍应写明。

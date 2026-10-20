@@ -25,9 +25,11 @@ func newNamedModelFeedbackTestContext() *gin.Context {
 }
 
 // 具名请求的成败也并入 auto 健康体系:失败按与真实流量相同的判据分档
-// (命中确定性判据走长冷却),成功提分;但不改变任何路由行为
+// (命中管理员确定性关键词走摘除,其余按抖动),成功提分;但不改变任何路由行为
 // (这里只测记账,路由行为由既有测试覆盖)。
 func TestNamedModelFeedbackEntersHealthSystem(t *testing.T) {
+	original := operation_setting.AutoModelPermanentKeywordsToString()
+	t.Cleanup(func() { operation_setting.SetAutoModelPermanentKeywords(original) })
 	operation_setting.AutoModelEnabled = true
 	t.Cleanup(func() { operation_setting.AutoModelEnabled = true })
 
@@ -42,7 +44,8 @@ func TestNamedModelFeedbackEntersHealthSystem(t *testing.T) {
 	}
 	info.MarkUpstreamDispatch()
 
-	// a) 确定性失败(502):走长冷却,与 auto 请求同档
+	// a) 确定性失败(502 命中管理员关键词):按摘除档记录,与 auto 请求同判据
+	operation_setting.SetAutoModelPermanentKeywords("bad response status code 502")
 	namedErr := types.NewErrorWithStatusCode(
 		errors.New("bad response status code 502"),
 		types.ErrorCode("bad_response_status_code"), http.StatusBadGateway)
@@ -54,7 +57,7 @@ func TestNamedModelFeedbackEntersHealthSystem(t *testing.T) {
 		require.Equal(t, "default", key.group)
 		require.Equal(t, "glm-5.3-flash", key.modelName)
 		require.Equal(t, 32, key.channelID)
-		require.True(t, outcome.permanent, "502 是确定性失败,必须标永久")
+		require.True(t, outcome.permanent, "502 命中管理员关键词,是确定性失败")
 	}
 
 	// b) 普通瞬态失败(限流):抖动档

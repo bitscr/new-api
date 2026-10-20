@@ -9,16 +9,17 @@ import (
 )
 
 const (
-	AutoModelScoreVersion      = 1
-	AutoModelScoreScopeModel   = "model"
-	AutoModelScoreScopeChannel = "channel"
+	AutoModelScoreVersion    = 1
+	AutoModelScoreScopeModel = "model"
 )
 
-// AutoModelScore stores a raw passive score summary, not request content. Scope
-// distinguishes (group, model, channel) evidence from independently aggregated
-// (group, channel) evidence, whose Model is empty. ObservedAt is the last actual
-// observation in Unix nanoseconds; saving/restoring must never refresh it.
-// Shared databases reuse last-observation snapshots, not distributed EWMA merges.
+// AutoModelScore stores a raw passive score summary for one (group, model,
+// channel) route, not request content. The Scope column is kept for schema
+// compatibility; only Scope=model rows are written, loaded and updated.
+// Legacy scope=channel rows are ignored by reads and left to the generic
+// expiration prune. ObservedAt is the last actual observation in Unix
+// nanoseconds; saving/restoring must never refresh it. Shared databases reuse
+// last-observation snapshots, not distributed EWMA merges.
 type AutoModelScore struct {
 	Scope        string  `gorm:"type:varchar(8);primaryKey;not null"`
 	Group        string  `gorm:"type:varchar(64);primaryKey;not null"`
@@ -94,6 +95,6 @@ func LoadAutoModelScores(ctx context.Context, db *gorm.DB) ([]AutoModelScore, er
 		return nil, errors.New("auto model score database is not initialized")
 	}
 	var rows []AutoModelScore
-	err := db.WithContext(ctx).Find(&rows).Error
+	err := db.WithContext(ctx).Where(&AutoModelScore{Scope: AutoModelScoreScopeModel}).Find(&rows).Error
 	return rows, err
 }
