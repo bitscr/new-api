@@ -24,7 +24,7 @@ condition = "OR"
 regexTarget = "line"
 regexes = [
   '''Mask API keys \(e\.g\., "api_key:''',
-  '''^const keyChars = "''',
+  '''keyChars = "''',
   '''jimeng_(?:vgfm_t2v_l20|v30_pro|ti2v_v30_pro)''',
   '''key := "0123''',
 ]
