@@ -13,15 +13,20 @@ title = "new-api secret scanning"
 useDefault = true
 
 [allowlist]
-# 两类例外都按"具体位置"记录,而不是忽略全部注释/文档/测试:
+# 例外都按"具体位置"记录,而不是忽略全部注释/文档/测试:
 #   1) 部署示例与安装脚本里的固定数据库/Redis 示例密码——公开示例值,真实生产不复用;
 #   2) common/str.go 脱敏函数示例注释里 key 形状的字面量——已确认为非运行配置。
-#      这里只匹配该行的说明前缀,不写入任何密钥本体。
-description = "documented example values and the masked-example comment line"
+#      这里只匹配该行的说明前缀,不写入任何密钥本体;
+#   3) 已确认为非密钥的运行时常量与测试数据:随机 key 字符集、火山引擎即梦的公开
+#      模型标识(jimeng_*)、审计日志测试中的固定兑换码。均不包含真实凭据。
+description = "documented example values, masked-example comment line, and known non-secret literals"
 condition = "OR"
 regexTarget = "line"
 regexes = [
   '''Mask API keys \(e\.g\., "api_key:''',
+  '''^const keyChars = "''',
+  '''jimeng_(?:vgfm_t2v_l20|v30_pro|ti2v_v30_pro)''',
+  '''key := "0123''',
 ]
 paths = [
   '''docker-compose\.yml$''',
