@@ -85,10 +85,12 @@ invoking the upstream request callback. A refused connection still counts as an
 attempt. A local validation error that never enters dispatch cannot lower health
 scores or create an auto cooldown.
 
-This does not relax model parameter validation. For example, if the local capability
-table rejects `gpt-5.4` with `reasoning_effort=max`, the request can still return 400,
-but a never-contacted upstream must not be penalized. Keeping max in the auto effort
-mapper is not a promise that every downstream capability validator accepts it.
+This does not relax model parameter validation. Official OpenAI models now clamp an
+unsupported effort to the highest supported value instead of returning a local 400
+(for example, `gpt-5.4` with `reasoning_effort=max` becomes `xhigh`). Third-party
+adaptors may still reject a request before dispatch; a never-contacted upstream must
+not be penalized, and keeping an effort in the auto mapper is not a promise that every
+downstream validator accepts it.
 
 Feedback is deduplicated within the request by `(group, model, channel)`, keeping the
 last observation for each key. At request completion, these final observations are

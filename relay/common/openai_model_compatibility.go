@@ -82,8 +82,19 @@ func NormalizeOpenAIRequest(body []byte, responses bool) ([]byte, string, bool, 
 			reasoning["effort"], _ = common.Marshal(effort)
 			fields["reasoning"], _ = common.Marshal(reasoning)
 		}
-		if err := capabilities.ValidateEffort(model, "reasoning.effort", effort); err != nil {
-			return nil, "", false, err
+		if clamped := capabilities.ClampEffort(effort); clamped != effort {
+			effort = clamped
+			var reasoning map[string]json.RawMessage
+			if raw := fields["reasoning"]; len(raw) > 0 {
+				if err := common.Unmarshal(raw, &reasoning); err != nil {
+					return nil, "", false, err
+				}
+			}
+			if reasoning == nil {
+				reasoning = make(map[string]json.RawMessage)
+			}
+			reasoning["effort"], _ = common.Marshal(effort)
+			fields["reasoning"], _ = common.Marshal(reasoning)
 		}
 	} else {
 		var request dto.GeneralOpenAIRequest
@@ -95,8 +106,9 @@ func NormalizeOpenAIRequest(body []byte, responses bool) ([]byte, string, bool, 
 			effort = suffixEffort
 			fields["reasoning_effort"], _ = common.Marshal(effort)
 		}
-		if err := capabilities.ValidateEffort(model, "reasoning_effort", effort); err != nil {
-			return nil, "", false, err
+		if clamped := capabilities.ClampEffort(effort); clamped != effort {
+			effort = clamped
+			fields["reasoning_effort"], _ = common.Marshal(effort)
 		}
 		if capabilities.CompletionTokens {
 			if request.MaxCompletionTokens == nil && request.MaxTokens != nil {

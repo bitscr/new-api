@@ -55,6 +55,24 @@ func (c Capabilities) ValidateEffort(model, field, effort string) error {
 	return nil
 }
 
+// ClampEffort 命中官方固定档位时原样保留，否则取最高档。
+// none 表示关闭思考，永远原样保留；空档位或未列出档位时原样返回。
+func (c Capabilities) ClampEffort(effort string) string {
+	if effort == "none" {
+		return "none"
+	}
+	if effort == "" || c.Efforts == "" {
+		return effort
+	}
+	efforts := strings.Split(c.Efforts, ",")
+	for _, supported := range efforts {
+		if supported == effort {
+			return effort
+		}
+	}
+	return efforts[len(efforts)-1]
+}
+
 func (c Capabilities) RemoveSampling(effort string) bool {
 	return c.Sampling == SamplingNever ||
 		(c.Sampling == SamplingWithoutReasoning && c.EffectiveEffort(effort) != "none")

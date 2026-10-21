@@ -28,6 +28,7 @@ import {
   Spin,
   Progress,
   Descriptions,
+  Modal,
   Tag,
   Popconfirm,
   RadioGroup,
@@ -79,6 +80,9 @@ export default function SettingsPerformance(props) {
   const [logCleanupMode, setLogCleanupMode] = useState('by_count');
   const [logCleanupValue, setLogCleanupValue] = useState(10);
   const [logCleanupLoading, setLogCleanupLoading] = useState(false);
+  const [logExportVisible, setLogExportVisible] = useState(false);
+  const [logExportLoading, setLogExportLoading] = useState('');
+  const [databaseExportLoading, setDatabaseExportLoading] = useState(false);
 
   function handleFieldChange(fieldName) {
     return (value) => {
@@ -211,6 +215,67 @@ export default function SettingsPerformance(props) {
       showError(t('清理失败'));
     } finally {
       setLogCleanupLoading(false);
+    }
+  }
+
+  async function downloadFile(url, fallbackName) {
+    const res = await API.get(url, { responseType: 'blob' });
+    const contentType = res.headers['content-type'] || '';
+    if (contentType.includes('application/json')) {
+      const text = await res.data.text();
+      let message = t('导出失败');
+      try {
+        const payload = JSON.parse(text);
+        if (payload?.message) message = payload.message;
+      } catch {
+        // keep the generic message
+      }
+      showError(message);
+      return false;
+    }
+    const blob = new Blob([res.data], { type: contentType || 'application/octet-stream' });
+    const disposition = res.headers['content-disposition'] || '';
+    let filename = fallbackName;
+    const match = /filename\*?=(?:UTF-8''|")?([^";]+)/i.exec(disposition);
+    if (match) {
+      try {
+        filename = decodeURIComponent(match[1].replace(/"/g, ''));
+      } catch {
+        filename = match[1].replace(/"/g, '');
+      }
+    }
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    return true;
+  }
+
+  async function exportLogFile(name) {
+    setLogExportLoading(name);
+    try {
+      await downloadFile(`/api/performance/logs/export?name=${encodeURIComponent(name)}`, name);
+    } catch (error) {
+      showError(t('导出日志失败'));
+    } finally {
+      setLogExportLoading('');
+    }
+  }
+
+  async function exportDatabase() {
+    setDatabaseExportLoading(true);
+    try {
+      if (await downloadFile('/api/performance/database/export', 'one-api.db')) {
+        showSuccess(t('数据库导出已开始'));
+      }
+    } catch (error) {
+      showError(t('导出数据库失败'));
+    } finally {
+      setDatabaseExportLoading(false);
     }
   }
 
@@ -432,6 +497,16 @@ export default function SettingsPerformance(props) {
               style={{ marginBottom: 16 }}
             />
             <Row gutter={16} style={{ marginBottom: 16 }}>
+              <Col span={24}>
+                <Button
+                  onClick={() => setLogExportVisible(true)}
+                  disabled={!logInfo.files || logInfo.files.length === 0}
+                >
+                  {t('导出日志')}
+                </Button>
+              </Col>
+            </Row>
+            <Row gutter={16} style={{ marginBottom: 16 }}>
               <Col xs={24} sm={12} md={8}>
                 <div style={{ marginBottom: 12 }}>
                   <Text strong style={{ display: 'block', marginBottom: 8 }}>
@@ -502,6 +577,20 @@ export default function SettingsPerformance(props) {
             description={t('服务器日志功能未启用（未配置日志目录）')}
           />
         )}
+      </Form.Section>
+
+      {/* 数据库导出 */}
+      <Form.Section text={t('数据库导出')}>
+        <Banner
+          type='info'
+          description={t(
+            '导出当前 SQLite 数据库的一致性快照。MySQL/PostgreSQL 不支持直接下载数据库文件。',
+          )}
+          style={{ marginBottom: 16 }}
+        />
+        <Button loading={databaseExportLoading} onClick={exportDatabase}>
+          {t('导出数据库')}
+        </Button>
       </Form.Section>
 
       {/* 性能统计 */}
@@ -731,6 +820,50 @@ export default function SettingsPerformance(props) {
           )}
         </Form.Section>
       </Spin>
+
+      <Modal
+        title={t('选择要导出的日志文件')}
+        visible={logExportVisible}
+        onCancel={() => setLogExportVisible(false)}
+        footer={null}
+        width={640}
+      >
+        {logInfo?.files?.length ? (
+          <div style={{ maxHeight: 420, overflowY: 'auto' }}>
+            {logInfo.files.map((file) => (
+              <div
+                key={file.name}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 12,
+                  padding: '10px 0',
+                  borderBottom: '1px solid var(--semi-color-border)',
+                }}
+              >
+                <div style={{ minWidth: 0 }}>
+                  <Text strong ellipsis={{ showTooltip: true }} style={{ display: 'block' }}>
+                    {file.name}
+                  </Text>
+                  <Text type='tertiary' size='small'>
+                    {formatBytes(file.size)} · {new Date(file.mod_time).toLocaleString()}
+                  </Text>
+                </div>
+                <Button
+                  size='small'
+                  loading={logExportLoading === file.name}
+                  onClick={() => exportLogFile(file.name)}
+                >
+                  {t('导出')}
+                </Button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <Text type='tertiary'>{t('没有可导出的日志文件')}</Text>
+        )}
+      </Modal>
     </>
   );
 }

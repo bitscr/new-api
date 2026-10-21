@@ -89,13 +89,13 @@ func TestOpenAIResponsesSamplingAndEffort(t *testing.T) {
 	for _, name := range []string{"temperature", "top_p", "top_logprobs"} {
 		require.False(t, gjson.GetBytes(body, name).Exists())
 	}
-	for _, payload := range []string{
-		`{"model":"gpt-6-astra","reasoning":{"effort":"none"}}`,
-		`{"model":"gpt-6-sol","reasoning":{"effort":"minimal"}}`,
+	for _, tc := range []struct{ payload, want string }{
+		{`{"model":"gpt-6-astra","reasoning":{"effort":"none"}}`, "none"},
+		{`{"model":"gpt-6-sol","reasoning":{"effort":"minimal"}}`, "max"},
 	} {
-		_, _, _, err := NormalizeOpenAIRequest([]byte(payload), true)
-		require.ErrorContains(t, err, "reasoning.effort")
-		require.ErrorContains(t, err, "supported values")
+		body, _, _, err := NormalizeOpenAIRequest([]byte(tc.payload), true)
+		require.NoError(t, err)
+		require.Equal(t, tc.want, gjson.GetBytes(body, "reasoning.effort").String())
 	}
 }
 

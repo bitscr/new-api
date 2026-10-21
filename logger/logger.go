@@ -8,13 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
-	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 )
 
@@ -25,52 +23,120 @@ const (
 	loggerDebug = "DEBUG"
 )
 
-const maxLogCount = 1000000
+const dailyLogDateLayout = "20060102"
 
-var logCount atomic.Int64
 var setupLogLock sync.Mutex
-var setupLogWorking atomic.Bool
-var currentLogPath string
-var currentLogPathMu sync.RWMutex
-var currentLogFile *os.File
 
-func GetCurrentLogPath() string {
-	currentLogPathMu.RLock()
-	defer currentLogPathMu.RUnlock()
-	return currentLogPath
+// dailyFileWriter appends every process's logs for one calendar day to the same
+// file. Rotation happens lazily on the first write after midnight, so Gin access
+// logs, common.SysLog and logger.Log* all follow the same daily file.
+type dailyFileWriter struct {
+	dir  string
+	mu   sync.Mutex
+	file *os.File
+	date string
+	path string
 }
 
-func SetupLogger() {
-	defer func() {
-		setupLogWorking.Store(false)
-	}()
-	if *common.LogDir != "" {
-		ok := setupLogLock.TryLock()
-		if !ok {
-			log.Println("setup log is already working")
-			return
-		}
-		defer func() {
-			setupLogLock.Unlock()
-		}()
-		logPath := filepath.Join(*common.LogDir, fmt.Sprintf("oneapi-%s.log", time.Now().Format("20060102150405")))
-		fd, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Fatal("failed to open log file")
-		}
-		currentLogPathMu.Lock()
-		oldFile := currentLogFile
-		currentLogPath = logPath
-		currentLogFile = fd
-		currentLogPathMu.Unlock()
+func (w *dailyFileWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.ensureFileLocked(time.Now()); err != nil {
+		return 0, err
+	}
+	return w.file.Write(p)
+}
 
-		common.LogWriterMu.Lock()
-		gin.DefaultWriter = io.MultiWriter(os.Stdout, fd)
-		gin.DefaultErrorWriter = io.MultiWriter(os.Stderr, fd)
-		if oldFile != nil {
-			_ = oldFile.Close()
-		}
-		common.LogWriterMu.Unlock()
+func (w *dailyFileWriter) openForDate(now time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.ensureFileLocked(now)
+}
+
+// ensureFileLocked 的调用方必须持有 w.mu。
+func (w *dailyFileWriter) ensureFileLocked(now time.Time) error {
+	date := now.Format(dailyLogDateLayout)
+	if w.file != nil && w.date == date {
+		return nil
+	}
+	path := filepath.Join(w.dir, "oneapi-"+date+".log")
+	fd, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	if w.file != nil {
+		_ = w.file.Close()
+	}
+	w.file = fd
+	w.date = date
+	w.path = path
+	return nil
+}
+
+func (w *dailyFileWriter) CurrentPath() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.path
+}
+
+func (w *dailyFileWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return nil
+	}
+	err := w.file.Close()
+	w.file = nil
+	w.path = ""
+	w.date = ""
+	return err
+}
+
+var (
+	currentLogWriter   *dailyFileWriter
+	currentLogWriterMu sync.RWMutex
+)
+
+// GetCurrentLogPath 返回当天正在写入的日志文件路径。
+func GetCurrentLogPath() string {
+	currentLogWriterMu.RLock()
+	writer := currentLogWriter
+	currentLogWriterMu.RUnlock()
+	if writer == nil {
+		return ""
+	}
+	return writer.CurrentPath()
+}
+
+// SetupLogger 打开当天的日志文件。文件按天命名(oneapi-YYYYMMDD.log)，
+// 进程重启不会新建文件；跨天后的第一次写入由 dailyFileWriter 自动切换。
+func SetupLogger() {
+	if *common.LogDir == "" {
+		return
+	}
+	if !setupLogLock.TryLock() {
+		log.Println("setup log is already working")
+		return
+	}
+	defer setupLogLock.Unlock()
+
+	writer := &dailyFileWriter{dir: *common.LogDir}
+	if err := writer.openForDate(time.Now()); err != nil {
+		log.Fatal("failed to open log file")
+	}
+
+	currentLogWriterMu.Lock()
+	oldWriter := currentLogWriter
+	currentLogWriter = writer
+	currentLogWriterMu.Unlock()
+
+	common.LogWriterMu.Lock()
+	gin.DefaultWriter = io.MultiWriter(os.Stdout, writer)
+	gin.DefaultErrorWriter = io.MultiWriter(os.Stderr, writer)
+	common.LogWriterMu.Unlock()
+
+	if oldWriter != nil {
+		_ = oldWriter.Close()
 	}
 }
 
@@ -108,12 +174,6 @@ func logHelper(ctx context.Context, level string, msg string) {
 	}
 	_, _ = fmt.Fprintf(writer, "[%s] %v | %s | %s \n", level, now.Format("2006/01/02 - 15:04:05"), id, msg)
 	common.LogWriterMu.RUnlock()
-	if logCount.Add(1) > maxLogCount && setupLogWorking.CompareAndSwap(false, true) {
-		logCount.Store(0)
-		gopool.Go(func() {
-			SetupLogger()
-		})
-	}
 }
 
 func LogQuota(quota int) string {
@@ -164,7 +224,7 @@ func FormatQuota(quota int) string {
 		return fmt.Sprintf("%s%.6f", symbol, v)
 	case operation_setting.QuotaDisplayTypeTokens:
 		return fmt.Sprintf("%d", quota)
-	default:
+	default: // USD
 		return fmt.Sprintf("＄%.6f", q/common.QuotaPerUnit)
 	}
 }

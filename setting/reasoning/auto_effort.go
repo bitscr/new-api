@@ -2,30 +2,53 @@ package reasoning
 
 import "strings"
 
-// MapAutoEffort adapts only max, except for families that do not accept effort.
-// A supplied upstream model is authoritative, including an unknown alias; only
-// an absent upstream name falls back to the selected request model.
+// MapAutoEffort 把请求里的思考档位适配到目标模型支持的档位。
+//
+// 规则：
+//   - 模型明确不支持思考（kimi 旧版、minimax、mistral 等）→ 省略该参数；
+//   - none 永远表示“关闭思考”，原样保留，不参与最高档收敛；
+//   - 传入值在模型官方固定档位表中 → 原样保留；
+//   - 不在表中 → 取该表最高档（不做任何别名映射）；
+//   - 未知模型 → 兜底固定档位 low/high/max，不在表中时取最高档 max。
+//
+// 已知 OpenAI 模型优先使用 pkg/openaimodel 的能力表；其余主流模型使用
+// resolveEffortProfile 中的本地表。表在部署机器上静态生效，不依赖运行时探测。
 func MapAutoEffort(effort, upstreamModel, requestedModel string) string {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if effort == "" {
+		return ""
+	}
 	modelName := upstreamModel
 	if strings.TrimSpace(modelName) == "" {
 		modelName = requestedModel
 	}
-	family := autoEffortFamily(modelName)
-	switch family {
-	case "kimi", "minimax":
+	profile := resolveEffortProfile(modelName)
+	if profile.omit {
 		return ""
-	case "gpt", "deepseek", "glm":
+	}
+	// none 是“关闭思考”的固定语义，不能被抬成最高思考档。
+	if effort == "none" {
+		return "none"
+	}
+	if profile.known && len(profile.efforts) == 0 {
+		// 已知模型但官方未列出档位（例如部分 codex 模型）：不擅自改写。
 		return effort
 	}
-	if effort != "max" {
-		return effort
-	}
-	if family == "qwen3" || family == "grok" {
-		return "xhigh"
-	}
-	return "high"
+	return clampEfforts(profile.efforts, effort)
 }
 
+// clampEfforts：命中固定档位保留，否则取最高档。没有别名映射。
+func clampEfforts(efforts []string, effort string) string {
+	for _, supported := range efforts {
+		if supported == effort {
+			return effort
+		}
+	}
+	return efforts[len(efforts)-1]
+}
+
+// autoEffortFamily 返回模型终端名称里的家族 token。
+// 它只负责识别家族；档位表由 resolveEffortProfile 负责。
 func autoEffortFamily(modelName string) string {
 	modelName = strings.ToLower(strings.TrimSpace(modelName))
 	// Consume leading bracket tags at every segment boundary before looking
@@ -73,7 +96,9 @@ func autoEffortFamily(modelName string) string {
 	for i := len(parts) - 1; i >= 0; i-- {
 		part := parts[i]
 		switch part {
-		case "gpt", "deepseek", "glm", "qwen3", "grok":
+		case "gpt", "claude", "gemini", "deepseek", "glm", "qwen3", "qwen", "grok",
+			"llama", "mistral", "mixtral", "cohere", "command", "ernie", "hunyuan",
+			"doubao", "step", "yi", "internlm":
 			return part
 		}
 		if strings.HasPrefix(part, "kimi") {
@@ -81,6 +106,9 @@ func autoEffortFamily(modelName string) string {
 		}
 		if strings.HasPrefix(part, "minimax") {
 			return "minimax"
+		}
+		if strings.HasPrefix(part, "internlm") {
+			return "internlm"
 		}
 	}
 	return ""

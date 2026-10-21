@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -114,6 +115,23 @@ func AutoModelCapabilityFailure(err *types.NewAPIError) string {
 		}
 	}
 	return ""
+}
+
+// AutoModelFailureReason 返回一次上游失败的短摘要（错误码/类型 + HTTP 状态），
+// 用于冷却记录与模型报错日志。只读结构化字段，不包含上游正文或凭据。
+func AutoModelFailureReason(err *types.NewAPIError) string {
+	if err == nil {
+		return ""
+	}
+	detail := err.ToOpenAIError()
+	code := strings.TrimSpace(string(err.GetErrorCode()))
+	if code == "" {
+		code = strings.TrimSpace(detail.Type)
+	}
+	if code == "" {
+		code = "unknown"
+	}
+	return fmt.Sprintf("%s(HTTP %d)", code, err.StatusCode)
 }
 
 // AutoModelPermanentFailure 判定一次上游失败是不是"确定性"的:命中管理员在面板

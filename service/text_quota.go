@@ -340,6 +340,30 @@ func mistralNativeCallPrice(info *relaycommon.RelayInfo) bool {
 }
 
 func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []string) {
+	// 200 但没有有效回答（正文为空、只有告警横幅，或上游在流里明确报错）不是
+	// 一次可交付的调用，不应产生扣费。此时 BillingSession 还没 Settle，直接退还
+	// 预扣费并跳过结算；错误日志仍由 controller 的失败路径记录。
+	if relayInfo != nil {
+		refundReason := ""
+		if relayInfo.HasExplicitProtocolError() {
+			// 上游明确报错是跨格式可靠的信号。
+			refundReason = "上游明确返回协议错误"
+		} else if relayInfo.StreamStatus != nil && relayInfo.StreamStatus.IsUpstreamFailure() {
+			// 截断、超时、带错误的 handler_stop：已经交付的部分内容也不再收费。
+			refundReason = "上游流异常结束"
+		} else if relayInfo.RelayFormat == types.RelayFormatOpenAI {
+			// 空正文/只有告警横幅的判断目前只对 OpenAI Chat 的客户端响应可靠；
+			// 原生 Claude/Gemini 格式不要用这个信号退款，避免把健康回答误判为空。
+			if unusable, why := relayInfo.ClientAnswerUnusable(); unusable {
+				refundReason = why
+			}
+		}
+		if refundReason != "" {
+			logger.LogInfo(ctx, fmt.Sprintf("上游没有给出有效回答（%s），跳过计费并返还预扣费", refundReason))
+			RefundBilling(ctx, relayInfo)
+			return
+		}
+	}
 	originUsage := usage
 	if usage == nil {
 		extraContent = append(extraContent, "上游无计费信息")

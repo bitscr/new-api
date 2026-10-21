@@ -9,108 +9,92 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/gin-gonic/gin"
 )
 
-func setupErrorLogDir(t *testing.T) string {
+func setupDailyLogTest(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	old := *common.LogDir
+	oldDir := *common.LogDir
 	*common.LogDir = dir
+
+	common.LogWriterMu.RLock()
+	oldWriter := gin.DefaultWriter
+	oldErrorWriter := gin.DefaultErrorWriter
+	common.LogWriterMu.RUnlock()
+
+	SetupLogger()
+
 	t.Cleanup(func() {
-		*common.LogDir = old
-		modelErrorFileMu.Lock()
-		if modelErrorFile != nil {
-			_ = modelErrorFile.Close()
-			modelErrorFile = nil
+		*common.LogDir = oldDir
+		currentLogWriterMu.Lock()
+		writer := currentLogWriter
+		currentLogWriter = nil
+		currentLogWriterMu.Unlock()
+		if writer != nil {
+			_ = writer.Close()
 		}
-		modelErrorDate = ""
-		modelErrorPath = ""
-		modelErrorFileMu.Unlock()
+		common.LogWriterMu.Lock()
+		gin.DefaultWriter = oldWriter
+		gin.DefaultErrorWriter = oldErrorWriter
+		common.LogWriterMu.Unlock()
 	})
 	return dir
 }
 
-func TestLogModelErrorWritesDailyFile(t *testing.T) {
-	dir := setupErrorLogDir(t)
+func TestDailyFileWriterRotatesByDate(t *testing.T) {
+	dir := t.TempDir()
+	writer := &dailyFileWriter{dir: dir}
+	defer writer.Close()
+
+	dayOne := time.Date(2026, 10, 20, 23, 59, 59, 0, time.Local)
+	if err := writer.openForDate(dayOne); err != nil {
+		t.Fatalf("open day one: %v", err)
+	}
+	if got, want := writer.CurrentPath(), filepath.Join(dir, "oneapi-20261020.log"); got != want {
+		t.Fatalf("day one path = %q, want %q", got, want)
+	}
+
+	dayTwo := dayOne.Add(2 * time.Second)
+	if err := writer.openForDate(dayTwo); err != nil {
+		t.Fatalf("open day two: %v", err)
+	}
+	if got, want := writer.CurrentPath(), filepath.Join(dir, "oneapi-20261021.log"); got != want {
+		t.Fatalf("day two path = %q, want %q", got, want)
+	}
+}
+
+func TestModelErrorAndGatewayLogShareDailyFile(t *testing.T) {
+	dir := setupDailyLogTest(t)
 	ctx := context.WithValue(context.Background(), common.RequestIdKey, "req-123")
 
 	LogModelError(ctx, "model request failed")
+	LogError(ctx, "gateway error")
 
-	path := filepath.Join(dir, modelErrorFilePrefix+time.Now().Format(modelErrorDateLayout)+modelErrorFileSuffix)
+	path := filepath.Join(dir, "oneapi-"+time.Now().Format(dailyLogDateLayout)+".log")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("expected daily error log file, got error: %v", err)
+		t.Fatalf("expected merged daily log file: %v", err)
 	}
 	content := string(data)
-	if !strings.Contains(content, "model request failed") {
-		t.Errorf("log content missing message: %q", content)
-	}
-	if !strings.Contains(content, "req-123") {
-		t.Errorf("log content missing request id: %q", content)
+	for _, want := range []string{"model request failed", "gateway error", "req-123"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("merged log missing %q: %s", want, content)
+		}
 	}
 }
 
 func TestLogModelErrorNilContextUsesSystemId(t *testing.T) {
-	dir := setupErrorLogDir(t)
+	dir := setupDailyLogTest(t)
 
 	LogModelError(nil, "boom")
 
-	path := filepath.Join(dir, modelErrorFilePrefix+time.Now().Format(modelErrorDateLayout)+modelErrorFileSuffix)
+	path := filepath.Join(dir, "oneapi-"+time.Now().Format(dailyLogDateLayout)+".log")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("expected daily error log file, got error: %v", err)
+		t.Fatalf("expected merged daily log file: %v", err)
 	}
 	if !strings.Contains(string(data), "SYSTEM") {
 		t.Errorf("expected SYSTEM fallback request id, got: %q", string(data))
-	}
-}
-
-func TestCleanupModelErrorLogsRetention(t *testing.T) {
-	dir := setupErrorLogDir(t)
-
-	today := time.Now().Format(modelErrorDateLayout)
-	withinRetention := time.Now().AddDate(0, 0, -3).Format(modelErrorDateLayout)
-	expired := time.Now().AddDate(0, 0, -8).Format(modelErrorDateLayout)
-
-	todayPath := filepath.Join(dir, modelErrorFilePrefix+today+modelErrorFileSuffix)
-	withinPath := filepath.Join(dir, modelErrorFilePrefix+withinRetention+modelErrorFileSuffix)
-	expiredPath := filepath.Join(dir, modelErrorFilePrefix+expired+modelErrorFileSuffix)
-	unrelatedPath := filepath.Join(dir, "oneapi-20200101000000.log")
-
-	for _, p := range []string{todayPath, withinPath, expiredPath, unrelatedPath} {
-		if err := os.WriteFile(p, []byte("x"), 0644); err != nil {
-			t.Fatalf("failed to prepare file %s: %v", p, err)
-		}
-	}
-
-	cleanupModelErrorLogs()
-
-	if _, err := os.Stat(expiredPath); !os.IsNotExist(err) {
-		t.Errorf("expected expired log file to be removed: %s", expiredPath)
-	}
-	for _, p := range []string{todayPath, withinPath, unrelatedPath} {
-		if _, err := os.Stat(p); err != nil {
-			t.Errorf("expected file to be kept: %s (%v)", p, err)
-		}
-	}
-}
-
-func TestCleanupModelErrorLogsSkipsActiveFile(t *testing.T) {
-	dir := setupErrorLogDir(t)
-
-	expired := time.Now().AddDate(0, 0, -30).Format(modelErrorDateLayout)
-	path := filepath.Join(dir, modelErrorFilePrefix+expired+modelErrorFileSuffix)
-	if err := os.WriteFile(path, []byte("x"), 0644); err != nil {
-		t.Fatalf("failed to prepare file: %v", err)
-	}
-
-	modelErrorFileMu.Lock()
-	modelErrorPath = path
-	modelErrorFileMu.Unlock()
-
-	cleanupModelErrorLogs()
-
-	if _, err := os.Stat(path); err != nil {
-		t.Errorf("expected active log file to be kept: %s (%v)", path, err)
 	}
 }

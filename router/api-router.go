@@ -224,7 +224,9 @@ func SetApiRouter(router *gin.Engine) {
 			performanceRoute.POST("/reset_stats", controller.ResetPerformanceStats)
 			performanceRoute.POST("/gc", controller.ForceGC)
 			performanceRoute.GET("/logs", controller.GetLogFiles)
+			performanceRoute.GET("/logs/export", controller.ExportLogFile)
 			performanceRoute.DELETE("/logs", controller.CleanupLogFiles)
+			performanceRoute.GET("/database/export", controller.ExportDatabase)
 		}
 		conversationLogRoute := apiRouter.Group("/conversation_logs")
 		conversationLogRoute.Use(middleware.RootAuth())

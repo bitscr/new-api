@@ -273,7 +273,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.RetryIndex = retryParam.GetRetry()
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
-			logger.LogError(c, channelErr.Error())
+			// auto 的本地路线拒绝（冷却、已试过、资格失效等）是正常跳过，
+			// 后续还会试别的路线；只有最终失败才由外层按 ERR 记录。
+			if isAutoModelRequest(c) && types.IsSkipRetryError(channelErr) {
+				logger.LogInfo(c, channelErr.Error())
+			} else {
+				logger.LogError(c, channelErr.Error())
+			}
 			// 派发前就拿不到渠道:当前路线同样进本地跳过集合,重排不会把它放回队首。
 			if current, ok := service.GetCurrentAutoModelRoute(c); ok {
 				markAutoModelRouteLocallyRejected(c, current)
@@ -389,6 +395,23 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				} else {
 					// auto 不走 processChannelError(它会把整条渠道判死),所以这里自己记。
 					recordRelayErrorLog(c, types.NewErrorWithStatusCode(errors.New(reason), types.ErrorCodeBadResponse, http.StatusOK, types.ErrOptionWithSkipRetry()))
+				}
+			} else if relayInfo.StreamStatus != nil && relayInfo.StreamStatus.IsUpstreamFailure() {
+				// 上游流已经交付了一部分内容，不能再换路重试；但截断/超时不是成功，
+				// 必须留下失败证据，否则坏组合的冷却会被"成功"清掉、分数还会被抬高。
+				reason := relayInfo.StreamStatus.Summary()
+				if isAutoModelRequest(c) {
+					logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 的流异常结束（%s），不计成功", relayInfo.OriginModelName, reason))
+				} else {
+					logger.LogError(c, fmt.Sprintf("渠道 #%d 的 %s 流异常结束（%s）", channel.Id, relayInfo.OriginModelName, reason))
+				}
+				recordAutoModelStreamFailure(c, relayInfo, reason)
+				streamErr := types.NewErrorWithStatusCode(errors.New("upstream stream ended abnormally: "+reason),
+					types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+				if isAutoModelRequest(c) {
+					recordRelayErrorLog(c, streamErr)
+				} else {
+					processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), streamErr)
 				}
 			} else {
 				recordAutoModelFeedback(c, relayInfo, true)
@@ -943,9 +966,16 @@ func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam 
 	for route := range locallyRejectedAutoModelRoutes(c) {
 		excludedRoutes[route] = true
 	}
-	routes, rebuildStatus := service.RebuildAutoModelRoutePlanForRetry(c,
-		common.GetContextKeyString(c, constant.ContextKeyAutoModelRequestGroup),
-		excludedRoutes)
+	// A used group is the outer boundary when cross-group retry is off. Rebuilding
+	// from the request-level group would re-run "first nonempty group" and could
+	// replace this group's untried routes with another group's plan, which dispatch
+	// then correctly denies — losing the remaining same-group candidates.
+	rebuildGroup := common.GetContextKeyString(c, constant.ContextKeyAutoModelRequestGroup)
+	if !common.GetContextKeyBool(c, constant.ContextKeyTokenCrossGroupRetry) &&
+		info.UsingGroup != "" && info.UsingGroup != "auto" {
+		rebuildGroup = info.UsingGroup
+	}
+	routes, rebuildStatus := service.RebuildAutoModelRoutePlanForRetry(c, rebuildGroup, excludedRoutes)
 	switch rebuildStatus {
 	case service.AutoModelRebuildReplaced:
 		service.ReplaceAutoModelRoutePlan(c, routes)
@@ -1199,23 +1229,23 @@ func recordAutoModelUpstreamFailure(c *gin.Context, info *relaycommon.RelayInfo,
 		latencyMS: elapsedMS,
 		elapsedMS: elapsedMS,
 		permanent: service.AutoModelPermanentFailure(err),
-		reason:    autoModelPermanentFailureReason(err),
+		reason:    service.AutoModelFailureReason(err),
 	})
 }
 
-func autoModelPermanentFailureReason(err *types.NewAPIError) string {
-	if err == nil {
-		return ""
+// recordAutoModelStreamFailure 记录一次"已交付部分内容、但上游流异常结束"的失败。
+// 这条路径没有 NewAPIError（不能再给客户端写第二个响应），所以只影响评分与冷却。
+func recordAutoModelStreamFailure(c *gin.Context, info *relaycommon.RelayInfo, reason string) {
+	if !shouldRecordAutoHealthFeedback(c, info) {
+		return
 	}
-	detail := err.ToOpenAIError()
-	code := strings.TrimSpace(string(err.GetErrorCode()))
-	if code == "" {
-		code = strings.TrimSpace(detail.Type)
-	}
-	if code == "" {
-		code = "unknown"
-	}
-	return fmt.Sprintf("%s(HTTP %d)", code, err.StatusCode)
+	elapsedMS := observedAutoModelCooldownLatency(info, false)
+	queueAutoModelFeedback(c, info, autoModelFeedback{
+		success:   false,
+		latencyMS: elapsedMS,
+		elapsedMS: elapsedMS,
+		reason:    reason,
+	})
 }
 
 // An unusable HTTP 200 is the final failure of this combination, not a success.
@@ -1322,7 +1352,8 @@ func flushAutoModelFeedback(c *gin.Context) {
 			// 禁用),没有冷却等待;仍然只挡这一个组合。
 			service.RecordAutoModelPermanentFailure(key.group, key.modelName, key.channelID, feedback.reason)
 		default:
-			service.RecordAutoModelOutcome(key.group, key.modelName, key.channelID, feedback.success, feedback.latencyMS, feedback.elapsedMS)
+			service.RecordAutoModelOutcomeWithReason(key.group, key.modelName, key.channelID,
+				feedback.success, feedback.latencyMS, feedback.elapsedMS, feedback.reason)
 		}
 	}
 }

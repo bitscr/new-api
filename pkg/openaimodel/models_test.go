@@ -25,6 +25,27 @@ func TestResolveExactModels(t *testing.T) {
 	}
 }
 
+func TestClampEffort(t *testing.T) {
+	for _, tc := range []struct{ model, effort, want string }{
+		{"gpt-5.5", "max", "xhigh"},
+		{"gpt-5.5", "xhigh", "xhigh"},
+		{"gpt-5.5", "none", "none"},
+		{"gpt-5", "max", "high"},
+		{"gpt-5.1", "minimal", "high"},
+		{"gpt-6-astra", "none", "none"},
+		{"gpt-5", "", ""},
+		{"o1-mini", "max", "max"},
+	} {
+		c, ok := Lookup(tc.model)
+		if !ok {
+			t.Fatalf("model %q not found", tc.model)
+		}
+		if got := c.ClampEffort(tc.effort); got != tc.want {
+			t.Errorf("ClampEffort(%q, %q) = %q, want %q", tc.model, tc.effort, got, tc.want)
+		}
+	}
+}
+
 func TestDocumentedEffortsAndSampling(t *testing.T) {
 	for _, tc := range []struct {
 		model, effort   string

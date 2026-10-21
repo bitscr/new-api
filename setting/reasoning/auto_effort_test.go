@@ -2,232 +2,144 @@ package reasoning
 
 import "testing"
 
-func TestMapAutoEffortMaxRouting(t *testing.T) {
+func TestMapAutoEffortKnownFamilies(t *testing.T) {
 	for _, tc := range []struct {
-		model string
-		want  string
+		model  string
+		effort string
+		want   string
 	}{
-		{"openai/gpt-6-luna", "max"},
-		{"deepseek-ai/deepseek-v4-flash-0731", "max"},
-		{"nim/nvidia/glm-5.3-flash", "max"},
-		{"intern/inkstone/qwen3.8-flash", "xhigh"},
-		{"xai/grok-4.6", "xhigh"},
-		{"moonshotai/kimi-k2.7-code", ""},
-		{"MiniMaxAI/MiniMax-M3", ""},
-		{"google/gemini-3.1-pro-preview", "high"},
-		{"provider/unknown-model", "high"},
+		// OpenAI 精确能力表优先于家族兜底。
+		{"gpt-6-luna", "max", "max"},
+		{"gpt-5.5", "max", "xhigh"},
+		{"gpt-5.5", "none", "none"},
+		{"gpt-5", "max", "high"},
+		{"gpt-free", "max", "max"},
+
+		// DeepSeek：固定 none/low/high/max；不在表中的值取最高档 max。
+		{"[次]deepseek-v4.1-flash", "max", "max"},
+		{"deepseek-v4-flash:0731", "medium", "max"},
+		{"deepseek-v4-flash:0731", "minimal", "max"},
+		{"deepseek-v4-flash:0731", "xhigh", "max"},
+		{"DeepSeek-V4-Flash-0731", "none", "none"},
+
+		// GLM 版本差异。
+		{"glm-5.1", "max", "xhigh"},
+		{"glm-5.2", "max", "max"},
+		{"glm-5.3", "max", "max"},
+		{"glm-5.3", "medium", "max"},
+		{"glm-5.3", "xhigh", "max"},
+		{"glm-5.3", "none", "none"},
+		{"glm-5.3", "minimal", "max"},
+		{"glm-5.2", "low", "max"},
+		{"glm-5.2", "xhigh", "max"},
+
+		// Qwen3.8 不接受 high，适配到 xhigh。
+		{"intern/inkstone/qwen3.8-flash", "max", "xhigh"},
+		{"channel:Qwen3.8-Flash", "high", "xhigh"},
+		{"qwen3.7-max", "high", "high"},
+		{"qwen3.8-flash-next", "high", "xhigh"},
+		{"qwen3.8-flash-next", "medium", "medium"},
+		{"qwen3.8-flash-next", "xhigh", "xhigh"},
+		{"qwen3", "max", "xhigh"},
+
+		// Gemini 不支持 max；3.1 Pro 只有 low/high。
+		{"google/gemini-3.1-pro-preview", "max", "high"},
+		{"google/gemini-3.1-pro-preview", "medium", "high"},
+		{"gemini-3.7-flash", "max", "high"},
+		{"gemini-3.6-flash", "minimal", "minimal"},
+
+		// Claude。
+		{"claude-opus-5-free", "max", "max"},
+		{"claude-opus-5-free", "xhigh", "max"},
+		{"claude-sonnet-5-free", "xhigh", "max"},
+
+		// Kimi K3 支持 low/high/max；K2 及更早不接受 effort。
+		{"vendor/KimiK3", "max", "max"},
+		{"moonshotai/kimi-k2.7-code", "max", ""},
+		{"MiniMaxAI/MiniMax-M3", "max", ""},
+		{"codestral-mistral", "max", ""},
+		{"cohere/north-mini-code:free", "max", ""},
+
+		// Grok。
+		{"xai/grok-4.6", "max", "xhigh"},
+
+		// 未知模型：low/high/max 兜底，不匹配取 max。
+		{"provider/unknown-model", "max", "max"},
+		{"provider/unknown-model", "medium", "max"},
+		{"provider/unknown-model", "none", "none"},
 	} {
-		t.Run(tc.model, func(t *testing.T) {
-			if got := MapAutoEffort("max", tc.model, "auto"); got != tc.want {
-				t.Fatalf("MapAutoEffort(max, %q) = %q, want %q", tc.model, got, tc.want)
+		t.Run(tc.model+"_"+tc.effort, func(t *testing.T) {
+			if got := MapAutoEffort(tc.effort, tc.model, "auto"); got != tc.want {
+				t.Fatalf("MapAutoEffort(%q, %q) = %q, want %q", tc.effort, tc.model, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestMapAutoEffortModelNames(t *testing.T) {
-	for _, tc := range []struct{ model, want string }{
-		{"[次]deepseek-v4.1-flash", "max"},
-		{"DeepSeek-V4-Flash-0731", "max"},
-		{"deepseek-v4-flash:0731", "max"},
-		{"channel:Qwen3.8-Flash", "xhigh"},
-		{"[tier]GROK-4", "xhigh"},
-		{"[gpt]gemini-3.1-pro", "high"},
-		{"[kimi][tier]Qwen3.8-Flash", "xhigh"},
-		{"gpt-proxy/qwen3.8-flash", "xhigh"},
-		{"gpt-proxy/opaque", "high"},
-		{"notdeepseek-v4", "high"},
-		{"notgpt-6", "high"},
-		{"notgrok-4", "high"},
-		{"qwen30", "high"},
-		{"qwen3", "xhigh"},
-		{"prefix-qwen3.8-flash", "xhigh"},
-		{"vendor/KimiK3", ""},
-		{"vendor/MiniMaxM3", ""},
-		{"gpt-free", "max"},
+// TestMapAutoEffortOfficialFixedLevels 锁定官方固定档位规则：
+// 命中固定档位原样保留；不命中取该表最高档，不做别名映射。
+func TestMapAutoEffortOfficialFixedLevels(t *testing.T) {
+	for _, tc := range []struct {
+		model, effort, want string
+	}{
+		// DeepSeek：固定 none/low/high/max；不在表中的值取最高档 max。
+		{"deepseek-v4.1-flash", "none", "none"},
+		{"deepseek-v4.1-flash", "low", "low"},
+		{"deepseek-v4.1-flash", "high", "high"},
+		{"deepseek-v4.1-flash", "max", "max"},
+		{"deepseek-v4.1-flash", "minimal", "max"},
+		{"deepseek-v4.1-flash", "medium", "max"},
+		{"deepseek-v4.1-flash", "xhigh", "max"},
+		{"[次]deepseek-v4-flash", "max", "max"},
+		// none 永远表示关闭思考，不参与最高档收敛。
+		{"claude-fable-5.1-free", "none", "none"},
+		{"gemini-3.7-flash", "none", "none"},
+		{"glm-5.3-flash-free", "none", "none"},
+		{"provider/unknown-model", "none", "none"},
+		// Qwen3.8：固定 low/medium/xhigh；high 不在表中，取最高档 xhigh。
+		{"qwen3.8-flash-next", "high", "xhigh"},
+		{"qwen3.8-flash-next", "medium", "medium"},
+		{"qwen3.8-flash-next", "xhigh", "xhigh"},
+		// Claude 固定 high 原样保留。
+		{"claude-fable-5.1-free", "high", "high"},
+		// GLM 5.3：固定 low/high/max；不在表中的值取最高档 max。
+		{"glm-5.3-flash-free", "max", "max"},
+		{"glm-5.3-flash-free", "medium", "max"},
+		{"glm-5.3-flash-free", "xhigh", "max"},
+		{"gemini-3.7-flash", "high", "high"},
+		{"MiMo-V2.6-Flash", "high", "high"},
+		{"hy4-preview-free", "high", "high"},
+		{"gpt-6-luna", "max", "max"},
+		{"gpt-5.6-luna", "low", "low"},
 	} {
-		t.Run(tc.model, func(t *testing.T) {
-			if got := MapAutoEffort("max", tc.model, ""); got != tc.want {
-				t.Fatalf("model %q mapped to %q, want %q", tc.model, got, tc.want)
+		t.Run(tc.model+"_"+tc.effort, func(t *testing.T) {
+			if got := MapAutoEffort(tc.effort, tc.model, "auto"); got != tc.want {
+				t.Fatalf("MapAutoEffort(%q, %q) = %q, want %q", tc.effort, tc.model, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestMapAutoEffortMisleadingPrefix(t *testing.T) {
-	for _, label := range []string{"gpt", "kimi", "minimax"} {
-		for _, terminal := range []string{"gemini-3.1-pro", "unknown-model"} {
-			for _, model := range []string{label + ":" + terminal, label + "/" + terminal, "[" + label + "]" + terminal} {
-				t.Run(model, func(t *testing.T) {
-					for _, effort := range []string{"max", "medium", "low", "", "custom-level"} {
-						want := effort
-						if effort == "max" {
-							want = "high"
-						}
-						if got := MapAutoEffort(effort, model, "auto"); got != want {
-							t.Errorf("MapAutoEffort(%q, %q, auto) = %q, want %q; the terminal model must own the family", effort, model, got, want)
-						}
-					}
-				})
-			}
-		}
-	}
-}
-
-func TestMapAutoEffortBracketTagSlashRegression(t *testing.T) {
-	for _, tc := range []struct{ effort, want string }{{"max", "high"}, {"medium", "medium"}} {
-		if got := MapAutoEffort(tc.effort, "[tenant/kimi]gemini-3.1-pro", "auto"); got != tc.want {
-			t.Errorf("MapAutoEffort(%q, [tenant/kimi]gemini-3.1-pro, auto) = %q, want %q", tc.effort, got, tc.want)
-		}
-	}
-}
-
-func TestMapAutoEffortBracketNamespacePrecedence(t *testing.T) {
-	for _, tc := range []struct{ model, want string }{
-		{"GpT-5.6", "max"}, {"deepseek-v4-flash", "max"}, {"glm-5.3", "max"},
-		{"Qwen3.8-Flash", "xhigh"}, {"GROK-4", "xhigh"}, {"KimiK3", ""},
-		{"MiniMaxM3", ""}, {"gemini-3.1-pro", "high"}, {"unknown-model", "high"},
-	} {
-		for _, prefix := range []string{
-			"[tenant/kimi]",
-			"[tenant:gpt/kimi]",
-			"[gpt][tenant:kimi/minimax]",
-			"[tenant/kimi]provider/",
-			"provider/[tenant/kimi]",
-			"[tenant/kimi]provider/[tier:minimax/gpt]",
-			"gpt:[tenant/kimi]",
-			"kimi:provider/[tenant/gpt]",
-			"provider/[tenant/kimi]minimax:[tier:gpt/kimi]",
-			"minimax:[scope:qwen3/gpt]provider/[tenant:kimi/gpt][tier:deepseek/minimax]",
-			"provider:[tenant/kimi]gpt:[tier/minimax]",
-			"[tenant/gpt]provider:[tier/minimax]kimi/[scope:grok/kimi]",
-			"\t[tenant:gpt/kimi]  provider / [tier:minimax/kimi] ",
-		} {
-			t.Run(prefix+tc.model, func(t *testing.T) {
-				for _, suffix := range []string{
-					"", ":0731", ":2026-07-31", ":preview", ":PREVIEW:0731", ":0731:preview",
-					":[tier/kimi]preview:[rev:gpt/minimax]2026.07_31",
-				} {
-					model := prefix + tc.model + suffix
-					for _, effort := range []string{"max", "medium", "", "MAX", "custom-level"} {
-						want := tc.want
-						if effort != "max" && want != "" {
-							want = effort
-						}
-						if got := MapAutoEffort(effort, model, "auto"); got != want {
-							t.Errorf("MapAutoEffort(%q, %q, auto) = %q, want %q; bracket tags and namespace labels must not own the terminal model", effort, model, got, want)
-						}
-					}
-				}
-			})
-		}
-	}
-}
-
-func TestMapAutoEffortSlashDoesNotIntroduceRevision(t *testing.T) {
-	for _, prefix := range []string{
-		"gpt", "kimi", "minimax", "qwen3", "provider/[scope:gpt/kimi]gpt", "gpt:[tenant/kimi]kimi",
-	} {
-		for _, leaf := range []string{
-			"0731", "2026-07-31", "preview", "0731:preview", "preview:0731", "[scope/gpt]0731:[rev/kimi]preview",
-		} {
-			model := prefix + "/" + leaf
-			t.Run(model, func(t *testing.T) {
-				for _, effort := range []string{"max", "medium", "", "custom-level"} {
-					want := effort
-					if effort == "max" {
-						want = "high"
-					}
-					if got := MapAutoEffort(effort, model, "auto"); got != want {
-						t.Errorf("MapAutoEffort(%q, %q, auto) = %q, want %q; slash leaves are not colon revision metadata", effort, model, got, want)
-					}
-				}
-			})
-		}
-	}
-}
-
-func TestMapAutoEffortPreviewRevisionControls(t *testing.T) {
-	for _, tc := range []struct{ model, want string }{
-		{"GpT-5.6", "max"}, {"deepseek-v4-flash", "max"}, {"glm-5.3", "max"},
-		{"Qwen3.8-Flash", "xhigh"}, {"grok-4", "xhigh"}, {"KimiK3", ""},
-		{"MiniMaxM3", ""}, {"gemini-3.1-pro", "high"}, {"unknown-model", "high"},
-	} {
-		for _, prefix := range []string{"", "[Fast] vendor/", "gpt:", "kimi:[tier:gpt]"} {
-			for _, suffix := range []string{":preview", ":preview:0731", ":0731:preview"} {
-				model := prefix + tc.model + suffix
-				t.Run(model, func(t *testing.T) {
-					for _, effort := range []string{"max", "medium"} {
-						want := tc.want
-						if effort != "max" && want != "" {
-							want = effort
-						}
-						if got := MapAutoEffort(effort, model, "auto"); got != want {
-							t.Errorf("MapAutoEffort(%q, %q) = %q, want %q; revision tags must preserve the terminal model family", effort, model, got, want)
-						}
-					}
-				})
-			}
-		}
-	}
-}
-
-func TestMapAutoEffortNumericRevisionRequiresDigit(t *testing.T) {
-	for _, family := range []struct{ label, wantMax string }{
-		{"gpt", "max"}, {"deepseek", "max"}, {"glm", "max"},
-		{"qwen3", "xhigh"}, {"grok", "xhigh"}, {"kimi", ""}, {"minimax", ""},
-	} {
-		for _, suffix := range []struct {
-			value      string
-			isRevision bool
-		}{
-			{"", false}, {"-", false}, {".", false}, {"_", false}, {"---", false}, {".-_", false},
-			{"---:preview", false}, {"preview:_", false}, {"_:0731", false}, {"0731:", false},
-			{"١", false}, {"１", false}, {"1a", false}, {"1+2", false}, {"1 2", false},
-			{"0", true}, {"0123456789", true}, {"0731", true}, {"2026-07-31", true},
-			{"2026.07_31", true}, {".-_0_-.", true},
-			{"preview", true}, {"PREVIEW", true}, {"preview:0731", true}, {"0731:preview", true},
-		} {
-			model := family.label + ":" + suffix.value
-			t.Run(model, func(t *testing.T) {
-				wantMax, wantMedium := "high", "medium"
-				if suffix.isRevision {
-					wantMax = family.wantMax
-					if wantMax == "" {
-						wantMedium = ""
-					}
-				}
-				for _, tc := range []struct{ effort, want string }{{"max", wantMax}, {"medium", wantMedium}} {
-					if got := MapAutoEffort(tc.effort, model, "auto"); got != tc.want {
-						t.Errorf("MapAutoEffort(%q, %q, auto) = %q, want %q", tc.effort, model, got, tc.want)
-					}
-				}
-			})
-		}
-	}
-}
-
-func TestMapAutoEffortNamespaceVersionControls(t *testing.T) {
-	for _, tc := range []struct{ model, want string }{
-		{"deepseek-v4-flash:0731", "max"},
-		{"channel:deepseek-v4-flash:0731", "max"},
-		{"[kimi:tier]DeepSeek-V4-Flash:0731", "max"},
-		{"gpt:deepseek-v4-flash:2026-07-31", "max"},
-		{"kimi:Qwen3.8-Flash:0731", "xhigh"},
-		{"gpt:[kimi][tier]GROK-4:0731", "xhigh"},
-		{"channel:KimiK3:0731", ""},
-		{"channel:MiniMaxM3:0731", ""},
-		{"kimi:gpt-free:0731", "max"},
-		{"minimax:[gpt]gemini-3.1-pro", "high"},
-		{"gpt:[kimi]unknown-model", "high"},
-		{"minimax:channel:gemini-3.1-pro:0731", "high"},
-		{"kimi:unknown-model:0731", "high"},
-		{"gpt:deployment-42", "high"},
-		{"kimi:2026-unknown", "high"},
+func TestMapAutoEffortFamilyParsing(t *testing.T) {
+	for _, tc := range []struct {
+		model  string
+		effort string
+		want   string
+	}{
+		{"[tenant/kimi]gemini-3.1-pro", "max", "high"},
+		{"gpt:[kimi]qwen3.8-flash", "max", "xhigh"},
+		{"provider/[tenant/kimi]deepseek-v4", "max", "max"},
+		{"z-ai/glm-5.3", "max", "max"},
+		{"notdeepseek-v4", "max", "max"},
+		{"notgpt-6", "max", "max"},
+		{"notgrok-4", "max", "max"},
+		{"qwen30", "max", "max"},
+		{"[tier]GROK-4", "max", "xhigh"},
+		{"[gpt]gemini-3.1-pro", "max", "high"},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
-			if got := MapAutoEffort("max", tc.model, "auto"); got != tc.want {
-				t.Errorf("MapAutoEffort(max, %q, auto) = %q, want %q", tc.model, got, tc.want)
+			if got := MapAutoEffort(tc.effort, tc.model, "auto"); got != tc.want {
+				t.Fatalf("MapAutoEffort(%q, %q) = %q, want %q", tc.effort, tc.model, got, tc.want)
 			}
 		})
 	}
@@ -238,7 +150,7 @@ func TestMapAutoEffortUpstreamPriority(t *testing.T) {
 		{"xai/grok-4.6", "deepseek-v4", "xhigh"},
 		{"openai/gpt-6-luna", "qwen3.8", "max"},
 		{"google/gemini-3", "gpt-6-luna", "high"},
-		{"opaque", "gpt-6-luna", "high"},
+		{"opaque", "gpt-6-luna", "max"},
 		{"", "Qwen3.8-Flash", "xhigh"},
 	} {
 		if got := MapAutoEffort("max", tc.upstream, tc.requested); got != tc.want {
@@ -247,42 +159,11 @@ func TestMapAutoEffortUpstreamPriority(t *testing.T) {
 	}
 }
 
-func TestMapAutoEffortNonMax(t *testing.T) {
-	for _, model := range []string{"gpt-6-luna", "deepseek-v4", "glm-5", "qwen3.8", "grok-4.6", "gemini-3", "unknown", "kimi-k3", "minimax-m3"} {
-		for _, effort := range []string{"", "minimal", "low", "medium", "high", "xhigh", "none", "MAX", "custom-level"} {
-			want := effort
-			if model == "kimi-k3" || model == "minimax-m3" {
-				want = ""
-			}
-			if got := MapAutoEffort(effort, model, ""); got != want {
-				t.Errorf("model=%q effort=%q got=%q want=%q", model, effort, got, want)
-			}
-		}
+func TestMapAutoEffortEmptyAndCase(t *testing.T) {
+	if got := MapAutoEffort("", "gpt-5.5", ""); got != "" {
+		t.Fatalf("empty effort = %q, want empty", got)
 	}
-}
-
-func TestMapAutoEffortFamilyLevels(t *testing.T) {
-	efforts := []string{"minimal", "low", "medium", "high", "xhigh", "max"}
-	tests := []struct {
-		name  string
-		model string
-		want  []string
-	}{
-		{
-			name:  "DeepSeek",
-			model: "deepseek-v4-flash-0731",
-			want:  []string{"minimal", "low", "medium", "high", "xhigh", "max"},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			for i, effort := range efforts {
-				t.Run(effort, func(t *testing.T) {
-					if got := MapAutoEffort(effort, tt.model, ""); got != tt.want[i] {
-						t.Errorf("MapAutoEffort(%q, %q, %q) = %q, want %q", effort, tt.model, "", got, tt.want[i])
-					}
-				})
-			}
-		})
+	if got := MapAutoEffort(" MAX ", "deepseek-v4", ""); got != "max" {
+		t.Fatalf("case/space normalization = %q, want max", got)
 	}
 }

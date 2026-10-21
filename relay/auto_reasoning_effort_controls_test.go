@@ -21,7 +21,7 @@ func TestAutoReasoningEffortRetryUsesOriginal(t *testing.T) {
 		for _, stream := range []bool{false, true} {
 			for _, tc := range []struct{ first, firstEffort, second string }{
 				{"gemini-3-flash-preview", "high", "gpt-free"},
-				{"kimi-k3", "", "deepseek-v4-flash"},
+				{"kimi-k3", "max", "deepseek-v4-flash"},
 			} {
 				name := string(format) + "/" + tc.first + "/nonstream"
 				if stream {
@@ -53,7 +53,7 @@ func TestAutoReasoningEffortPassthroughRetryUsesOriginal(t *testing.T) {
 		for _, stream := range []bool{false, true} {
 			for _, tc := range []struct{ first, firstEffort, second string }{
 				{"gemini-3-flash-preview", "high", "gpt-free"},
-				{"kimi-k3", "", "deepseek-v4-flash"},
+				{"kimi-k3", "max", "deepseek-v4-flash"},
 			} {
 				name := string(format) + "/" + tc.first + "/nonstream"
 				if stream {
@@ -126,7 +126,7 @@ func TestAutoReasoningEffortMappedUpstream(t *testing.T) {
 	for _, tc := range []struct{ model, mapping, upstream, effort string }{
 		{"gpt-public", `{"gpt-public":"hop","hop":"vendor/Qwen3.8-Flash"}`, "vendor/Qwen3.8-Flash", "xhigh"},
 		{"qwen3-public", `{"qwen3-public":"deepseek-ai/deepseek-v4-flash"}`, "deepseek-ai/deepseek-v4-flash", "max"},
-		{"gpt-public", `{"gpt-public":"deployment-42"}`, "deployment-42", "high"},
+		{"gpt-public", `{"gpt-public":"deployment-42"}`, "deployment-42", "max"},
 	} {
 		t.Run(tc.upstream, func(t *testing.T) {
 			f := newAutoEffortFixture(t, types.RelayFormatOpenAI, tc.model, `{"reasoning_effort":"max"}`, true, false)

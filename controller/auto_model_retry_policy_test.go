@@ -45,6 +45,10 @@ func TestAutoModelFailedChannelExclusionIsNotLocalLimit(t *testing.T) {
 func TestAutoModelRetryPolicyAdvancesByErrorScope(t *testing.T) {
 	oldCodes := operation_setting.AutomaticRetryStatusCodesToString()
 	t.Cleanup(func() { require.NoError(t, operation_setting.AutomaticRetryStatusCodesFromString(oldCodes)) })
+	// 测试模型没有计费配置；自用模式下 HasModelBillingConfig 才放行它们。
+	oldSelfUse := operation_setting.SelfUseModeEnabled
+	operation_setting.SelfUseModeEnabled = true
+	t.Cleanup(func() { operation_setting.SelfUseModeEnabled = oldSelfUse })
 	for _, tc := range []struct {
 		name        string
 		status      int

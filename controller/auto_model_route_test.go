@@ -75,6 +75,7 @@ func newAutoModelRouteTestContext(t *testing.T, group string, routes []service.A
 		`{"model":"auto","messages":[{"role":"user","content":"hello"}],"temperature":0,"stream":false,"unknown":{"integer":9007199254740993,"zero":0}}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 	common.SetContextKey(c, constant.ContextKeyAutoModelClientName, "auto")
+	common.SetContextKey(c, constant.ContextKeyAutoModelRequestGroup, group)
 	common.SetContextKey(c, constant.ContextKeyTokenGroup, group)
 	common.SetContextKey(c, constant.ContextKeyUserGroup, group)
 	service.SetAutoModelRoutePlan(c, routes)
@@ -121,12 +122,19 @@ func TestGetChannelAutoPinsFirstRouteInsteadOfContextOrRandomChannel(t *testing.
 	require.NotNil(t, err, "a missing plan must fail closed rather than reuse the context channel")
 }
 
-func TestAutoModelRoutesExhaustChannelModelsThenSwitchSameModelAcrossChannels(t *testing.T) {
+// A retry re-derives the plan from the still-eligible route set, so plan indices
+// are not stable across attempts. What must hold is that each concrete route is
+// dispatched at most once and every untried route remains reachable.
+func TestAutoModelRoutesRetryAdvancesThroughUntriedRoutes(t *testing.T) {
+	oldSelfUse := operation_setting.SelfUseModeEnabled
+	operation_setting.SelfUseModeEnabled = true
+	t.Cleanup(func() { operation_setting.SelfUseModeEnabled = oldSelfUse })
 	db := openAutoModelRouteControllerTestDB(t)
 	first := createAutoModelRouteTestChannel(t, db, "default", "a", "b", "c")
 	other := createAutoModelRouteTestChannel(t, db, "default", "c")
+	initial := service.AutoModelRoute{Group: "default", ModelName: "a", ChannelID: first.Id}
 	routes := []service.AutoModelRoute{
-		{Group: "default", ModelName: "a", ChannelID: first.Id},
+		initial,
 		{Group: "default", ModelName: "b", ChannelID: first.Id},
 		{Group: "default", ModelName: "a", ChannelID: first.Id}, // duplicate snapshot entry must not retry a failed pair
 		{Group: "default", ModelName: "c", ChannelID: first.Id},
@@ -134,22 +142,67 @@ func TestAutoModelRoutesExhaustChannelModelsThenSwitchSameModelAcrossChannels(t 
 	}
 	c, info, retry := newAutoModelRouteTestContext(t, "default", routes)
 	bindInitialAutoModelRouteForTest(t, c, info)
-	for _, nextIndex := range []int{1, 3, 4} {
+	visited := map[service.AutoModelRoute]bool{initial: true}
+	var triedChannels []string
+	for i := 0; i < 3; i++ {
+		tried, ok := service.GetCurrentAutoModelRoute(c)
+		require.True(t, ok)
+		triedChannels = append(triedChannels, fmt.Sprint(tried.ChannelID))
 		markCurrentAutoModelRouteAttempted(c)
 		addUsedChannel(c, info.ChannelId)
 		require.True(t, trySwitchAutoModel(c, info, retry, 0, &types.TokenCountMeta{}))
-		require.Equal(t, nextIndex, service.GetAutoModelRouteIndex(c))
-		require.Equal(t, routes[nextIndex].ChannelID, info.ChannelId)
-		require.Equal(t, routes[nextIndex].ModelName, info.OriginModelName)
-		require.Equal(t, routes[nextIndex].ModelName, info.ClientModelName)
-		require.Equal(t, routes[nextIndex].ModelName, info.Request.(*dto.GeneralOpenAIRequest).Model)
+		current, ok := service.GetCurrentAutoModelRoute(c)
+		require.True(t, ok)
+		require.False(t, visited[current], "a retry must not repeat an already dispatched route")
+		visited[current] = true
+		require.Equal(t, current.ChannelID, info.ChannelId)
+		require.Equal(t, current.ModelName, info.OriginModelName)
+		require.Equal(t, current.ModelName, info.ClientModelName)
+		require.Equal(t, current.ModelName, info.Request.(*dto.GeneralOpenAIRequest).Model)
 		selected, err := getChannel(c, info, retry)
 		require.Nil(t, err)
-		require.Equal(t, routes[nextIndex].ChannelID, selected.Id)
+		require.Equal(t, current.ChannelID, selected.Id)
 	}
-	require.Equal(t, []string{fmt.Sprint(first.Id), fmt.Sprint(first.Id), fmt.Sprint(first.Id)}, c.GetStringSlice("use_channel"),
-		"channel history remains intact; the third model must not hit the legacy channel max2")
+	require.Len(t, visited, 4, "all four unique routes were reachable before the plan was exhausted")
+	require.Equal(t, triedChannels, c.GetStringSlice("use_channel"),
+		"channel history remains intact; retries on the same channel are not capped at two")
+	require.Contains(t, triedChannels, fmt.Sprint(first.Id), "the first channel's remaining models stay reachable")
+	// Production marks a route attempted before dispatch, so the last bound route
+	// must be excluded before asserting that a re-plan has nothing left.
+	markCurrentAutoModelRouteAttempted(c)
 	require.False(t, trySwitchAutoModel(c, info, retry, 0, &types.TokenCountMeta{}))
+}
+
+// With cross-group retry disabled, a rebuild must stay inside the group that
+// already served the request. Rebuilding from the request-level "auto" group
+// would pick an unused earlier group's plan and discard this group's untried
+// routes, which dispatch then rejects as cross-group.
+func TestAutoModelRetryRebuildStaysInCurrentGroupWhenCrossGroupDisabled(t *testing.T) {
+	oldSelfUse := operation_setting.SelfUseModeEnabled
+	operation_setting.SelfUseModeEnabled = true
+	t.Cleanup(func() { operation_setting.SelfUseModeEnabled = oldSelfUse })
+	db := openAutoModelRouteControllerTestDB(t)
+	first := createAutoModelRouteTestChannel(t, db, "g1", "a")
+	second := createAutoModelRouteTestChannel(t, db, "g2", "a", "b")
+	c, info, retry := newAutoModelRouteTestContext(t, "auto", []service.AutoModelRoute{
+		{Group: "g2", ModelName: "a", ChannelID: second.Id},
+		{Group: "g2", ModelName: "b", ChannelID: second.Id},
+	})
+	common.SetContextKey(c, constant.ContextKeyUserGroup, "g1")
+	common.SetContextKey(c, constant.ContextKeyTokenGroups, []string{"g1", "g2"})
+	common.SetContextKey(c, constant.ContextKeyTokenCrossGroupRetry, false)
+	info.TokenGroup = "auto"
+	info.UserGroup = "g1"
+	bindInitialAutoModelRouteForTest(t, c, info)
+	require.Equal(t, second.Id, info.ChannelId)
+	markCurrentAutoModelRouteAttempted(c)
+	require.True(t, trySwitchAutoModel(c, info, retry, 0, &types.TokenCountMeta{}))
+	current, ok := service.GetCurrentAutoModelRoute(c)
+	require.True(t, ok)
+	require.Equal(t, "g2", current.Group, "the rebuild must not fall back to the unused earlier group")
+	require.Equal(t, "b", current.ModelName)
+	require.Equal(t, second.Id, info.ChannelId)
+	require.NotEqual(t, first.Id, info.ChannelId)
 }
 
 func TestAutoModelRouteLimitsHardExcludeAllModelsOnChannel(t *testing.T) {

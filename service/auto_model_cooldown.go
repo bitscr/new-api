@@ -226,6 +226,13 @@ func nextAutoModelCooldown(prev autoModelCooldownState, reason string, now time.
 
 // applyAutoModelCooldown 依据一次 auto 请求的结果维护冷却（粒度：模型 + 渠道）。
 func applyAutoModelCooldown(group, name string, channelID int, success bool, elapsedMs int64) {
+	applyAutoModelCooldownWithReason(group, name, channelID, success, elapsedMs, "")
+}
+
+// applyAutoModelCooldownWithReason 与 applyAutoModelCooldown 相同，但失败时可以
+// 带上游错误摘要。摘要由 service.AutoModelFailureReason 生成，只包含错误码与
+// HTTP 状态；这里再做一次长度限制，避免面板与数据库出现超长原因。
+func applyAutoModelCooldownWithReason(group, name string, channelID int, success bool, elapsedMs int64, failureReason string) {
 	group = strings.TrimSpace(group)
 	name = strings.TrimSpace(name)
 	if group == "" || name == "" || channelID <= 0 {
@@ -240,18 +247,34 @@ func applyAutoModelCooldown(group, name string, channelID int, success bool, ela
 		return
 	}
 
-	reason := "请求失败"
+	reason := strings.TrimSpace(failureReason)
 	if success {
 		reason = fmt.Sprintf("响应过慢（%dms）", elapsedMs)
 	} else if elapsedMs > autoModelSlowLatencyMs {
-		reason = fmt.Sprintf("超时/失败（%dms）", elapsedMs)
+		if reason != "" {
+			reason = fmt.Sprintf("超时/失败（%dms）: %s", elapsedMs, reason)
+		} else {
+			reason = fmt.Sprintf("超时/失败（%dms）", elapsedMs)
+		}
+	} else if reason == "" {
+		reason = "请求失败"
 	}
+	reason = truncateAutoModelCooldownReason(reason)
 	tripAutoModelCooldown(group, name, channelID, reason, now)
 
 	// 只冷却"这个渠道上的这个模型"。
 	// 早期版本在这里额外冷却了整条渠道（同上游的其它模型一并避让），但他的判断更准确：
 	// 一个渠道下 5 个模型，试挂了 2 个不代表剩下 3 个也不行——它们可能又快又稳，
 	// 整条避让就把它们错过了。所以渠道级冷却已移除（历史上的 model='' 记录在载入时清理）。
+}
+
+func truncateAutoModelCooldownReason(reason string) string {
+	const maxRunes = 200
+	runes := []rune(strings.TrimSpace(reason))
+	if len(runes) <= maxRunes {
+		return string(runes)
+	}
+	return string(runes[:maxRunes]) + "…"
 }
 
 // tripAutoModelCooldown 让一个 (分组, 模型, 渠道) 组合进入(或加重)抖动冷却。

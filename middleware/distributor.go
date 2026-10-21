@@ -218,7 +218,9 @@ func Distribute() func(c *gin.Context) {
 					return
 				}
 				if channel == nil {
-					abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": usingGroup, "Model": modelRequest.Model}), types.ErrorCodeModelNotFound)
+					// 没有可用渠道是“这个模型当前没有配置”，不是服务暂时不可用。
+					// 用 503 会让客户端把它当成可重试错误，造成同一模型的重试风暴。
+					abortWithOpenAiMessage(c, http.StatusNotFound, i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": usingGroup, "Model": modelRequest.Model}), types.ErrorCodeModelNotFound)
 					return
 				}
 				if usingGroup == "auto" && selectGroup != "" {

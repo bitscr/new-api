@@ -29,9 +29,9 @@ type StreamErrorEntry struct {
 }
 
 type StreamStatus struct {
-	EndReason  StreamEndReason
-	EndError   error
-	endOnce    sync.Once
+	EndReason StreamEndReason
+	EndError  error
+	endOnce   sync.Once
 
 	mu         sync.Mutex
 	Errors     []StreamErrorEntry
@@ -92,6 +92,22 @@ func (s *StreamStatus) IsNormalEnd() bool {
 	return s.EndReason == StreamEndReasonDone ||
 		s.EndReason == StreamEndReasonEOF ||
 		s.EndReason == StreamEndReasonHandlerStop
+}
+
+// IsUpstreamFailure reports stream endings that are evidence against the upstream
+// even when some bytes were already delivered. ping_fail is a client delivery
+// problem and panic points at a local bug, so neither penalizes the upstream.
+func (s *StreamStatus) IsUpstreamFailure() bool {
+	if s == nil {
+		return false
+	}
+	switch s.EndReason {
+	case StreamEndReasonScannerErr, StreamEndReasonTimeout:
+		return true
+	case StreamEndReasonHandlerStop:
+		return s.EndError != nil || s.HasErrors()
+	}
+	return false
 }
 
 func (s *StreamStatus) Summary() string {

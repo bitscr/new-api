@@ -17,13 +17,13 @@ import (
 func TestAutoEffortPassthroughOmitsUnsupportedFields(t *testing.T) {
 	for _, effort := range []string{`"max"`, `""`, `null`} {
 		t.Run(effort, func(t *testing.T) {
-			body := []byte(`{"model":"kimi-k3","reasoning_effort":` + effort + `,"reasoning":{"effort":` + effort + `},"output_config":{"effort":` + effort + `,"keep":false},"thinking":{"type":"enabled"},"large":9007199254740993,"zero":0}`)
+			body := []byte(`{"model":"kimi-k2.7-code","reasoning_effort":` + effort + `,"reasoning":{"effort":` + effort + `},"output_config":{"effort":` + effort + `,"keep":false},"thinking":{"type":"enabled"},"large":9007199254740993,"zero":0}`)
 			storage, err := basecommon.CreateBodyStorage(body)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = storage.Close() })
 			c := &gin.Context{}
 			basecommon.SetContextKey(c, constant.ContextKeyAutoModelClientName, "auto")
-			info := &RelayInfo{ChannelMeta: &ChannelMeta{UpstreamModelName: "kimi-k3"}}
+			info := &RelayInfo{ChannelMeta: &ChannelMeta{UpstreamModelName: "kimi-k2.7-code"}}
 			reader, err := PrepareEffortPassthrough(c, info, storage)
 			require.NoError(t, err)
 			mapped, err := io.ReadAll(reader)

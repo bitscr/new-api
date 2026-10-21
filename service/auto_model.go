@@ -101,6 +101,12 @@ func RecordAutoModelOutcome(group, name string, channelID int, success bool, lat
 	recordAutoModelOutcome(group, name, channelID, success, latencyMs, elapsedMs, false, "")
 }
 
+// RecordAutoModelOutcomeWithReason 与 RecordAutoModelOutcome 相同，但把本次失败
+// 的短摘要带进冷却记录。摘要只应包含错误码/HTTP 状态等可公开信息，不能放上游正文。
+func RecordAutoModelOutcomeWithReason(group, name string, channelID int, success bool, latencyMs int64, elapsedMs int64, reason string) {
+	recordAutoModelOutcome(group, name, channelID, success, latencyMs, elapsedMs, false, reason)
+}
+
 // RecordAutoModelUnusableAnswer 记录一次"HTTP 200 但没有有效回答"：
 // 正文为空，或正文只是上游网关塞进来的告警横幅（实测样本见 relay/common/answer_observation.go）。
 //
@@ -139,7 +145,11 @@ func RecordAutoModelTestOutcome(channel *model.Channel, modelName string, succes
 			RecordAutoModelPermanentFailure(group, name, channel.Id, "手动测试失败: "+reason)
 			continue
 		}
-		RecordAutoModelOutcome(group, name, channel.Id, success, elapsedMs, elapsedMs)
+		reason := ""
+		if !success && testErr != nil {
+			reason = AutoModelFailureReason(testErr)
+		}
+		RecordAutoModelOutcomeWithReason(group, name, channel.Id, success, elapsedMs, elapsedMs, reason)
 	}
 }
 
@@ -165,7 +175,7 @@ func recordAutoModelOutcome(group, name string, channelID int, success bool, lat
 		return
 	}
 	// 慢或者失败进入冷却（落库，跨重启生效），正常速度的成功清除冷却。
-	applyAutoModelCooldown(group, name, channelID, success, elapsedMs)
+	applyAutoModelCooldownWithReason(group, name, channelID, success, elapsedMs, cooldownReason)
 }
 
 const autoModelMaxObservations = 20.0

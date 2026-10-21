@@ -225,6 +225,18 @@ func hasExplicitProtocolError(payload []byte) bool {
 	return false
 }
 
+// HasExplicitProtocolError 报告上游是否在响应里明确报了错。
+// 这是跨格式都可靠的失败信号；空正文判断只对 OpenAI Chat 格式可靠。
+func (info *RelayInfo) HasExplicitProtocolError() bool {
+	if info == nil || info.answer == nil {
+		return false
+	}
+	observation := info.answer
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	return observation.protocolError
+}
+
 // ClientAnswerUnusable 判断这次请求是否"HTTP 200 但没有可用回答"。
 // 判断不出来时一律返回 false（宁可漏判，也不能把正常回答当失败）。
 func (info *RelayInfo) ClientAnswerUnusable() (bool, string) {

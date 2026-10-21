@@ -13,6 +13,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 )
 
@@ -208,7 +209,10 @@ func getLogFiles() ([]LogFileInfo, error) {
 			continue
 		}
 		name := entry.Name()
-		if !strings.HasPrefix(name, "oneapi-") || !strings.HasSuffix(name, ".log") {
+		// 新日志统一写入 oneapi-YYYYMMDD.log；model-error-* 是历史文件，
+		// 保留在列表里让管理员可以一并清理。
+		if (!strings.HasPrefix(name, "oneapi-") && !strings.HasPrefix(name, "model-error-")) ||
+			!strings.HasSuffix(name, ".log") {
 			continue
 		}
 		info, err := entry.Info()
@@ -221,8 +225,12 @@ func getLogFiles() ([]LogFileInfo, error) {
 			ModTime: info.ModTime(),
 		})
 	}
-	// 按文件名降序排列（最新在前）
+	// 按修改时间降序排列（最新在前）。文件名格式已从时间戳改为按天，
+	// 不能再用名称排序，否则同一天的新旧文件会排错顺序。
 	sort.Slice(files, func(i, j int) bool {
+		if !files[i].ModTime.Equal(files[j].ModTime) {
+			return files[i].ModTime.After(files[j].ModTime)
+		}
 		return files[i].Name > files[j].Name
 	})
 	return files, nil
@@ -350,6 +358,54 @@ func CleanupLogFiles(c *gin.Context) {
 		"message": "",
 		"data":    result,
 	})
+}
+
+// ExportLogFile 下载单个日志文件。仅允许日志目录下的 oneapi-*/model-error-* 文件。
+func ExportLogFile(c *gin.Context) {
+	if *common.LogDir == "" {
+		common.ApiErrorMsg(c, "log directory not configured")
+		return
+	}
+	name := strings.TrimSpace(c.Query("name"))
+	base := filepath.Base(name)
+	if name == "" || base != name || strings.ContainsAny(name, `/\`) || !strings.HasSuffix(base, ".log") ||
+		(!strings.HasPrefix(base, "oneapi-") && !strings.HasPrefix(base, "model-error-")) {
+		common.ApiErrorMsg(c, "invalid log file name")
+		return
+	}
+	path := filepath.Join(*common.LogDir, base)
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		common.ApiErrorMsg(c, "log file not found")
+		return
+	}
+	c.FileAttachment(path, base)
+}
+
+// ExportDatabase 导出 SQLite 数据库快照。VACUUM INTO 生成一致性副本，
+// 不会因为写入中的数据库而产生半页/损坏文件。MySQL/PostgreSQL 没有本地文件可下载。
+func ExportDatabase(c *gin.Context) {
+	if !common.UsingSQLite {
+		common.ApiErrorMsg(c, "当前数据库不是 SQLite，无法直接下载数据库文件")
+		return
+	}
+	if model.DB == nil {
+		common.ApiErrorMsg(c, "database not initialized")
+		return
+	}
+	tempDir, err := os.MkdirTemp("", "new-api-db-export-")
+	if err != nil {
+		common.ApiError(c, fmt.Errorf("创建临时目录失败: %w", err))
+		return
+	}
+	defer os.RemoveAll(tempDir)
+	target := filepath.Join(tempDir, "one-api.db")
+	escaped := strings.ReplaceAll(target, "'", "''")
+	if err := model.DB.Exec("VACUUM INTO '" + escaped + "'").Error; err != nil {
+		common.ApiError(c, fmt.Errorf("导出数据库失败: %w", err))
+		return
+	}
+	c.FileAttachment(target, "one-api.db")
 }
 
 // getDiskCacheInfo 获取磁盘缓存目录信息

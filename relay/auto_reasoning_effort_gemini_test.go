@@ -93,7 +93,8 @@ func TestAutoReasoningEffortPassthroughSelectedAdaptor(t *testing.T) {
 					wantEffort := tc.effort
 					if route.urlModel {
 						wantURL = baseURL + "/v1beta/models/" + mappedModel + ":" + action
-						if tc.auto && tc.effort == "max" {
+						if tc.auto {
+							// gemini-3.1-pro 只支持 low/high；max 与 medium 都收敛到 high。
 							wantEffort = "high"
 						}
 					}
@@ -133,7 +134,7 @@ func TestAutoReasoningEffortGeminiPassthroughMappedModel(t *testing.T) {
 		auto               bool
 	}{
 		{"auto max", "max", "high", true},
-		{"auto non-max", "medium", "medium", true},
+		{"auto non-max", "medium", "high", true},
 		{"named max", "max", "max", false},
 	} {
 		for _, stream := range []bool{false, true} {

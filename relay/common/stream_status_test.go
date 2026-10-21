@@ -157,6 +157,41 @@ func TestStreamStatus_IsNormalEnd_NilSafe(t *testing.T) {
 	assert.True(t, s.IsNormalEnd())
 }
 
+func TestStreamStatus_IsUpstreamFailure(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		reason   StreamEndReason
+		endErr   error
+		softErrs int
+		want     bool
+	}{
+		{StreamEndReasonScannerErr, fmt.Errorf("unexpected EOF"), 0, true},
+		{StreamEndReasonTimeout, nil, 0, true},
+		{StreamEndReasonHandlerStop, fmt.Errorf("upstream stream error"), 0, true},
+		{StreamEndReasonHandlerStop, nil, 1, true},
+		{StreamEndReasonHandlerStop, nil, 0, false},
+		{StreamEndReasonDone, nil, 0, false},
+		{StreamEndReasonEOF, nil, 1, false},
+		{StreamEndReasonClientGone, fmt.Errorf("context canceled"), 0, false},
+		{StreamEndReasonPingFail, fmt.Errorf("ping write failed"), 0, false},
+		{StreamEndReasonPanic, fmt.Errorf("handler panic"), 0, false},
+	}
+	for _, tt := range tests {
+		s := NewStreamStatus()
+		s.SetEndReason(tt.reason, tt.endErr)
+		for i := 0; i < tt.softErrs; i++ {
+			s.RecordError("soft")
+		}
+		assert.Equal(t, tt.want, s.IsUpstreamFailure(), "reason=%s", tt.reason)
+	}
+}
+
+func TestStreamStatus_IsUpstreamFailure_NilSafe(t *testing.T) {
+	t.Parallel()
+	var s *StreamStatus
+	assert.False(t, s.IsUpstreamFailure())
+}
+
 func TestStreamStatus_Summary(t *testing.T) {
 	t.Parallel()
 

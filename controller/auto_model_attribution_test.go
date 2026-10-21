@@ -26,6 +26,14 @@ import (
 
 func newAutoModelAttributionContext(t *testing.T, upstreamURL, effort string) (*gin.Context, *relaycommon.RelayInfo) {
 	t.Helper()
+	return newAutoModelAttributionContextForBody(t, upstreamURL, "gpt-5.4", map[string]any{
+		"model": "gpt-5.4", "reasoning_effort": effort,
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+}
+
+func newAutoModelAttributionContextForBody(t *testing.T, upstreamURL, model string, payload map[string]any) (*gin.Context, *relaycommon.RelayInfo) {
+	t.Helper()
 	if service.GetHttpClient() == nil {
 		service.InitHttpClient()
 	}
@@ -35,17 +43,14 @@ func newAutoModelAttributionContext(t *testing.T, upstreamURL, effort string) (*
 	settings.PassThroughRequestEnabled = false
 	settings.ChatCompletionsToResponsesPolicy = model_setting.ChatCompletionsToResponsesPolicy{}
 
-	body, err := common.Marshal(map[string]any{
-		"model": "gpt-5.4", "reasoning_effort": effort,
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-	})
+	body, err := common.Marshal(payload)
 	require.NoError(t, err)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
 	c.Request.Header.Set("Content-Type", "application/json")
 	common.SetContextKey(c, constant.ContextKeyAutoModelClientName, "auto")
 	common.SetContextKey(c, constant.ContextKeyUsingGroup, t.Name())
-	common.SetContextKey(c, constant.ContextKeyOriginalModel, "gpt-5.4")
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, model)
 	common.SetContextKey(c, constant.ContextKeyChannelId, 970101)
 	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstreamURL)
@@ -76,16 +81,24 @@ func TestAutoModelLocalValidationDoesNotQueueFeedback(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 			}))
 			defer upstream.Close()
-			c, info := newAutoModelAttributionContext(t, upstream.URL, "max")
+			c, info := newAutoModelAttributionContextForBody(t, upstream.URL, "gpt-6-astra", map[string]any{
+				"model": "gpt-6-astra", "n": 2,
+				"messages": []map[string]string{{"role": "user", "content": "hi"}},
+				"tools": []map[string]any{{
+					"type": "function",
+					"function": map[string]any{
+						"name": "lookup", "parameters": map[string]any{"type": "object"},
+					},
+				}},
+			})
 			info.BeginAttempt()
 			apiErr := relay.TextHelper(c, info)
 			info.EndAttempt()
 			require.NotNil(t, apiErr)
 			require.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
 			require.Equal(t, types.ErrorCodeInvalidRequest, apiErr.GetErrorCode())
-			require.Contains(t, apiErr.Error(), `does not support reasoning_effort="max"`)
-			require.Zero(t, calls.Load(), "the real GPT validator must reject before the upstream is contacted")
-			require.Equal(t, "max", info.Request.(*dto.GeneralOpenAIRequest).ReasoningEffort)
+			require.Contains(t, apiErr.Error(), "n>1")
+			require.Zero(t, calls.Load(), "local validation must reject before the upstream is contacted")
 
 			if unusable {
 				recordAutoModelUnusableAnswer(c, info, "no upstream answer")
@@ -206,7 +219,9 @@ func TestAutoModelLocalRetryDoesNotInheritUpstreamDispatch(t *testing.T) {
 	// A subsequent route can fail locally. The first route's dispatch must not
 	// turn validation failure on this new channel into upstream evidence.
 	common.SetContextKey(c, constant.ContextKeyChannelId, 970102)
-	info.Request.(*dto.GeneralOpenAIRequest).ReasoningEffort = "max"
+	// A local request-shape error must stop before dispatch. Use a mismatched
+	// request type so the assertion is independent of model/effort mapping.
+	info.Request = &dto.OpenAIResponsesRequest{}
 	info.BeginAttempt()
 	apiErr = relay.TextHelper(c, info)
 	info.EndAttempt()

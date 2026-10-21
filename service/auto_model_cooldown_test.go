@@ -40,7 +40,7 @@ func cooldownRows(t *testing.T) []model.AutoModelCooldown {
 
 // TestAutoModelCooldownIsPerModel 锁定当前语义：冷却是"该渠道上的该模型"的事。
 // 一个渠道下试挂了 2 个模型，不代表剩下 3 个也不行，所以不再冷却整条渠道
-// （早期版本会额外写一条 model='' 的渠道级记录，让同上游的其它模型一起避让）。
+// （早期版本会额外写一条 model=” 的渠道级记录，让同上游的其它模型一起避让）。
 func TestAutoModelCooldownIsPerModel(t *testing.T) {
 	setupAutoModelCooldownTestDB(t)
 	group := "default"
@@ -71,6 +71,16 @@ func TestAutoModelCooldownIsPerModel(t *testing.T) {
 	_, ok := autoModelCooldowns.Get(autoModelHealthKey(group, "slow-model", 1))
 	require.False(t, ok, "模型级冷却应被清除")
 	require.True(t, autoModelCooldownActive(group, "second-slow-model", []int{1}))
+}
+
+func TestAutoModelCooldownKeepsFailureReason(t *testing.T) {
+	setupAutoModelCooldownTestDB(t)
+
+	applyAutoModelCooldownWithReason("default", "dead-model", 9, false, 120, "insufficient_balance(HTTP 402)")
+
+	rows := cooldownRows(t)
+	require.Len(t, rows, 1)
+	require.Equal(t, "insufficient_balance(HTTP 402)", rows[0].Reason)
 }
 
 // TestLegacyChannelLevelCooldownIsPurged 历史残留的渠道级记录不该继续生效：

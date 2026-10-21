@@ -132,7 +132,7 @@ func TestAutoReasoningEffortMaxChatFamilies(t *testing.T) {
 		{"moonshotai/kimi-k2.7-code", ""},
 		{"MiniMaxAI/MiniMax-M3", ""},
 		{"google/gemini-3.1-pro-preview", "high"},
-		{"provider/unknown-model", "high"},
+		{"provider/unknown-model", "max"},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
 			f := newAutoEffortFixture(t, types.RelayFormatOpenAI, tc.model, `{"reasoning_effort":"max","temperature":0}`, true, false)
@@ -152,7 +152,7 @@ func TestAutoReasoningEffortMaxChatFamilies(t *testing.T) {
 func TestAutoReasoningEffortResponses(t *testing.T) {
 	for _, tc := range []struct{ model, want string }{
 		{"qwen/qwen3.8-27b", "xhigh"}, {"grok-4.6", "xhigh"},
-		{"kimi-k3", ""}, {"minimax-m3", ""},
+		{"kimi-k3", "max"}, {"minimax-m3", ""},
 		{"deepseek-v4-flash", "max"}, {"gemini-3-flash-preview", "high"},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
@@ -170,7 +170,7 @@ func TestAutoReasoningEffortResponses(t *testing.T) {
 }
 
 func TestAutoReasoningEffortNestedChat(t *testing.T) {
-	for _, tc := range []struct{ model, want string }{{"qwen3.8-flash", "xhigh"}, {"kimi-k3", ""}} {
+	for _, tc := range []struct{ model, want string }{{"qwen3.8-flash", "xhigh"}, {"kimi-k3", "max"}} {
 		t.Run(tc.model, func(t *testing.T) {
 			f := newAutoEffortFixture(t, types.RelayFormatOpenAI, tc.model, `{"reasoning_effort":"max","reasoning":{"effort":"max","enabled":true,"exclude":false,"budget_tokens":0},"thinking":{"type":"enabled"}}`, true, false)
 			body := f.send(t)
@@ -189,7 +189,7 @@ func TestAutoReasoningEffortNestedChat(t *testing.T) {
 
 func TestAutoReasoningEffortPassthrough(t *testing.T) {
 	for _, format := range []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses} {
-		for _, tc := range []struct{ model, want string }{{"qwen3.8-flash", "xhigh"}, {"kimi-k3", ""}} {
+		for _, tc := range []struct{ model, want string }{{"qwen3.8-flash", "xhigh"}, {"kimi-k3", "max"}} {
 			t.Run(string(format)+"/"+tc.model, func(t *testing.T) {
 				fields, path := `{"reasoning_effort":"max","unknown":false,"seed":0}`, "reasoning_effort"
 				if format == types.RelayFormatOpenAIResponses {
@@ -224,8 +224,8 @@ func TestAutoReasoningEffortNativeInputs(t *testing.T) {
 		format                                   types.RelayFormat
 		channel                                  int
 	}{
-		{"claude fallback", "claude-opus-4-6", `{"output_config":{"effort":"max","custom":false}}`, "output_config.effort", "output_config.effort", "high", types.RelayFormatClaude, constant.ChannelTypeAnthropic},
-		{"claude kimi", "kimi-k3", `{"output_config":{"effort":"max","custom":false},"thinking":{"type":"adaptive"}}`, "output_config.effort", "output_config.effort", "", types.RelayFormatClaude, constant.ChannelTypeAnthropic},
+		{"claude fallback", "claude-opus-4-6", `{"output_config":{"effort":"max","custom":false}}`, "output_config.effort", "output_config.effort", "max", types.RelayFormatClaude, constant.ChannelTypeAnthropic},
+		{"claude kimi", "kimi-k3", `{"output_config":{"effort":"max","custom":false},"thinking":{"type":"adaptive"}}`, "output_config.effort", "output_config.effort", "max", types.RelayFormatClaude, constant.ChannelTypeAnthropic},
 		{"gemini", "gemini-3-pro-preview", `{"generationConfig":{"thinkingConfig":{"thinkingLevel":"max","includeThoughts":true}}}`, "generationConfig.thinkingConfig.thinkingLevel", "generationConfig.thinkingConfig.thinkingLevel", "high", types.RelayFormatGemini, constant.ChannelTypeGemini},
 		{"gemini snake", "gemini-3-pro-preview", `{"generationConfig":{"thinking_config":{"thinking_level":"max","include_thoughts":true}}}`, "generationConfig.thinkingConfig.thinkingLevel", "generationConfig.thinking_config.thinking_level", "high", types.RelayFormatGemini, constant.ChannelTypeGemini},
 	} {
@@ -257,10 +257,19 @@ func TestAutoReasoningEffortNativeInputs(t *testing.T) {
 	}
 }
 
-func TestAutoReasoningEffortDeepSeekUnchanged(t *testing.T) {
-	f := newAutoEffortFixture(t, types.RelayFormatOpenAI, "deepseek-ai/deepseek-v4-flash-0731", `{"reasoning_effort":"xhigh"}`, true, false)
-	body := f.send(t)
-	require.Equal(t, "xhigh", gjson.GetBytes(body, "reasoning_effort").String())
-	require.Equal(t, "xhigh", f.info.ReasoningEffort)
-	require.Equal(t, "xhigh", f.info.Request.(*dto.GeneralOpenAIRequest).ReasoningEffort)
+func TestAutoReasoningEffortDeepSeekFixedLevels(t *testing.T) {
+	for _, tc := range []struct{ effort, want string }{
+		{"none", "none"},
+		{"high", "high"},
+		{"max", "max"},
+		{"xhigh", "max"}, // 官方映射写法，落到固定档位 max
+	} {
+		t.Run(tc.effort, func(t *testing.T) {
+			f := newAutoEffortFixture(t, types.RelayFormatOpenAI, "deepseek-ai/deepseek-v4-flash-0731", `{"reasoning_effort":"`+tc.effort+`"}`, true, false)
+			body := f.send(t)
+			require.Equal(t, tc.want, gjson.GetBytes(body, "reasoning_effort").String())
+			require.Equal(t, tc.want, f.info.ReasoningEffort)
+			require.Equal(t, tc.effort, f.info.Request.(*dto.GeneralOpenAIRequest).ReasoningEffort)
+		})
+	}
 }
