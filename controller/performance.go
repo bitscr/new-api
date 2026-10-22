@@ -181,6 +181,9 @@ type LogFileInfo struct {
 	Name    string    `json:"name"`
 	Size    int64     `json:"size"`
 	ModTime time.Time `json:"mod_time"`
+	// Managed 表示这是 new-api 自己按 oneapi-*/model-error-* 命名的日志。
+	// stdout.log 和 NFS 的 .nfs* 删除占位文件会展示、可导出,但不参与自动清理。
+	Managed bool `json:"managed"`
 }
 
 // LogFilesResponse 日志文件列表响应
@@ -192,6 +195,20 @@ type LogFilesResponse struct {
 	OldestTime *time.Time    `json:"oldest_time,omitempty"`
 	NewestTime *time.Time    `json:"newest_time,omitempty"`
 	Files      []LogFileInfo `json:"files"`
+}
+
+func isManagedLogFileName(name string) bool {
+	return (strings.HasPrefix(name, "oneapi-") || strings.HasPrefix(name, "model-error-")) &&
+		strings.HasSuffix(name, ".log")
+}
+
+// isVisibleLogFileName keeps the log directory useful even when the deployment
+// owns the capture file or an NFS silly-rename is in effect. stdout.log is common
+// in container platforms; .nfs* is a deleted-but-still-open log that NFS renames.
+func isVisibleLogFileName(name string) bool {
+	return isManagedLogFileName(name) ||
+		strings.HasSuffix(name, ".log") ||
+		strings.HasPrefix(name, ".nfs")
 }
 
 // getLogFiles 读取日志目录中的日志文件列表
@@ -209,10 +226,10 @@ func getLogFiles() ([]LogFileInfo, error) {
 			continue
 		}
 		name := entry.Name()
-		// 新日志统一写入 oneapi-YYYYMMDD.log；model-error-* 是历史文件，
-		// 保留在列表里让管理员可以一并清理。
-		if (!strings.HasPrefix(name, "oneapi-") && !strings.HasPrefix(name, "model-error-")) ||
-			!strings.HasSuffix(name, ".log") {
+		// 新日志统一写入 oneapi-YYYYMMDD.log；model-error-* 是历史文件。
+		// stdout.log / .nfs* 是容器或 NFS 产生的实际日志，也展示出来，
+		// 但 Managed=false，自动清理不会删除它们。
+		if !isVisibleLogFileName(name) {
 			continue
 		}
 		info, err := entry.Info()
@@ -223,6 +240,7 @@ func getLogFiles() ([]LogFileInfo, error) {
 			Name:    name,
 			Size:    info.Size(),
 			ModTime: info.ModTime(),
+			Managed: isManagedLogFileName(name),
 		})
 	}
 	// 按修改时间降序排列（最新在前）。文件名格式已从时间戳改为按天，
@@ -296,32 +314,54 @@ func CleanupLogFiles(c *gin.Context) {
 		return
 	}
 
+	now := time.Now()
 	activeLogPath := logger.GetCurrentLogPath()
+	managed := make([]LogFileInfo, 0, len(files))
+	for _, f := range files {
+		if f.Managed {
+			managed = append(managed, f)
+		}
+	}
+	// The newest managed file is the daily file most likely being written. NFS
+	// may hide an actively written file as .nfs* if it is unlinked; protecting the
+	// newest and recently modified files prevents this process from doing that.
+	newestManagedPath := ""
+	if len(managed) > 0 {
+		newestManagedPath = filepath.Join(*common.LogDir, managed[0].Name)
+	}
+	protected := func(f LogFileInfo) bool {
+		fullPath := filepath.Join(*common.LogDir, f.Name)
+		return fullPath == activeLogPath || fullPath == newestManagedPath ||
+			f.ModTime.After(now.Add(-10*time.Minute))
+	}
+
 	var toDelete []LogFileInfo
+	protectedCount := 0
 
 	switch mode {
 	case "by_count":
-		// files 已按名称降序（最新在前），保留前 value 个
-		for i, f := range files {
+		// managed 已按修改时间降序（最新在前），保留前 value 个
+		for i, f := range managed {
 			if i < value {
 				continue
 			}
-			fullPath := filepath.Join(*common.LogDir, f.Name)
-			if fullPath == activeLogPath {
+			if protected(f) {
+				protectedCount++
 				continue
 			}
 			toDelete = append(toDelete, f)
 		}
 	case "by_days":
-		cutoff := time.Now().AddDate(0, 0, -value)
-		for _, f := range files {
-			if f.ModTime.Before(cutoff) {
-				fullPath := filepath.Join(*common.LogDir, f.Name)
-				if fullPath == activeLogPath {
-					continue
-				}
-				toDelete = append(toDelete, f)
+		cutoff := now.AddDate(0, 0, -value)
+		for _, f := range managed {
+			if !f.ModTime.Before(cutoff) {
+				continue
 			}
+			if protected(f) {
+				protectedCount++
+				continue
+			}
+			toDelete = append(toDelete, f)
 		}
 	}
 
@@ -339,9 +379,10 @@ func CleanupLogFiles(c *gin.Context) {
 	}
 
 	result := gin.H{
-		"deleted_count": deletedCount,
-		"freed_bytes":   freedBytes,
-		"failed_files":  failedFiles,
+		"deleted_count":   deletedCount,
+		"freed_bytes":     freedBytes,
+		"failed_files":    failedFiles,
+		"protected_count": protectedCount,
 	}
 
 	if len(failedFiles) > 0 {
@@ -360,7 +401,8 @@ func CleanupLogFiles(c *gin.Context) {
 	})
 }
 
-// ExportLogFile 下载单个日志文件。仅允许日志目录下的 oneapi-*/model-error-* 文件。
+// ExportLogFile 下载单个日志文件。允许 new-api 的 oneapi-*/model-error-*，
+// 以及日志目录中的 stdout.log 和 NFS 删除占位文件 .nfs*；仍严格限制为目录直接子文件。
 func ExportLogFile(c *gin.Context) {
 	if *common.LogDir == "" {
 		common.ApiErrorMsg(c, "log directory not configured")
@@ -368,8 +410,7 @@ func ExportLogFile(c *gin.Context) {
 	}
 	name := strings.TrimSpace(c.Query("name"))
 	base := filepath.Base(name)
-	if name == "" || base != name || strings.ContainsAny(name, `/\`) || !strings.HasSuffix(base, ".log") ||
-		(!strings.HasPrefix(base, "oneapi-") && !strings.HasPrefix(base, "model-error-")) {
+	if name == "" || base != name || strings.ContainsAny(name, `/\`) || !isVisibleLogFileName(base) {
 		common.ApiErrorMsg(c, "invalid log file name")
 		return
 	}

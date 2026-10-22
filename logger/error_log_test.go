@@ -64,6 +64,46 @@ func TestDailyFileWriterRotatesByDate(t *testing.T) {
 	}
 }
 
+// NFS turns a deleted-but-open daily log into a hidden .nfs* file. The writer
+// must notice that its canonical path no longer points at its open descriptor
+// and recreate oneapi-YYYYMMDD.log instead of appending to an invisible inode.
+func TestDailyFileWriterRecreatesDeletedDailyFile(t *testing.T) {
+	dir := t.TempDir()
+	writer := &dailyFileWriter{dir: dir}
+	defer writer.Close()
+
+	now := time.Now()
+	if err := writer.openForDate(now); err != nil {
+		t.Fatalf("open daily log: %v", err)
+	}
+	path := writer.CurrentPath()
+	if _, err := writer.Write([]byte("before delete\n")); err != nil {
+		t.Fatalf("write before delete: %v", err)
+	}
+	// Windows cannot unlink an open file. Close the descriptor first so the test
+	// can remove the path; the writer still holds it and must reopen the canonical
+	// daily file on the next write. On Linux/NFS the same state is produced by an
+	// unlink while the descriptor stays open.
+	writer.mu.Lock()
+	_ = writer.file.Close()
+	writer.lastCheck = time.Time{}
+	writer.mu.Unlock()
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove daily log: %v", err)
+	}
+
+	if _, err := writer.Write([]byte("after delete\n")); err != nil {
+		t.Fatalf("write after delete: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("daily log was not recreated: %v", err)
+	}
+	if !strings.Contains(string(data), "after delete") {
+		t.Fatalf("recreated daily log missing new content: %q", string(data))
+	}
+}
+
 func TestModelErrorAndGatewayLogShareDailyFile(t *testing.T) {
 	dir := setupDailyLogTest(t)
 	ctx := context.WithValue(context.Background(), common.RequestIdKey, "req-123")

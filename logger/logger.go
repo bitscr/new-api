@@ -25,17 +25,25 @@ const (
 
 const dailyLogDateLayout = "20060102"
 
+// dailyLogIdentityCheckInterval bounds how often the writer verifies that its
+// open file is still the file at the canonical daily path. NFS turns a deleted
+// but still-open file into a hidden ".nfs*" file; without this check the writer
+// would keep appending to an invisible inode forever and the log page would show
+// an empty directory.
+const dailyLogIdentityCheckInterval = 10 * time.Second
+
 var setupLogLock sync.Mutex
 
 // dailyFileWriter appends every process's logs for one calendar day to the same
 // file. Rotation happens lazily on the first write after midnight, so Gin access
 // logs, common.SysLog and logger.Log* all follow the same daily file.
 type dailyFileWriter struct {
-	dir  string
-	mu   sync.Mutex
-	file *os.File
-	date string
-	path string
+	dir       string
+	mu        sync.Mutex
+	file      *os.File
+	date      string
+	path      string
+	lastCheck time.Time
 }
 
 func (w *dailyFileWriter) Write(p []byte) (int, error) {
@@ -57,7 +65,24 @@ func (w *dailyFileWriter) openForDate(now time.Time) error {
 func (w *dailyFileWriter) ensureFileLocked(now time.Time) error {
 	date := now.Format(dailyLogDateLayout)
 	if w.file != nil && w.date == date {
-		return nil
+		if !w.lastCheck.IsZero() && now.Sub(w.lastCheck) < dailyLogIdentityCheckInterval {
+			return nil
+		}
+		w.lastCheck = now
+		current, currentErr := w.file.Stat()
+		onDisk, diskErr := os.Stat(w.path)
+		if currentErr == nil && diskErr == nil && os.SameFile(current, onDisk) {
+			return nil
+		}
+		// A permission or transient stat error must not stop logging; only a
+		// missing or replaced path means this descriptor no longer owns the file.
+		if diskErr != nil && !os.IsNotExist(diskErr) && currentErr == nil {
+			return nil
+		}
+		log.Printf("daily log file %s was removed or replaced; recreating", w.path)
+		_ = w.file.Close()
+		w.file = nil
+		w.path = ""
 	}
 	path := filepath.Join(w.dir, "oneapi-"+date+".log")
 	fd, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -70,6 +95,7 @@ func (w *dailyFileWriter) ensureFileLocked(now time.Time) error {
 	w.file = fd
 	w.date = date
 	w.path = path
+	w.lastCheck = now
 	return nil
 }
 

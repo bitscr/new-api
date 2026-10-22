@@ -200,13 +200,20 @@ export default function SettingsPerformance(props) {
         `/api/performance/logs?mode=${logCleanupMode}&value=${logCleanupValue}`,
       );
       if (res.data.success) {
-        const { deleted_count, freed_bytes } = res.data.data;
+        const { deleted_count, freed_bytes, protected_count } = res.data.data;
         showSuccess(
           t('已清理 {{count}} 个日志文件，释放 {{size}}', {
             count: deleted_count,
             size: formatBytes(freed_bytes),
           }),
         );
+        if (protected_count > 0) {
+          showWarning(
+            t('{{count}} 个活动或最新日志文件已保护，未删除', {
+              count: protected_count,
+            }),
+          );
+        }
       } else {
         showError(res.data.message || t('清理失败'));
       }
@@ -498,12 +505,15 @@ export default function SettingsPerformance(props) {
             />
             <Row gutter={16} style={{ marginBottom: 16 }}>
               <Col span={24}>
-                <Button
-                  onClick={() => setLogExportVisible(true)}
-                  disabled={!logInfo.files || logInfo.files.length === 0}
-                >
-                  {t('导出日志')}
-                </Button>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <Button
+                    onClick={() => setLogExportVisible(true)}
+                    disabled={!logInfo.files || logInfo.files.length === 0}
+                  >
+                    {t('导出日志')}
+                  </Button>
+                  <Button onClick={fetchLogInfo}>{t('刷新日志')}</Button>
+                </div>
               </Col>
             </Row>
             <Row gutter={16} style={{ marginBottom: 16 }}>
@@ -570,6 +580,11 @@ export default function SettingsPerformance(props) {
                 </div>
               </Col>
             </Row>
+            <Text type='tertiary' size='small'>
+              {t(
+                'oneapi-*.log 是当前合并日志；model-error-*.log 仅为旧版本遗留文件，新日志不会再生成。两者参与自动清理；stdout.log、.nfs* 等外部文件只展示和导出，不会被自动删除。活动日志和最近写入的文件会受到保护。',
+              )}
+            </Text>
           </>
         ) : (
           <Banner
@@ -845,6 +860,11 @@ export default function SettingsPerformance(props) {
                 <div style={{ minWidth: 0 }}>
                   <Text strong ellipsis={{ showTooltip: true }} style={{ display: 'block' }}>
                     {file.name}
+                    {!file.managed && (
+                      <Tag color='grey' style={{ marginLeft: 8 }}>
+                        {t('外部文件')}
+                      </Tag>
+                    )}
                   </Text>
                   <Text type='tertiary' size='small'>
                     {formatBytes(file.size)} · {new Date(file.mod_time).toLocaleString()}

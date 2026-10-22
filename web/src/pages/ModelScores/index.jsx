@@ -58,6 +58,10 @@ function formatTime(unixSeconds) {
   return date.toLocaleString();
 }
 
+function scoreRowKey(record) {
+  return `${record.group}\u0000${record.model}\u0000${record.channel_id}`;
+}
+
 const ModelScores = () => {
   const { t } = useTranslation();
   const [loading, setLoading] = useState(true);
@@ -65,7 +69,15 @@ const ModelScores = () => {
   const [refreshSeconds, setRefreshSeconds] = useState(DEFAULT_REFRESH_SECONDS);
   const [keyword, setKeyword] = useState('');
   const [group, setGroup] = useState('');
+  const [channel, setChannel] = useState('');
   const [pageSize, setPageSize] = useState(20);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [sortState, setSortState] = useState({
+    dataIndex: 'score',
+    sortOrder: 'descend',
+  });
+  const [selectedRowKeys, setSelectedRowKeys] = useState([]);
+  const [batchClearing, setBatchClearing] = useState(false);
   const timerRef = useRef();
 
   const load = async (showSpinner = true) => {
@@ -135,16 +147,123 @@ const ModelScores = () => {
     return Array.from(set).map((value) => ({ value, label: value }));
   }, [rows]);
 
+  const channelOptions = useMemo(() => {
+    const ids = new Set();
+    rows.forEach((row) => {
+      const id = Number(row.channel_id);
+      if (Number.isInteger(id) && id > 0) ids.add(id);
+    });
+    return Array.from(ids)
+      .sort((a, b) => a - b)
+      .map((id) => ({ value: String(id), label: `#${id}` }));
+  }, [rows]);
+
   const filteredRows = useMemo(() => {
     const kw = keyword.trim().toLowerCase();
     return rows.filter((row) => {
       if (group && row.group !== group) return false;
+      if (channel && String(row.channel_id) !== String(channel)) return false;
       if (!kw) return true;
       return String(row.model || '')
         .toLowerCase()
         .includes(kw);
     });
-  }, [rows, keyword, group]);
+  }, [rows, keyword, group, channel]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+    setSelectedRowKeys([]);
+  }, [keyword, group, channel]);
+
+  const sortedRows = useMemo(() => {
+    if (!sortState.sortOrder) return filteredRows;
+    const valueOf = (row) => {
+      switch (sortState.dataIndex) {
+        case 'score':
+          return Number(row.score) || 0;
+        case 'channel_priority':
+          return Number(row.channel_priority) || 0;
+        case 'latency_ms':
+          return Number(row.latency_ms) || 0;
+        case 'observations':
+          return Number(row.observations) || 0;
+        default:
+          return null;
+      }
+    };
+    const direction = sortState.sortOrder === 'ascend' ? 1 : -1;
+    return [...filteredRows].sort((a, b) => {
+      const left = valueOf(a);
+      const right = valueOf(b);
+      if (left === null || right === null) return 0;
+      return (left - right) * direction;
+    });
+  }, [filteredRows, sortState]);
+
+  const pageRows = useMemo(() => {
+    const start = (currentPage - 1) * pageSize;
+    return sortedRows.slice(start, start + pageSize);
+  }, [sortedRows, currentPage, pageSize]);
+
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(filteredRows.length / pageSize));
+    if (currentPage > maxPage) setCurrentPage(maxPage);
+  }, [filteredRows.length, pageSize, currentPage]);
+
+  const selectedRecords = useMemo(() => {
+    const byKey = new Map(rows.map((row) => [scoreRowKey(row), row]));
+    return selectedRowKeys.map((key) => byKey.get(key)).filter(Boolean);
+  }, [rows, selectedRowKeys]);
+
+  useEffect(() => {
+    const valid = new Set(rows.map(scoreRowKey));
+    setSelectedRowKeys((previous) => {
+      const next = previous.filter((key) => valid.has(key));
+      return next.length === previous.length ? previous : next;
+    });
+  }, [rows]);
+
+  const selectCurrentPage = () => {
+    const keys = pageRows.map(scoreRowKey);
+    setSelectedRowKeys(Array.from(new Set([...selectedRowKeys, ...keys])));
+  };
+
+  const clearSelectedNegative = async () => {
+    if (!selectedRecords.length) return;
+    setBatchClearing(true);
+    try {
+      let cleared = 0;
+      let skipped = 0;
+      // The backend accepts up to 1000 rows; chunk anyway so a future select-all
+      // over a large table cannot turn into one oversized request.
+      for (let start = 0; start < selectedRecords.length; start += 200) {
+        const items = selectedRecords.slice(start, start + 200).map((row) => ({
+          group: row.group,
+          model: row.model,
+          channel_id: Number(row.channel_id),
+        }));
+        const res = await API.post('/api/option/auto_model_scores/batch', {
+          items,
+        });
+        const { success, message, data } = res.data;
+        if (!success) {
+          showError(message || t('批量清除失败'));
+          return;
+        }
+        cleared += Number(data?.cleared_count) || 0;
+        skipped += Number(data?.skipped_count) || 0;
+      }
+      showSuccess(
+        t('已清除 {{cleared}} 条，跳过 {{skipped}} 条', { cleared, skipped }),
+      );
+      setSelectedRowKeys([]);
+      await load(false);
+    } catch (error) {
+      showError(t('批量清除失败'));
+    } finally {
+      setBatchClearing(false);
+    }
+  };
 
   const columns = [
     {
@@ -230,6 +349,13 @@ const ModelScores = () => {
     });
   }
 
+  const rowSelection = isRoot()
+    ? {
+        selectedRowKeys,
+        onChange: (keys) => setSelectedRowKeys(keys),
+      }
+    : undefined;
+
   return (
     <div className='mt-[60px] px-2'>
       <Card
@@ -246,6 +372,7 @@ const ModelScores = () => {
             gap: 12,
             marginBottom: 16,
             flexWrap: 'wrap',
+            alignItems: 'center',
           }}
         >
           <Input
@@ -263,20 +390,79 @@ const ModelScores = () => {
             style={{ width: 200 }}
             showClear
           />
+          <Select
+            value={channel}
+            onChange={setChannel}
+            placeholder={t('按渠道筛选')}
+            optionList={channelOptions}
+            style={{ width: 160 }}
+            showClear
+          />
+          {isRoot() && (
+            <>
+              <Button
+                onClick={selectCurrentPage}
+                disabled={pageRows.length === 0}
+              >
+                {t('全选本页')}
+              </Button>
+              <Button
+                onClick={() => setSelectedRowKeys([])}
+                disabled={selectedRowKeys.length === 0}
+              >
+                {t('清空选择')}
+              </Button>
+              <Popconfirm
+                title={t('确定批量清除所选组合的负面效果？')}
+                content={t('共 {{count}} 条，得分将恢复中立 0.5 并解除冷却', {
+                  count: selectedRecords.length,
+                })}
+                onConfirm={clearSelectedNegative}
+              >
+                <Button
+                  type='danger'
+                  loading={batchClearing}
+                  disabled={batchClearing || selectedRecords.length === 0}
+                >
+                  {selectedRecords.length > 0
+                    ? t('批量清除负面效果 ({{count}})', {
+                        count: selectedRecords.length,
+                      })
+                    : t('批量清除负面效果')}
+                </Button>
+              </Popconfirm>
+            </>
+          )}
         </div>
         <Spin spinning={loading}>
           <Table
             columns={columns}
             dataSource={filteredRows}
+            rowSelection={rowSelection}
+            onChange={(changeInfo) => {
+              const sorter = changeInfo?.sorter;
+              if (sorter?.dataIndex) {
+                setSortState({
+                  dataIndex: sorter.dataIndex,
+                  sortOrder: sorter.sortOrder,
+                });
+              }
+            }}
             pagination={{
+              currentPage,
               pageSize,
               pageSizeOpts: [10, 20, 50, 100],
               showSizeChanger: true,
-              onPageSizeChange: setPageSize,
+              onChange: (page, size) => {
+                setCurrentPage(page);
+                setPageSize(size);
+              },
+              onPageSizeChange: (size) => {
+                setCurrentPage(1);
+                setPageSize(size);
+              },
             }}
-            rowKey={(record) =>
-              `${record.group}\u0000${record.model}\u0000${record.channel_id}`
-            }
+            rowKey={scoreRowKey}
             empty={t('暂无模型得分数据')}
           />
         </Spin>

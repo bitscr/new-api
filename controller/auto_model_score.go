@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
@@ -52,5 +53,74 @@ func ClearAutoModelNegativeEffects(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
+	})
+}
+
+// autoModelScoreClearBatchLimit 限制单次批量清除的行数,避免一个请求长时间
+// 持有评分/冷却锁或产生无界日志。
+const autoModelScoreClearBatchLimit = 1000
+
+type autoModelScoreClearItem struct {
+	Group     string `json:"group"`
+	Model     string `json:"model"`
+	ChannelID int    `json:"channel_id"`
+}
+
+type autoModelScoreClearBatchRequest struct {
+	Items []autoModelScoreClearItem `json:"items"`
+}
+
+// ClearAutoModelNegativeEffectsBatch 批量清除所选 (分组, 模型, 渠道) 的负面效果。
+// 重复行只执行一次;没有观测数据的行计入 skipped,不回滚其它已清除行。
+func ClearAutoModelNegativeEffectsBatch(c *gin.Context) {
+	var request autoModelScoreClearBatchRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "请求格式无效"})
+		return
+	}
+	if len(request.Items) == 0 {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "请选择要清除的得分行"})
+		return
+	}
+	if len(request.Items) > autoModelScoreClearBatchLimit {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "单次最多清除 " + strconv.Itoa(autoModelScoreClearBatchLimit) + " 行",
+		})
+		return
+	}
+
+	seen := make(map[autoModelScoreClearItem]bool, len(request.Items))
+	items := make([]autoModelScoreClearItem, 0, len(request.Items))
+	for _, item := range request.Items {
+		item.Group = strings.TrimSpace(item.Group)
+		item.Model = strings.TrimSpace(item.Model)
+		if item.Group == "" || item.Model == "" || item.ChannelID <= 0 {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": "存在无效的得分行"})
+			return
+		}
+		if seen[item] {
+			continue
+		}
+		seen[item] = true
+		items = append(items, item)
+	}
+
+	cleared, skipped := 0, 0
+	for _, item := range items {
+		if service.ClearAutoModelNegativeEffects(item.Group, item.Model, item.ChannelID) {
+			cleared++
+		} else {
+			skipped++
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data": gin.H{
+			"cleared_count": cleared,
+			"skipped_count": skipped,
+		},
 	})
 }

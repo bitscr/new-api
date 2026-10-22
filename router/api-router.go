@@ -201,6 +201,7 @@ func SetApiRouter(router *gin.Engine) {
 			optionRoute.GET("/auto_model_cooldowns", controller.GetAutoModelCooldowns)
 			optionRoute.DELETE("/auto_model_cooldowns", controller.DeleteAutoModelCooldown)
 			optionRoute.DELETE("/auto_model_scores", controller.ClearAutoModelNegativeEffects)
+			optionRoute.POST("/auto_model_scores/batch", controller.ClearAutoModelNegativeEffectsBatch)
 			optionRoute.POST("/rest_model_ratio", controller.ResetModelRatio)
 			optionRoute.POST("/migrate_console_setting", controller.MigrateConsoleSetting) // 用于迁移检测的旧键，下个版本会删除
 		}
