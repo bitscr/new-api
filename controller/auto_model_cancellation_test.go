@@ -105,10 +105,10 @@ func TestObservedAutoLatencyRetainsValidSubMillisecondSuccess(t *testing.T) {
 	start := time.Unix(1700000000, 0)
 	for _, firstResponseDelay := range []time.Duration{0, 500 * time.Microsecond} {
 		info := &relaycommon.RelayInfo{
-			IsStream:                 true,
-			AttemptStartTime:         start,
-			AttemptFirstResponseTime: start.Add(firstResponseDelay),
-			AttemptEndTime:           start.Add(time.Minute),
+			IsStream:                    true,
+			AttemptStartTime:            start,
+			AttemptFirstValidOutputTime: start.Add(firstResponseDelay),
+			AttemptEndTime:              start.Add(time.Minute),
 		}
 		require.Equal(t, int64(1), observedAutoLatency(info, true))
 		require.Equal(t, int64(1), observedAutoModelCooldownLatency(info, true), "valid fast streams must clear prior cooldowns")

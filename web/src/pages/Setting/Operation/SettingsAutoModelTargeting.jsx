@@ -28,7 +28,13 @@ import {
   Switch,
   Typography,
 } from '@douyinfe/semi-ui';
-import { API, compareObjects, showError, showSuccess, showWarning } from '../../../helpers';
+import {
+  API,
+  compareObjects,
+  showError,
+  showSuccess,
+  showWarning,
+} from '../../../helpers';
 import { useTranslation } from 'react-i18next';
 
 const { Text } = Typography;
@@ -37,7 +43,12 @@ const OPTION_KEYS = [
   'AutoModelEnabled',
   'AutoModelCandidates',
   'AutoModelWeights',
-  'AutoModelScoreBandWidth',
+  'AutoModelReliabilityThreshold',
+  'AutoModelMinObservations',
+  'AutoModelLatencyToleranceRatio',
+  'AutoModelLatencyToleranceMs',
+  'AutoModelExploreRatio',
+  'AutoModelExploreMaxRatio',
 ];
 
 /**
@@ -52,11 +63,10 @@ const OPTION_KEYS = [
  *   分组名出现但值是空数组 = 该分组一个模型都不选,auto 在该分组下无路可走。
  * 两者在原始 JSON 里看起来很像,后果完全相反。
  *
- * 「模型得分同档宽度」管的是同一渠道优先级内、模型有效得分的分档:与档内最高分
- * 差距不超过它的路线算同一档,档内只按权重随机;差距超过它才另起一档。priority 是
- * 硬边界,高优先级的低分候选也排在低优先级的高分前面。渠道聚合健康分已整体移除,
- * 不参与排序,也没有仅供诊断的保留形态;「模型得分」页展示的是模型级得分与渠道
- * 优先级。
+ * 路由在渠道 priority 硬边界内执行:近期可靠性达到门槛、成功延迟样本充足的路线
+ * 进入主流量;成功延迟接近的路线共同竞争并按渠道/模型权重随机;可靠性不足、样本
+ * 不足、证据陈旧、待恢复或明显较慢的路线进入试用/探索范围。探索只使用真实业务
+ * 请求,不会主动测活。「模型得分」页已改为 auto 路由状态,展示这些证据和原因。
  */
 export default function SettingsAutoModelTargeting(props) {
   const { t } = useTranslation();
@@ -65,7 +75,12 @@ export default function SettingsAutoModelTargeting(props) {
     AutoModelEnabled: 'true',
     AutoModelCandidates: '',
     AutoModelWeights: '',
-    AutoModelScoreBandWidth: '0.01',
+    AutoModelReliabilityThreshold: '0.95',
+    AutoModelMinObservations: '5',
+    AutoModelLatencyToleranceRatio: '0.20',
+    AutoModelLatencyToleranceMs: '250',
+    AutoModelExploreRatio: '0.05',
+    AutoModelExploreMaxRatio: '0.10',
   });
   const refForm = useRef();
   const [inputsRow, setInputsRow] = useState(inputs);
@@ -80,7 +95,10 @@ export default function SettingsAutoModelTargeting(props) {
     }
     for (const [group, names] of Object.entries(parsed)) {
       if (!String(group).trim()) throw new Error(t('分组名不能为空'));
-      if (!Array.isArray(names) || names.some((name) => typeof name !== 'string')) {
+      if (
+        !Array.isArray(names) ||
+        names.some((name) => typeof name !== 'string')
+      ) {
         throw new Error(t('分组「{{group}}」的值必须是字符串数组', { group }));
       }
       if (names.some((name) => !String(name).trim())) {
@@ -97,21 +115,32 @@ export default function SettingsAutoModelTargeting(props) {
     if (!value || !String(value).trim()) return null;
     const parsed = JSON.parse(value);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error(t('必须是一个 JSON 对象,例如 {"default": {"gpt-4o": 2}}'));
+      throw new Error(
+        t('必须是一个 JSON 对象,例如 {"default": {"gpt-4o": 2}}'),
+      );
     }
     for (const [group, models] of Object.entries(parsed)) {
       if (!String(group).trim()) throw new Error(t('分组名不能为空'));
       if (!models || typeof models !== 'object' || Array.isArray(models)) {
-        throw new Error(t('分组「{{group}}」的值必须是「模型名: 权重」对象', { group }));
+        throw new Error(
+          t('分组「{{group}}」的值必须是「模型名: 权重」对象', { group }),
+        );
       }
       for (const [model, weight] of Object.entries(models)) {
         if (!String(model).trim()) throw new Error(t('模型名不能为空'));
-        if (typeof weight !== 'number' || !Number.isFinite(weight) || weight < 0) {
+        if (
+          typeof weight !== 'number' ||
+          !Number.isFinite(weight) ||
+          weight < 0
+        ) {
           throw new Error(
-            t('分组「{{group}}」的模型「{{model}}」权重必须是不小于 0 的有限数字', {
-              group,
-              model,
-            }),
+            t(
+              '分组「{{group}}」的模型「{{model}}」权重必须是不小于 0 的有限数字',
+              {
+                group,
+                model,
+              },
+            ),
           );
         }
       }
@@ -119,17 +148,13 @@ export default function SettingsAutoModelTargeting(props) {
     return parsed;
   };
 
-  // 档宽是浮点数,不能套用失败判据面板那套"至少 1 的整数"校验。
-  // 只挡空值、非数字与负数:0(仅同分随机)和 >= 1(同优先级全部同档)都合法。
-  const parseBandWidth = (value) => {
+  const parseNumber = (value, { min, max, label }) => {
     const raw = String(value ?? '').trim();
-    if (!raw) throw new Error(t('不能为空;默认值是 0.01'));
+    if (!raw) throw new Error(t('不能为空'));
     const parsed = Number(raw);
     if (!Number.isFinite(parsed)) throw new Error(t('必须是数字'));
-    if (parsed < 0) {
-      throw new Error(
-        t('不能为负数:负的档宽会让分档边界反向,得分更高的路线反而落到更差的档'),
-      );
+    if (parsed < min || (max !== undefined && parsed > max)) {
+      throw new Error(label);
     }
     return parsed;
   };
@@ -137,7 +162,46 @@ export default function SettingsAutoModelTargeting(props) {
   const validators = {
     AutoModelCandidates: parseCandidates,
     AutoModelWeights: parseWeights,
-    AutoModelScoreBandWidth: parseBandWidth,
+    AutoModelReliabilityThreshold: (value) =>
+      parseNumber(value, {
+        min: 0,
+        max: 1,
+        label: t('可靠性门槛必须在 0～1 之间'),
+      }),
+    AutoModelMinObservations: (value) => {
+      const parsed = parseNumber(value, {
+        min: 1,
+        max: 70,
+        label: t('最低业务观测数必须是 1～70 的整数'),
+      });
+      if (!Number.isInteger(parsed)) throw new Error(t('必须是整数'));
+      return parsed;
+    },
+    AutoModelLatencyToleranceRatio: (value) =>
+      parseNumber(value, {
+        min: 0,
+        label: t('延迟相对容差必须是非负有限数字'),
+      }),
+    AutoModelLatencyToleranceMs: (value) => {
+      const parsed = parseNumber(value, {
+        min: 0,
+        label: t('延迟绝对容差不能为负数'),
+      });
+      if (!Number.isInteger(parsed)) throw new Error(t('必须是整数'));
+      return parsed;
+    },
+    AutoModelExploreRatio: (value) =>
+      parseNumber(value, {
+        min: 0,
+        max: 0.1,
+        label: t('探索比例必须满足 0 ≤ 基础比例 ≤ 最高比例 ≤ 0.10'),
+      }),
+    AutoModelExploreMaxRatio: (value) =>
+      parseNumber(value, {
+        min: 0,
+        max: 0.1,
+        label: t('探索比例必须满足 0 ≤ 基础比例 ≤ 最高比例 ≤ 0.10'),
+      }),
   };
 
   const validate = (key, value) => {
@@ -148,6 +212,24 @@ export default function SettingsAutoModelTargeting(props) {
     if (!validator) return '';
     try {
       validator(value, key);
+      if (
+        key === 'AutoModelExploreRatio' ||
+        key === 'AutoModelExploreMaxRatio'
+      ) {
+        const base = Number(
+          key === 'AutoModelExploreRatio'
+            ? value
+            : inputs.AutoModelExploreRatio,
+        );
+        const maximum = Number(
+          key === 'AutoModelExploreMaxRatio'
+            ? value
+            : inputs.AutoModelExploreMaxRatio,
+        );
+        if (base > maximum) {
+          return t('探索比例必须满足 0 ≤ 基础比例 ≤ 最高比例 ≤ 0.10');
+        }
+      }
       return '';
     } catch (e) {
       return e instanceof SyntaxError ? t('不是合法的 JSON 字符串') : e.message;
@@ -163,12 +245,28 @@ export default function SettingsAutoModelTargeting(props) {
       if (message) return showError(`${item.key}: ${message}`);
     }
 
-    const requestQueue = updateArray.map((item) =>
-      API.put('/api/option/', {
-        key: item.key,
-        value: String(inputs[item.key] ?? ''),
-      }),
+    const exploreKeys = ['AutoModelExploreRatio', 'AutoModelExploreMaxRatio'];
+    const exploreChanged = updateArray.some((item) =>
+      exploreKeys.includes(item.key),
     );
+    // 两个探索比例相互约束：无论改了哪一个，都把当前组合作为一次请求提交，
+    // 后端在同一事务里校验并保存。拆成两个单键请求会因先后顺序被拒绝。
+    const requestQueue = updateArray
+      .filter((item) => !exploreKeys.includes(item.key))
+      .map((item) =>
+        API.put('/api/option/', {
+          key: item.key,
+          value: String(inputs[item.key] ?? ''),
+        }),
+      );
+    if (exploreChanged) {
+      requestQueue.push(
+        API.put('/api/option/auto_model_explore_ratios', {
+          base: String(inputs.AutoModelExploreRatio ?? ''),
+          max: String(inputs.AutoModelExploreMaxRatio ?? ''),
+        }),
+      );
+    }
     setLoading(true);
     Promise.all(requestQueue)
       .then((res) => {
@@ -211,7 +309,10 @@ export default function SettingsAutoModelTargeting(props) {
   // 空数组是一个容易被误读的状态,单独提示出来。
   const emptyGroups = (() => {
     try {
-      const parsed = parseCandidates(inputs.AutoModelCandidates, 'AutoModelCandidates');
+      const parsed = parseCandidates(
+        inputs.AutoModelCandidates,
+        'AutoModelCandidates',
+      );
       return parsed
         ? Object.entries(parsed)
             .filter(([, names]) => names.length === 0)
@@ -242,14 +343,23 @@ export default function SettingsAutoModelTargeting(props) {
               <Form.TextArea
                 field={'AutoModelCandidates'}
                 label={t('候选模型白名单(按分组)')}
-                placeholder={'{"default": ["gpt-4o", "claude-sonnet-4"], "vip": ["gpt-4o"]}'}
+                placeholder={
+                  '{"default": ["gpt-4o", "claude-sonnet-4"], "vip": ["gpt-4o"]}'
+                }
                 extraText={t(
                   '留空 = 不限制,每个分组都用它全部启用的模型(受计费配置过滤)。分组名不出现 = 该分组不限制;分组名出现但数组为空 = 该分组一个模型都不选。',
                 )}
                 autosize={{ minRows: 6, maxRows: 14 }}
                 trigger='blur'
-                rules={[{ validator: (rule, value) => !validate('AutoModelCandidates', value) }]}
-                onChange={(value) => setInputs({ ...inputs, AutoModelCandidates: value })}
+                rules={[
+                  {
+                    validator: (rule, value) =>
+                      !validate('AutoModelCandidates', value),
+                  },
+                ]}
+                onChange={(value) =>
+                  setInputs({ ...inputs, AutoModelCandidates: value })
+                }
               />
             </Col>
           </Row>
@@ -271,10 +381,17 @@ export default function SettingsAutoModelTargeting(props) {
                   checkedText='|'
                   uncheckedText='〇'
                   onChange={(value) =>
-                    setInputs({ ...inputs, AutoModelEnabled: value ? 'true' : 'false' })
+                    setInputs({
+                      ...inputs,
+                      AutoModelEnabled: value ? 'true' : 'false',
+                    })
                   }
                 />
-                <Text type='tertiary' size='small' style={{ display: 'block', marginTop: 4 }}>
+                <Text
+                  type='tertiary'
+                  size='small'
+                  style={{ display: 'block', marginTop: 4 }}
+                >
                   {t('关闭后 model=auto 不再自动选路,命名模型的请求不受影响。')}
                 </Text>
               </Form.Slot>
@@ -291,8 +408,15 @@ export default function SettingsAutoModelTargeting(props) {
                 )}
                 autosize={{ minRows: 6, maxRows: 14 }}
                 trigger='blur'
-                rules={[{ validator: (rule, value) => !validate('AutoModelWeights', value) }]}
-                onChange={(value) => setInputs({ ...inputs, AutoModelWeights: value })}
+                rules={[
+                  {
+                    validator: (rule, value) =>
+                      !validate('AutoModelWeights', value),
+                  },
+                ]}
+                onChange={(value) =>
+                  setInputs({ ...inputs, AutoModelWeights: value })
+                }
               />
               <Text type='tertiary'>
                 {t(
@@ -302,34 +426,96 @@ export default function SettingsAutoModelTargeting(props) {
             </Col>
           </Row>
           <Row gutter={16} style={{ marginTop: 16 }}>
-            <Col xs={24} sm={12}>
+            <Col xs={24} sm={12} lg={8}>
               <Form.Input
-                field={'AutoModelScoreBandWidth'}
-                label={t('模型得分同档宽度')}
+                field={'AutoModelReliabilityThreshold'}
+                label={t('可靠性门槛')}
                 extraText={t(
-                  '默认 0.01,作用于每个渠道优先级内的模型有效得分分档:同一优先级的全部可用路线一起比较,与档内最高分差距不超过它的算同一档,档内只按权重随机;差距超过它才另起一档(锚定档内最高分,不做相邻链接)。priority 是硬边界:高优先级的低分候选也排在低优先级的高分前面。档内两级抽样保留渠道份额:先按渠道权重选渠道,再按模型权重选模型——渠道权重相同时,10 个候选模型的渠道与 1 个候选模型的渠道总流量约各占一半,模型数量不会放大渠道流量。模型权重 0 = 该模型不参与 auto。填 0 = 仅同分随机;填 1 或更大 = 同优先级内全部同档。',
+                  '默认 0.95。近期成功率低于它的路线不进入主流量，只作为试用/后备。',
                 )}
-                rules={[
-                  {
-                    validator: (rule, value) => {
-                      try {
-                        parseBandWidth(value);
-                        return true;
-                      } catch {
-                        return false;
-                      }
-                    },
-                  },
-                ]}
                 onChange={(value) =>
-                  setInputs({ ...inputs, AutoModelScoreBandWidth: value })
+                  setInputs({ ...inputs, AutoModelReliabilityThreshold: value })
+                }
+              />
+            </Col>
+            <Col xs={24} sm={12} lg={8}>
+              <Form.Input
+                field={'AutoModelMinObservations'}
+                label={t('最低业务观测数')}
+                extraText={t(
+                  '默认 5，可设 1～70。少于该数量的路线只进入试用，不进入主流量。',
+                )}
+                onChange={(value) =>
+                  setInputs({ ...inputs, AutoModelMinObservations: value })
+                }
+              />
+            </Col>
+            <Col xs={24} sm={12} lg={8}>
+              <Form.Input
+                field={'AutoModelLatencyToleranceRatio'}
+                label={t('延迟相对容差')}
+                extraText={t(
+                  '默认 0.20。候选池宽度取 max(绝对容差, 最低延迟 × 该比例)。',
+                )}
+                onChange={(value) =>
+                  setInputs({
+                    ...inputs,
+                    AutoModelLatencyToleranceRatio: value,
+                  })
                 }
               />
             </Col>
           </Row>
+          <Row gutter={16} style={{ marginTop: 16 }}>
+            <Col xs={24} sm={12} lg={8}>
+              <Form.Input
+                field={'AutoModelLatencyToleranceMs'}
+                label={t('延迟绝对容差(ms)')}
+                extraText={t(
+                  '默认 250ms。成功延迟相差不超过该值的路线共同竞争。',
+                )}
+                onChange={(value) =>
+                  setInputs({ ...inputs, AutoModelLatencyToleranceMs: value })
+                }
+              />
+            </Col>
+            <Col xs={24} sm={12} lg={8}>
+              <Form.Input
+                field={'AutoModelExploreRatio'}
+                label={t('基础探索比例')}
+                extraText={t(
+                  '默认 0.05。用于给主池之外的候选补充真实业务证据。',
+                )}
+                onChange={(value) =>
+                  setInputs({ ...inputs, AutoModelExploreRatio: value })
+                }
+              />
+            </Col>
+            <Col xs={24} sm={12} lg={8}>
+              <Form.Input
+                field={'AutoModelExploreMaxRatio'}
+                label={t('最高探索比例')}
+                extraText={t(
+                  '默认 0.10。待补充证据候选越多，探索比例越接近该值。',
+                )}
+                onChange={(value) =>
+                  setInputs({ ...inputs, AutoModelExploreMaxRatio: value })
+                }
+              />
+            </Col>
+          </Row>
+          <Text
+            type='tertiary'
+            size='small'
+            style={{ display: 'block', marginTop: 12 }}
+          >
+            {t(
+              '主流量顺序：渠道 priority 降序 → 可靠性准入 → 成功延迟接近的候选池 → 池内渠道/模型权重随机。可靠性不足、样本不足、证据陈旧、待恢复或明显较慢的路线进入试用/探索范围；探索只使用真实业务请求，不会主动测活。',
+            )}
+          </Text>
           <Row style={{ marginTop: 12 }}>
             <Button size='default' onClick={onSubmit}>
-              {t('保存 auto 候选与权重')}
+              {t('保存 auto 选路设置')}
             </Button>
           </Row>
         </Form.Section>

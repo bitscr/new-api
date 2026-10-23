@@ -21,9 +21,10 @@ read or modified. A separate loopback-only netns is required before bootstrap I/
 Persistence is proved while the gateway is still running, before stopping it: this
 does NOT assume SIGTERM executes Go defers or flushes the latest unsaved interval.
 The startup-ranking case also checks count continuation, so a lucky cold tie cannot
-prove restore. Legacy idle/priority/cooldown controls remain useful on old binaries;
-without the score table the three persistence cases fail explicitly, not with SQL
-setup errors. With the table present, score-enhanced legacy controls are mandatory.
+prove restore. Version-2 evidence is mandatory: a missing table or legacy-only schema
+is an explicit behavioral failure, never a silent SQL setup error. The fixture seeds
+model-scoped reliability counts and non-stream latency samples; channel-scoped blended
+scores are neither written nor read.
 """
 import argparse
 import base64
@@ -66,8 +67,17 @@ CASES = ('idle-no-probes', 'feedback-save-reload', 'startup-two-level-ranking',
 # 一旦有人往预置 DB 里写 AutoModelScoreDecayMinutes,就必须同步这个常量。
 DECAY_WINDOW_MS = 30 * 60 * 1000
 
-SCORE_COLUMNS = ('scope', 'group', 'model', 'channel_id', 'score', 'latency_ms',
-                 'observations', 'observed_at', 'version')
+SCORE_COLUMNS = (
+    'scope', 'group', 'model', 'channel_id',
+    'score', 'latency_ms', 'observations',
+    'success_count', 'failure_count',
+    'stream_latency_ms', 'stream_latency_samples', 'stream_latency_at',
+    'non_stream_latency_ms', 'non_stream_latency_samples', 'non_stream_latency_at',
+    'pending_recovery', 'observed_at', 'observation_seq', 'writer_id', 'version',
+)
+SCORE_VERSION = 2
+SCORE_TOMBSTONE_VERSION = 3
+EVIDENCE_CAP = 100.0
 
 
 def read_scores(root):
@@ -97,27 +107,51 @@ def check_scores(snapshot, expected_keys=None):
     if missing:
         return ['missing auto_model_scores columns: ' + repr(missing)]
     failures = []
-    keys = [score_key(row) for row in snapshot['rows']]
+    rows = [row for row in snapshot['rows'] if row.get('version') != SCORE_TOMBSTONE_VERSION]
+    keys = [score_key(row) for row in rows]
     if len(keys) != len(set(keys)):
         failures.append('duplicate score scope/key rows')
     if expected_keys is not None and set(keys) != set(expected_keys):
         failures.append('score scope/key set differs: ' + repr(keys))
-    for row in snapshot['rows']:
+    for row in rows:
         scope, group, model, channel = score_key(row)
-        if (scope not in ('channel', 'model') or not isinstance(group, str) or not group
-                or not isinstance(model, str) or (scope == 'channel') != (model == '')
+        if (scope != 'model' or not isinstance(group, str) or not group
+                or not isinstance(model, str) or not model
                 or type(channel) is not int or channel <= 0):
-            failures.append('invalid score scope/key')
-        if row.get('version') != 1:
-            failures.append('score version is not 1')
+            failures.append('invalid model score scope/key')
+        if row.get('version') != SCORE_VERSION:
+            failures.append('score version is not 2')
         if type(row.get('observed_at')) is not int or not 0 < row['observed_at'] <= 2**63 - 1:
             failures.append('observed_at is not an actual UnixNano int64')
-        for field, low, high in (('score', 0, 1), ('latency_ms', 0, math.inf),
-                                 ('observations', 0, 20)):
-            value = row.get(field)
-            if (type(value) not in (int, float) or not math.isfinite(value)
-                    or not low <= value <= high or (field == 'observations' and value == 0)):
-                failures.append('invalid score numeric field: ' + field)
+        # Version 2 writes neutral placeholders into the legacy columns; they must
+        # never be mistaken for restored blended evidence.
+        if not (abs(row.get('score', 0) - 0.5) < 1e-9 and abs(row.get('latency_ms', 0)) < 1e-9
+                and abs(row.get('observations', 0) - 1) < 1e-9):
+            failures.append('legacy blended columns are not neutral placeholders')
+        success = row.get('success_count')
+        failure = row.get('failure_count')
+        if (type(success) not in (int, float) or type(failure) not in (int, float)
+                or not math.isfinite(success) or not math.isfinite(failure)
+                or success < 0 or failure < 0 or not 0 < success + failure <= EVIDENCE_CAP + 1e-9):
+            failures.append('invalid v2 success/failure counts')
+        for prefix in ('stream', 'non_stream'):
+            latency = row.get(prefix + '_latency_ms')
+            samples = row.get(prefix + '_latency_samples')
+            updated = row.get(prefix + '_latency_at')
+            if (type(latency) not in (int, float) or type(samples) not in (int, float)
+                    or not math.isfinite(latency) or not math.isfinite(samples)
+                    or latency < 0 or samples < 0):
+                failures.append('invalid v2 latency evidence: ' + prefix)
+            if samples > 0 and (type(updated) is not int or updated <= 0):
+                failures.append('v2 latency samples have no observation time: ' + prefix)
+            if samples == 0 and (type(updated) is not int or updated != 0):
+                failures.append('v2 zero samples still carry an observation time: ' + prefix)
+        if row.get('pending_recovery') not in (0, 1, False, True):
+            failures.append('pending_recovery is not boolean')
+        if type(row.get('observation_seq')) is not int or row['observation_seq'] < 0:
+            failures.append('invalid observation_seq')
+        if not isinstance(row.get('writer_id'), str):
+            failures.append('invalid writer_id')
     return failures
 
 
@@ -145,56 +179,94 @@ def check_response(response, expected_body):
 def check_first_score(row):
     """Expired history must not become a confident or slow first observation."""
     failures = []
-    if not (abs(row['observations'] - 1) < 0.0001 and abs(row['score'] - 0.65) < 0.0001):
-        failures.append('first success did not produce one observation / score 0.65')
-    if not 0 < row['latency_ms'] < 20000:
+    if not (abs(row['success_count'] - 1) < 0.0001 and abs(row['failure_count']) < 0.0001):
+        failures.append('first success did not produce one v2 success / zero failures')
+    if not (abs(row['non_stream_latency_samples'] - 1) < 0.0001
+            and abs(row['stream_latency_samples']) < 0.0001):
+        failures.append('first non-stream success did not produce exactly one non-stream sample')
+    if not 0 < row['non_stream_latency_ms'] < 20000:
         failures.append('first success latency was not freshly observed')
+    if row['pending_recovery'] not in (0, False):
+        failures.append('a fast first success must not stay pending recovery')
     return failures
 
 
-def latency_update_bounds(before, sample_bounds_ms, observation_window_ns):
-    """Predict from prior history + external timings, never the row under test."""
-    low, high = sample_bounds_ms
+def _decay_factors(before_at_ns, observation_window_ns):
     start, end = observation_window_ns
+    if type(before_at_ns) is not int or before_at_ns <= 0 or type(start) is not int or type(end) is not int:
+        raise ValueError('invalid evidence timestamp or observation window')
+    if not 0 < start <= end:
+        raise ValueError('observation window is not ordered')
+    return [max(0, 1 - max(0, (at - before_at_ns) // 1000000) / DECAY_WINDOW_MS)
+            for at in (end, start)]
+
+
+def latency_update_bounds(before, sample_bounds_ms, observation_window_ns):
+    """Predict the non-stream EWMA from prior history plus external timings."""
+    low, high = sample_bounds_ms
     if (any(type(value) not in (int, float) or not math.isfinite(value) for value in (low, high))
-            or not 0 < low <= high or type(start) is not int or type(end) is not int
-            or not 0 < start <= end):
+            or not 0 < low <= high):
         raise ValueError('invalid independent latency measurement bounds')
-    factors = [max(0, 1 - max(0, (at - before['observed_at']) // 1000000) / DECAY_WINDOW_MS)
-               for at in (end, start)]
-    if before['latency_ms'] == 0 or factors[1] == 0:
-        return [low, high]
-    if factors[0] == 0:
-        raise ValueError('history expired inside latency measurement window')
-    return [before['latency_ms'] * factors[0] * 0.8 + low * 0.2,
-            before['latency_ms'] * factors[1] * 0.8 + high * 0.2]
+    factors = _decay_factors(before['non_stream_latency_at'], observation_window_ns)
+    old_samples = before['non_stream_latency_samples']
+    old_latency = before['non_stream_latency_ms']
+    # The new observed_at lies inside the window; use the widest factor bracket.
+    samples = [max(0.0, old_samples * factor) for factor in factors]
+    if old_latency <= 0 or max(samples) <= 0:
+        return [low, high, min(samples) + 1, max(samples) + 1]
+    if min(samples) <= 0:
+        raise ValueError('restored latency history expires inside the measurement window')
+    latencies = [old_latency * 0.8 + sample * 0.2 for sample in (low, high)]
+    return [min(latencies), max(latencies), min(samples) + 1, max(samples) + 1]
 
 
 def check_update(before, after, sample_latency_ms=None, observation_window_ns=None):
-    """One real success must fold into restored history, not restart at n=1."""
+    """One real non-stream success must fold into restored history, not restart."""
     failures = []
     if score_key(before) != score_key(after):
         failures.append('updated score key changed')
     if after['observed_at'] <= before['observed_at']:
         failures.append('last actual observation time did not advance')
-    age_ms = max(0, (after['observed_at'] - before['observed_at']) // 1000000)
-    factor = max(0, 1 - age_ms / DECAY_WINDOW_MS)
-    old_score = 0.5 + (before['score'] - 0.5) * factor
-    old_n = min(20, max(0, before['observations'])) * factor
-    expected = {'score': old_score + 0.30 * (1 - old_score),
-                'observations': min(20, old_n + 1)}
+    factors = _decay_factors(before['observed_at'], observation_window_ns or
+                             [after['observed_at'], after['observed_at']])
+    expected_success = [min(EVIDENCE_CAP, max(0, before['success_count']) * factor + 1)
+                        for factor in factors]
+    expected_failure = [min(EVIDENCE_CAP, max(0, before['failure_count']) * factor)
+                        for factor in factors]
+    if not min(expected_success) - 0.0001 <= after['success_count'] <= max(expected_success) + 0.0001:
+        failures.append('restored success count update differs: '
+                        f'{after["success_count"]!r} not in {expected_success!r}')
+    if not min(expected_failure) - 0.0001 <= after['failure_count'] <= max(expected_failure) + 0.0001:
+        failures.append('restored failure count update differs: '
+                        f'{after["failure_count"]!r} not in {expected_failure!r}')
+    if abs(after['stream_latency_samples'] - before['stream_latency_samples']) > 0.0001:
+        failures.append('non-stream feedback changed stream latency samples')
     if isinstance(sample_latency_ms, (list, tuple)):
-        low, high = latency_update_bounds(before, sample_latency_ms, observation_window_ns)
-        if not low - 0.0001 <= after['latency_ms'] <= high + 0.0001:
-            failures.append('restored latency_ms update differs: '
-                            f'{after["latency_ms"]!r} not in independently measured bounds [{low}, {high}]')
-    elif sample_latency_ms is not None:
-        old_latency = before['latency_ms'] * factor
-        expected['latency_ms'] = (old_latency * 0.8 + sample_latency_ms * 0.2
-                                  if old_latency else sample_latency_ms)
-    for field, value in expected.items():
-        if not math.isclose(after[field], value, rel_tol=0, abs_tol=0.0001):
-            failures.append(f'restored {field} update differs: {after[field]!r} != {value!r}')
+        low, high, samples_low, samples_high = latency_update_bounds(
+            before, sample_latency_ms, observation_window_ns)
+        if not low - 0.0001 <= after['non_stream_latency_ms'] <= high + 0.0001:
+            failures.append('restored non_stream_latency_ms update differs: '
+                            f'{after["non_stream_latency_ms"]!r} not in measured bounds [{low}, {high}]')
+        if not samples_low - 0.0001 <= after['non_stream_latency_samples'] <= samples_high + 0.0001:
+            failures.append('restored non_stream_latency_samples update differs: '
+                            f'{after["non_stream_latency_samples"]!r} not in [{samples_low}, {samples_high}]')
+    elif isinstance(sample_latency_ms, (int, float)):
+        factor = max(0, 1 - max(0, (after['observed_at'] - before['non_stream_latency_at']) // 1000000)
+                     / DECAY_WINDOW_MS)
+        old_samples = before['non_stream_latency_samples'] * factor
+        old_latency = before['non_stream_latency_ms']
+        expected_latency = old_latency * 0.8 + sample_latency_ms * 0.2 if old_samples > 0 else sample_latency_ms
+        expected_samples = old_samples + 1
+        if not math.isclose(after['non_stream_latency_ms'], expected_latency, rel_tol=0, abs_tol=0.0001):
+            failures.append('restored non_stream_latency_ms update differs: '
+                            f'{after["non_stream_latency_ms"]!r} != {expected_latency!r}')
+        if not math.isclose(after['non_stream_latency_samples'], expected_samples, rel_tol=0, abs_tol=0.0001):
+            failures.append('restored non_stream_latency_samples update differs: '
+                            f'{after["non_stream_latency_samples"]!r} != {expected_samples!r}')
+    if after['observation_seq'] <= before['observation_seq']:
+        failures.append('v2 observation sequence did not advance')
+    if after['pending_recovery'] not in (0, False):
+        failures.append('a fast success must not remain pending recovery')
     return failures
 
 
@@ -603,6 +675,10 @@ def seed_fixture(root, port, routes, priorities):
                 conn.execute('INSERT INTO abilities ("group",model,channel_id,enabled,priority,weight,tag) VALUES (\'default\',?,?,1,?,0,\'\')',
                              (model, channel, priorities[channel]))
         options = {'ModelRatio': json.dumps({name: 1 for name in REPLIES}), 'RetryTimes': '0',
+                   # These cases assert exact routes. Exploration is a deliberate
+                   # random override; disable it as a pair to keep the fixture
+                   # deterministic while still exercising the real planner.
+                   'AutoModelExploreRatio': '0', 'AutoModelExploreMaxRatio': '0',
                    'performance_setting.monitor_enabled': 'false',
                    'monitor_setting.auto_test_channel_enabled': 'false'}
         for key, value in options.items():
@@ -614,12 +690,23 @@ def model_key(model, channel):
     return ('model', 'default', model, channel)
 
 
-def channel_key(channel):
-    return ('channel', 'default', '', channel)
-
-
-def stored(key, score, observations, latency_ms, observed_at):
-    return dict(zip(SCORE_COLUMNS, (*key, score, latency_ms, observations, observed_at, 1)))
+def stored(key, success, failure, latency_ms, samples, observed_at, stream_samples=0):
+    """Build one version-2 model row; legacy columns stay neutral placeholders."""
+    observed_at = int(observed_at)
+    return {
+        'scope': key[0], 'group': key[1], 'model': key[2], 'channel_id': key[3],
+        'score': 0.5, 'latency_ms': 0, 'observations': 1,
+        'success_count': float(success), 'failure_count': float(failure),
+        'stream_latency_ms': float(latency_ms if stream_samples > 0 else 0),
+        'stream_latency_samples': float(stream_samples),
+        'stream_latency_at': observed_at if stream_samples > 0 else 0,
+        'non_stream_latency_ms': float(latency_ms if samples > 0 else 0),
+        'non_stream_latency_samples': float(samples),
+        'non_stream_latency_at': observed_at if samples > 0 else 0,
+        'pending_recovery': 0,
+        'observed_at': observed_at, 'observation_seq': 1, 'writer_id': 'fixture',
+        'version': SCORE_VERSION,
+    }
 
 
 def indexed(snapshot):
@@ -712,21 +799,18 @@ class Case:
         self.event('scores', self.row['scores'][-1])
         return snapshot
 
-    def seed_scores(self, rows, legacy_control=False):
+    def seed_scores(self, rows):
         snapshot = self.snapshot('before-score-seed')
-        if not snapshot['present'] and legacy_control:
-            self.row['stored_score_control_applied'] = False
-            return False
         require(check_scores(snapshot, []))
         columns = ','.join('"' + key + '"' for key in SCORE_COLUMNS)
+        placeholders = ','.join('?' for _ in SCORE_COLUMNS)
         with closing(sqlite3.connect(self.root / 'one-api.db')) as conn, conn:
             for row in rows:
-                conn.execute('INSERT INTO auto_model_scores (' + columns + ') VALUES (?,?,?,?,?,?,?,?,?)',
+                conn.execute('INSERT INTO auto_model_scores (' + columns + ') VALUES (' + placeholders + ')',
                              tuple(row[key] for key in SCORE_COLUMNS))
         actual = self.snapshot('seeded-scores')
         require(check_scores(actual, [score_key(row) for row in rows]))
         require([] if indexed(actual) == {score_key(row): row for row in rows} else ['score fixture seed did not round-trip'])
-        self.row['stored_score_control_applied'] = True
         return True
 
     def ask(self, token_name, route, delay=0.03):
@@ -812,10 +896,13 @@ class Case:
                 raise RuntimeError('business observation escaped independent latency measurement window')
             if distinct_latency and not (predicted[0] > sample[1] or predicted[1] < sample[0]):
                 raise RuntimeError('latency fixture cannot distinguish continuation from sample reset')
-            evidence = {'key': key, 'prior_latency_ms': previous[key]['latency_ms'],
+            evidence = {'key': key, 'prior_latency_ms': previous[key]['non_stream_latency_ms'],
+                        'prior_samples': previous[key]['non_stream_latency_samples'],
                         'prior_observed_at': previous[key]['observed_at'], 'sample_latency_ms': sample,
                         'observation_window_ns': window, 'expected_latency_ms': predicted,
-                        'actual_latency_ms': current[key]['latency_ms'], 'distinct_latency': distinct_latency}
+                        'actual_latency_ms': current[key]['non_stream_latency_ms'],
+                        'actual_samples': current[key]['non_stream_latency_samples'],
+                        'distinct_latency': distinct_latency}
             self.row.setdefault('latency_checks', []).append(evidence)
             self.event('latency-update-check', evidence)
             require(check_update(previous[key], current[key], sample_latency_ms=sample,
@@ -843,18 +930,17 @@ def case_feedback(ctx, negative_control):
     ctx.prepare()
     ctx.start('feedback-startup')
     a, b, c = model_key('score-a', 1), model_key('score-b', 1), model_key('score-c', 2)
-    one, two = channel_key(1), channel_key(2)
     response = ctx.ask('score-a', (1, 'score-a'), delay=3)
-    first = ctx.wait_scores('first-periodic-write', [a, one], [a, one], response)
-    ctx.first(first, [a, one])
+    first = ctx.wait_scores('first-periodic-write', [a], [a], response)
+    ctx.first(first, [a])
     response = ctx.ask('score-b', (1, 'score-b'), delay=3)
-    second = ctx.wait_scores('independent-sibling-model', [a, b, one], [b, one], response)
+    second = ctx.wait_scores('independent-sibling-model', [a, b], [b], response)
     ctx.first(second, [b])
-    ctx.updates(first, second, [one])
+    ctx.updates(first, second, [b])
     response = ctx.ask('score-c', (2, 'score-c'), delay=3)
-    keys = [a, b, c, one, two]
-    third = ctx.wait_scores('independent-second-channel', keys, [c, two], response)
-    ctx.first(third, [c, two])
+    keys = [a, b, c]
+    third = ctx.wait_scores('independent-second-channel', keys, [c], response)
+    ctx.first(third, [c])
     ctx.updates(second, third, [])
     ctx.idle('saved-evidence-idle-no-refresh', 6)
     stable = ctx.snapshot('confirmed-save-before-stop')
@@ -865,8 +951,8 @@ def case_feedback(ctx, negative_control):
     restored = ctx.snapshot('restored-before-business')
     require([] if restored['rows'] == stable['rows'] else ['restart changed still-fresh stored summaries'])
     response = ctx.ask('score-b', (1, 'score-b'))
-    updated = ctx.wait_scores('decisive-post-restart-update', keys, [b, one], response)
-    ctx.updates(stable, updated, [b, one], distinct_latency=True)
+    updated = ctx.wait_scores('decisive-post-restart-update', keys, [b], response)
+    ctx.updates(stable, updated, [b], distinct_latency=True)
     ctx.idle('post-reload-business-idle', 6)
     require([] if ctx.snapshot('post-reload-idle-scores')['rows'] == updated['rows']
             else ['idle recovery refreshed observed_at or changed evidence'])
@@ -875,50 +961,51 @@ def case_feedback(ctx, negative_control):
 def case_startup_ranking(ctx, negative_control):
     ctx.prepare(priorities={1: 0, 2: 0})
     at = time.time_ns() - 1000000000
-    seeds = [stored(channel_key(1), 0.97, 12, 4000, at), stored(channel_key(2), 0.05, 12, 4000, at),
-             stored(model_key('score-a', 1), 0.05, 12, 4000, at),
-             stored(model_key('score-b', 1), 0.60, 12, 4000, at),
-             stored(model_key('score-c', 2), 0.99, 12, 4000, at)]
+    seeds = [
+        # score-a is unreliable and must stay in trial despite its fast latency.
+        stored(model_key('score-a', 1), 1, 11, 900, 12, at, stream_samples=12),
+        # b and c are reliable; b is in the fast pool and c is a slower backup.
+        stored(model_key('score-b', 1), 12, 0, 4000, 12, at),
+        stored(model_key('score-c', 2), 12, 0, 6000, 12, at),
+    ]
     ctx.seed_scores(seeds)
     before = ctx.snapshot('fresh-ranking-before-start')
-    ctx.row['ranking_expectation'] = 'channel 1 beats channel 2 despite model c; model b beats a inside channel 1'
+    ctx.row['ranking_expectation'] = 'reliability admits b and c; the latency pool selects b; unreliable a remains trial'
     ctx.start('restore-before-first-http-business')
     response = ctx.ask('all', (1, 'score-b'))  # No warmup request and no cold-tie negative proof.
     updated = ctx.wait_scores('ranking-and-restored-count-update', [score_key(row) for row in seeds],
-                              [model_key('score-b', 1), channel_key(1)], response)
+                              [model_key('score-b', 1)], response)
     # A lucky cold tie cannot pass these continuation assertions if restore is ablated.
-    ctx.updates(before, updated, [model_key('score-b', 1), channel_key(1)], distinct_latency=True)
+    ctx.updates(before, updated, [model_key('score-b', 1)], distinct_latency=True)
     ctx.idle('ranking-after-business-idle', 6)
 
 
 def case_expired(ctx, negative_control):
     ctx.prepare(routes={1: ('score-a',), 2: ('score-c',)})
     at = time.time_ns() - (DECAY_WINDOW_MS + 1000) * 1000000  # 刚过衰减窗口,历史必须已经失效。
-    keys = [model_key('score-a', 1), channel_key(1), model_key('score-c', 2), channel_key(2)]
-    ctx.seed_scores([stored(key, 0.99, 19, 60000, at) for key in keys])
+    keys = [model_key('score-a', 1), model_key('score-c', 2)]
+    ctx.seed_scores([stored(key, 19, 0, 60000, 19, at) for key in keys])
     ctx.start('expired-score-restore')
     ctx.wait_scores('expired-snapshots-pruned', [])
     ctx.idle('expired-restore-idle-worker-ticks', 11)
     response = ctx.ask('score-a', (1, 'score-a'))
-    fresh_keys = [model_key('score-a', 1), channel_key(1)]
+    fresh_keys = [model_key('score-a', 1)]
     updated = ctx.wait_scores('expired-history-not-revived', fresh_keys, fresh_keys, response)
-    ctx.first(updated, fresh_keys)  # Deterministic n=1/score=.65/fresh latency, never a cold tie.
+    ctx.first(updated, fresh_keys)  # Deterministic n=1 / one non-stream sample, never a cold tie.
 
 
 def case_priority(ctx, negative_control):
     ctx.prepare(routes={1: ('score-a',), 2: ('score-c',)}, priorities={1: 100, 2: 0})
     at = time.time_ns() - 1000000000
-    seeds = [stored(key, score, 12, 10, at) for key, score in
-             ((model_key('score-a', 1), 0.01), (channel_key(1), 0.01),
-              (model_key('score-c', 2), 0.99), (channel_key(2), 0.99))]
-    enhanced = ctx.seed_scores(seeds, legacy_control=True)
+    seeds = [stored(model_key('score-a', 1), 12, 0, 10, 12, at),
+             stored(model_key('score-c', 2), 12, 0, 10, 12, at)]
+    ctx.seed_scores(seeds)
     before = ctx.snapshot('priority-before-start')
     ctx.start('priority-startup')
     response = ctx.ask('all', (1, 'score-a'))
-    if enhanced:
-        updated = ctx.wait_scores('priority-still-outranks-restored-score', [score_key(row) for row in seeds],
-                                  [model_key('score-a', 1), channel_key(1)], response)
-        ctx.updates(before, updated, [model_key('score-a', 1), channel_key(1)])
+    updated = ctx.wait_scores('priority-still-outranks-restored-evidence', [score_key(row) for row in seeds],
+                              [model_key('score-a', 1)], response)
+    ctx.updates(before, updated, [model_key('score-a', 1)])
     ctx.gateway.stop()
     ctx.start('priority-restart')
     ctx.ask('all', (1, 'score-a'))
@@ -928,20 +1015,19 @@ def case_priority(ctx, negative_control):
 def case_strict_cooldown(ctx, negative_control):
     ctx.prepare()
     at = time.time_ns() - 1000000000
-    seeds = [stored(key, score, 12, 10, at) for key, score in
-             ((model_key('score-a', 1), 0.99), (model_key('score-b', 1), 0.10),
-              (channel_key(1), 0.99), (model_key('score-c', 2), 0.90), (channel_key(2), 0.90))]
-    enhanced = ctx.seed_scores(seeds, legacy_control=True)
+    seeds = [stored(model_key('score-a', 1), 12, 0, 10, 12, at),
+             stored(model_key('score-b', 1), 12, 0, 10, 12, at),
+             stored(model_key('score-c', 2), 12, 0, 10, 12, at)]
+    ctx.seed_scores(seeds)
     before = ctx.snapshot('cooldown-before-start')
     until = int(time.time()) + 900
     original = seed_cooldowns(ctx.root, [('score-a', 1)], until)
     ctx.row['cooldowns'] = [{'label': 'one-pair-seeded', 'rows': original}]
     ctx.start('excellent-score-but-pair-cooling')
     response = ctx.ask('all', (1, 'score-b'))
-    if enhanced:
-        updated = ctx.wait_scores('sibling-allowed-cooled-pair-excluded', [score_key(row) for row in seeds],
-                                  [model_key('score-b', 1), channel_key(1)], response)
-        ctx.updates(before, updated, [model_key('score-b', 1), channel_key(1)])
+    updated = ctx.wait_scores('sibling-allowed-cooled-pair-excluded', [score_key(row) for row in seeds],
+                              [model_key('score-b', 1)], response)
+    ctx.updates(before, updated, [model_key('score-b', 1)])
     after = cooldowns(ctx.root)
     ctx.row['cooldowns'].append({'label': 'after-sibling-success', 'rows': after})
     require([] if after == original else ['sibling success changed another pair cooldown'])
@@ -964,10 +1050,9 @@ def case_strict_cooldown(ctx, negative_control):
 def case_cooldown_expiry(ctx, negative_control):
     ctx.prepare(routes={1: ('score-a',), 2: ('score-c',)})
     at = time.time_ns() - 1000000000
-    seeds = [stored(key, score, 12, 10, at) for key, score in
-             ((model_key('score-a', 1), 0.99), (channel_key(1), 0.99),
-              (model_key('score-c', 2), 0.10), (channel_key(2), 0.10))]
-    enhanced = ctx.seed_scores(seeds, legacy_control=True)
+    seeds = [stored(model_key('score-a', 1), 12, 0, 10, 12, at),
+             stored(model_key('score-c', 2), 12, 0, 10, 12, at)]
+    ctx.seed_scores(seeds)
     until = int(time.time()) + 8
     ctx.row['cooldown_until'] = until
     ctx.row['cooldowns'] = [{'label': 'short-active-pair',
@@ -980,18 +1065,16 @@ def case_cooldown_expiry(ctx, negative_control):
     require([] if time.time() > until else ['idle observation did not cross cooldown expiry'])
     ctx.row['cooldowns'].append({'label': 'expired-before-later-business', 'rows': cooldowns(ctx.root)})
     before = ctx.snapshot('expired-before-later-business')
-    if enhanced:
-        before = ctx.wait_scores('backup-periodic-write', [score_key(row) for row in seeds],
-                                 [model_key('score-c', 2), channel_key(2)], backup)
-        unchanged = indexed(before)
-        for row in seeds:
-            if row['channel_id'] == 1:
-                require([] if unchanged[score_key(row)] == row else ['idle expiry refreshed excellent stored evidence'])
+    before = ctx.wait_scores('backup-periodic-write', [score_key(row) for row in seeds],
+                             [model_key('score-c', 2)], backup)
+    unchanged = indexed(before)
+    for row in seeds:
+        if row['channel_id'] == 1:
+            require([] if unchanged[score_key(row)] == row else ['idle expiry refreshed excellent stored evidence'])
     response = ctx.ask('all', (1, 'score-a'))
-    if enhanced:
-        updated = ctx.wait_scores('later-explicit-request-reassesses-expired-pair', [score_key(row) for row in seeds],
-                                  [model_key('score-a', 1), channel_key(1)], response)
-        ctx.updates(before, updated, [model_key('score-a', 1), channel_key(1)])
+    updated = ctx.wait_scores('later-explicit-request-reassesses-expired-pair', [score_key(row) for row in seeds],
+                              [model_key('score-a', 1)], response)
+    ctx.updates(before, updated, [model_key('score-a', 1)])
     cleared = cooldowns(ctx.root)
     ctx.row['cooldowns'].append({'label': 'cleared-by-real-success', 'rows': cleared})
     require([] if cleared == [] else ['later real success failed to clear expired pair cooldown'])

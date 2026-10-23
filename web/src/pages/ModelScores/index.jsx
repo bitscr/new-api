@@ -29,26 +29,60 @@ import {
   Tag,
   Typography,
 } from '@douyinfe/semi-ui';
-import { API, isRoot, showError, showSuccess } from '../../helpers';
+import {
+  API,
+  isRoot,
+  showError,
+  showSuccess,
+  showWarning,
+} from '../../helpers';
 import { useTranslation } from 'react-i18next';
 
 const { Text } = Typography;
 
 const DEFAULT_REFRESH_SECONDS = 60;
 
-function formatScore(score) {
-  if (score === undefined || score === null || Number.isNaN(Number(score))) {
+function formatPercent(value) {
+  if (value === undefined || value === null || Number.isNaN(Number(value))) {
     return '-';
   }
-  return Number(score).toFixed(4);
+  return `${(Number(value) * 100).toFixed(1)}%`;
 }
 
-function scoreColor(score) {
-  const value = Number(score);
-  if (Number.isNaN(value)) return undefined;
-  if (value >= 0.7) return 'var(--semi-color-success)';
-  if (value <= 0.3) return 'var(--semi-color-danger)';
-  return 'var(--semi-color-warning)';
+function formatSamples(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count) || count <= 0) return '0';
+  return count >= 10 ? String(Math.round(count)) : count.toFixed(1);
+}
+
+function formatLatency(latency, samples) {
+  if (!samples || !latency) return '-';
+  return `${Math.round(Number(latency))}ms · ${formatSamples(samples)}`;
+}
+
+function formatCount(value) {
+  if (value === undefined || value === null) return '-';
+  const count = Number(value);
+  if (!Number.isFinite(count)) return '-';
+  if (count <= 0) return '0';
+  return count >= 10 ? String(Math.round(count)) : count.toFixed(1);
+}
+
+function categoryColor(category) {
+  switch (category) {
+    case 'main':
+    case 'reliable':
+      return 'green';
+    case 'backup':
+      return 'blue';
+    case 'pending_recovery':
+      return 'orange';
+    case 'cooling':
+    case 'unreliable':
+      return 'red';
+    default:
+      return 'grey';
+  }
 }
 
 function formatTime(unixSeconds) {
@@ -70,23 +104,34 @@ const ModelScores = () => {
   const [keyword, setKeyword] = useState('');
   const [group, setGroup] = useState('');
   const [channel, setChannel] = useState('');
+  const [streamMode, setStreamMode] = useState(false);
   const [pageSize, setPageSize] = useState(20);
   const [currentPage, setCurrentPage] = useState(1);
-  const [sortState, setSortState] = useState({
-    dataIndex: 'score',
-    sortOrder: 'descend',
-  });
   const [selectedRowKeys, setSelectedRowKeys] = useState([]);
   const [batchClearing, setBatchClearing] = useState(false);
   const timerRef = useRef();
+  const loadSeq = useRef(0);
+  // clear callbacks capture an old render's load closure. Read the current mode
+  // from a ref so "clear then switch mode" refreshes the new mode, and a late
+  // response for the old mode is discarded.
+  const streamModeRef = useRef(streamMode);
+  streamModeRef.current = streamMode;
 
   const load = async (showSpinner = true) => {
+    const seq = ++loadSeq.current;
+    const requestedStream = streamModeRef.current;
+    const isCurrent = () =>
+      seq === loadSeq.current && requestedStream === streamModeRef.current;
     if (showSpinner) setLoading(true);
     try {
-      const res = await API.get('/api/auto_model_scores');
+      const res = await API.get('/api/auto_model_scores', {
+        params: { stream: requestedStream ? 'true' : 'false' },
+      });
+      // 切换流式/非流式预览时，旧模式的迟到响应必须丢弃，不能覆盖新模式的表。
+      if (!isCurrent()) return;
       const { success, data, refresh_seconds, message } = res.data;
       if (!success) {
-        showError(message || t('加载模型得分失败'));
+        showError(message || t('加载路由状态失败'));
         return;
       }
       setRows(Array.isArray(data) ? data : []);
@@ -95,9 +140,9 @@ const ModelScores = () => {
         setRefreshSeconds(seconds);
       }
     } catch (error) {
-      showError(t('加载模型得分失败'));
+      if (isCurrent()) showError(t('加载路由状态失败'));
     } finally {
-      if (showSpinner) setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   };
 
@@ -117,9 +162,14 @@ const ModelScores = () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshSeconds]);
+  }, [refreshSeconds, streamMode]);
 
-  // 一键清除某个 (分组, 模型, 渠道) 组合的负面效果:得分恢复中立 0.5,冷却解除。
+  useEffect(() => {
+    load(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamMode]);
+
+  // 一键清除某个 (分组, 模型, 渠道) 组合的负面效果:清空证据并解除冷却。
   // 仅 root 可用:接口挂在 /api/option/ 的 RootAuth 路由组下。
   const clearNegative = async (record) => {
     try {
@@ -130,12 +180,17 @@ const ModelScores = () => {
           channel_id: record.channel_id,
         },
       });
-      const { success, message } = res.data;
+      const { success, message, data } = res.data;
       if (!success) {
-        showError(message || t('清除失败'));
+        if (data?.persistence_pending) {
+          showWarning(message || t('内存证据已清空，数据库写入待重试'));
+          await load(false);
+        } else {
+          showError(message || t('清除失败'));
+        }
         return;
       }
-      showSuccess(t('已恢复中立得分'));
+      showSuccess(t('证据已清空，恢复为待观察'));
       await load(false);
     } catch (error) {
       showError(t('清除失败'));
@@ -173,37 +228,12 @@ const ModelScores = () => {
   useEffect(() => {
     setCurrentPage(1);
     setSelectedRowKeys([]);
-  }, [keyword, group, channel]);
-
-  const sortedRows = useMemo(() => {
-    if (!sortState.sortOrder) return filteredRows;
-    const valueOf = (row) => {
-      switch (sortState.dataIndex) {
-        case 'score':
-          return Number(row.score) || 0;
-        case 'channel_priority':
-          return Number(row.channel_priority) || 0;
-        case 'latency_ms':
-          return Number(row.latency_ms) || 0;
-        case 'observations':
-          return Number(row.observations) || 0;
-        default:
-          return null;
-      }
-    };
-    const direction = sortState.sortOrder === 'ascend' ? 1 : -1;
-    return [...filteredRows].sort((a, b) => {
-      const left = valueOf(a);
-      const right = valueOf(b);
-      if (left === null || right === null) return 0;
-      return (left - right) * direction;
-    });
-  }, [filteredRows, sortState]);
+  }, [keyword, group, channel, streamMode]);
 
   const pageRows = useMemo(() => {
     const start = (currentPage - 1) * pageSize;
-    return sortedRows.slice(start, start + pageSize);
-  }, [sortedRows, currentPage, pageSize]);
+    return filteredRows.slice(start, start + pageSize);
+  }, [filteredRows, currentPage, pageSize]);
 
   useEffect(() => {
     const maxPage = Math.max(1, Math.ceil(filteredRows.length / pageSize));
@@ -234,6 +264,8 @@ const ModelScores = () => {
     try {
       let cleared = 0;
       let skipped = 0;
+      let pending = 0;
+      let pendingMessage = '';
       // The backend accepts up to 1000 rows; chunk anyway so a future select-all
       // over a large table cannot turn into one oversized request.
       for (let start = 0; start < selectedRecords.length; start += 200) {
@@ -246,16 +278,30 @@ const ModelScores = () => {
           items,
         });
         const { success, message, data } = res.data;
-        if (!success) {
+        const pendingCount = Number(data?.persistence_pending_count) || 0;
+        cleared += Number(data?.cleared_count) || 0;
+        skipped += Number(data?.skipped_count) || 0;
+        pending += pendingCount;
+        if (!success && pendingCount === 0) {
           showError(message || t('批量清除失败'));
           return;
         }
-        cleared += Number(data?.cleared_count) || 0;
-        skipped += Number(data?.skipped_count) || 0;
+        if (pendingCount > 0 && !pendingMessage) {
+          pendingMessage = message || '';
+        }
       }
-      showSuccess(
-        t('已清除 {{cleared}} 条，跳过 {{skipped}} 条', { cleared, skipped }),
-      );
+      if (pending > 0) {
+        showWarning(
+          pendingMessage || t('部分清除已在内存生效，数据库写入待重试'),
+        );
+      } else {
+        showSuccess(
+          t('已清除 {{cleared}} 条，跳过 {{skipped}} 条', {
+            cleared,
+            skipped,
+          }),
+        );
+      }
       setSelectedRowKeys([]);
       await load(false);
     } catch (error) {
@@ -266,84 +312,122 @@ const ModelScores = () => {
   };
 
   const columns = [
-    {
-      title: t('得分'),
-      dataIndex: 'score',
-      sorter: (a, b) => (Number(a.score) || 0) - (Number(b.score) || 0),
-      defaultSortOrder: 'descend',
-      render: (value) => (
-        <Text style={{ color: scoreColor(value), fontWeight: 600 }}>
-          {formatScore(value)}
-        </Text>
-      ),
-    },
+    { title: t('分组'), dataIndex: 'group', width: 110 },
     {
       title: t('模型'),
       dataIndex: 'model',
       render: (value) => <span className='font-medium'>{value || '-'}</span>,
     },
-    {
-      title: t('分组'),
-      dataIndex: 'group',
-    },
-    {
-      title: t('渠道'),
-      dataIndex: 'channel_id',
-      width: 90,
-    },
+    { title: t('渠道'), dataIndex: 'channel_id', width: 80 },
     {
       title: t('优先级'),
       dataIndex: 'channel_priority',
       width: 80,
-      sorter: (a, b) =>
-        (Number(a.channel_priority) || 0) - (Number(b.channel_priority) || 0),
       render: (value) =>
         value === undefined || value === null ? '-' : Number(value),
     },
     {
-      title: t('延迟(ms)'),
-      dataIndex: 'latency_ms',
-      sorter: (a, b) =>
-        (Number(a.latency_ms) || 0) - (Number(b.latency_ms) || 0),
-      render: (value) =>
-        value === undefined || value === null ? '-' : Math.round(Number(value)),
+      title: t('可靠性'),
+      dataIndex: 'reliability',
+      width: 100,
+      render: (value, record) =>
+        record.reliability_known ? (
+          <Text
+            style={{
+              color: ['main', 'backup', 'reliable'].includes(record.category)
+                ? 'var(--semi-color-success)'
+                : 'var(--semi-color-danger)',
+              fontWeight: 600,
+            }}
+          >
+            {formatPercent(value)}
+          </Text>
+        ) : (
+          '-'
+        ),
     },
     {
-      title: t('观察次数'),
+      title: t('业务样本'),
       dataIndex: 'observations',
-      sorter: (a, b) =>
-        (Number(a.observations) || 0) - (Number(b.observations) || 0),
-      render: (value) =>
-        value === undefined || value === null ? '-' : Math.round(Number(value)),
+      width: 90,
+      render: (value) => formatCount(value),
     },
     {
-      title: t('冷却'),
-      dataIndex: 'cooling',
-      render: (value, record) => {
-        if (!value) return <Tag color='grey'>{t('正常')}</Tag>;
-        const text = t('冷却 Lv.{{level}}', { level: record.cooldown_level });
-        return <Tag color='orange'>{text}</Tag>;
-      },
+      title: t('流式延迟 / 有效样本'),
+      dataIndex: 'stream_latency_ms',
+      width: 170,
+      render: (value, record) => (
+        <div>
+          <span>{formatLatency(value, record.stream_latency_samples)}</span>
+          {Number(record.stream_latency_samples) > 0 &&
+            !record.stream_latency_known && (
+              <Tag color='orange' style={{ marginLeft: 6 }}>
+                {record.stream_latency_fresh ? t('样本不足') : t('证据陈旧')}
+              </Tag>
+            )}
+        </div>
+      ),
     },
     {
-      title: t('更新时间'),
-      dataIndex: 'updated_at',
+      title: t('非流式耗时 / 有效样本'),
+      dataIndex: 'non_stream_latency_ms',
+      width: 180,
+      render: (value, record) => (
+        <div>
+          <span>{formatLatency(value, record.non_stream_latency_samples)}</span>
+          {Number(record.non_stream_latency_samples) > 0 &&
+            !record.non_stream_latency_known && (
+              <Tag color='orange' style={{ marginLeft: 6 }}>
+                {record.non_stream_latency_fresh
+                  ? t('样本不足')
+                  : t('证据陈旧')}
+              </Tag>
+            )}
+        </div>
+      ),
+    },
+    {
+      title: t('最后观测'),
+      dataIndex: 'last_observed_at',
+      width: 170,
       render: (value) => formatTime(value),
+    },
+    {
+      title: t('路由状态'),
+      dataIndex: 'category',
+      width: 180,
+      render: (value, record) => (
+        <div>
+          <Tag color={categoryColor(value)}>
+            {record.reason || value || '-'}
+          </Tag>
+          {record.pending_recovery && value !== 'pending_recovery' && (
+            <Tag color='orange' style={{ marginLeft: 6 }}>
+              {t('待恢复')}
+            </Tag>
+          )}
+          {record.cooling && (
+            <Tag color='red' style={{ marginLeft: 6 }}>
+              {t('冷却 Lv.{{level}}', { level: record.cooldown_level })}
+            </Tag>
+          )}
+        </div>
+      ),
     },
   ];
 
-  // 只有 root 能清除负面效果;普通用户看不到这一列。
   if (isRoot()) {
     columns.push({
       title: t('操作'),
       dataIndex: 'op',
+      width: 140,
       render: (_, record) => (
         <Popconfirm
-          title={t('确定清除该组合的负面效果？')}
-          content={t('得分将恢复中立 0.5,并解除冷却')}
+          title={t('确定清空该组合的业务证据？')}
+          content={t('证据将清空并恢复为待观察，不会生成成功样本')}
           onConfirm={() => clearNegative(record)}
         >
-          <Button size='small'>{t('清除负面效果')}</Button>
+          <Button size='small'>{t('清空证据')}</Button>
         </Popconfirm>
       ),
     });
@@ -359,7 +443,7 @@ const ModelScores = () => {
   return (
     <div className='mt-[60px] px-2'>
       <Card
-        title={t('模型得分排序')}
+        title={t('auto 路由状态')}
         headerExtraContent={
           <Text type='tertiary'>
             {t('每 {{seconds}} 秒自动刷新', { seconds: refreshSeconds })}
@@ -395,8 +479,21 @@ const ModelScores = () => {
             onChange={setChannel}
             placeholder={t('按渠道筛选')}
             optionList={channelOptions}
-            style={{ width: 160 }}
+            style={{ width: 150 }}
             showClear
+          />
+          <Select
+            value={streamMode ? 'stream' : 'non_stream'}
+            onChange={(value) => {
+              const next = value === 'stream';
+              streamModeRef.current = next;
+              setStreamMode(next);
+            }}
+            optionList={[
+              { value: 'non_stream', label: t('非流式预览') },
+              { value: 'stream', label: t('流式预览') },
+            ]}
+            style={{ width: 150 }}
           />
           {isRoot() && (
             <>
@@ -413,8 +510,8 @@ const ModelScores = () => {
                 {t('清空选择')}
               </Button>
               <Popconfirm
-                title={t('确定批量清除所选组合的负面效果？')}
-                content={t('共 {{count}} 条，得分将恢复中立 0.5 并解除冷却', {
+                title={t('确定清空所选组合的业务证据？')}
+                content={t('共 {{count}} 条，证据将清空并恢复为待观察', {
                   count: selectedRecords.length,
                 })}
                 onConfirm={clearSelectedNegative}
@@ -425,10 +522,10 @@ const ModelScores = () => {
                   disabled={batchClearing || selectedRecords.length === 0}
                 >
                   {selectedRecords.length > 0
-                    ? t('批量清除负面效果 ({{count}})', {
+                    ? t('批量清空证据 ({{count}})', {
                         count: selectedRecords.length,
                       })
-                    : t('批量清除负面效果')}
+                    : t('批量清空证据')}
                 </Button>
               </Popconfirm>
             </>
@@ -439,15 +536,6 @@ const ModelScores = () => {
             columns={columns}
             dataSource={filteredRows}
             rowSelection={rowSelection}
-            onChange={(changeInfo) => {
-              const sorter = changeInfo?.sorter;
-              if (sorter?.dataIndex) {
-                setSortState({
-                  dataIndex: sorter.dataIndex,
-                  sortOrder: sorter.sortOrder,
-                });
-              }
-            }}
             pagination={{
               currentPage,
               pageSize,
@@ -463,7 +551,7 @@ const ModelScores = () => {
               },
             }}
             rowKey={scoreRowKey}
-            empty={t('暂无模型得分数据')}
+            empty={t('暂无路由状态数据')}
           />
         </Spin>
         <Text
@@ -472,7 +560,7 @@ const ModelScores = () => {
           style={{ display: 'block', marginTop: 8 }}
         >
           {t(
-            '分数是含时间衰减、置信度与延迟惩罚的有效分(0.5 为中立)。auto 请求顺序 = 渠道优先级降序 → 每个优先级内按模型有效得分分档 → 档内按渠道/模型权重随机。此处列表不是实际请求顺序:授权、可用性与随机抽样都会影响每次请求的结果。',
+            '这里展示的是近期业务证据，不是模型能力排行；延迟样本与业务样本均为按衰减窗口折算后的有效值。auto 在既有授权和优先级内，先检查可靠性，再在成功延迟接近的候选池中按渠道/模型权重分流，并用少量真实业务请求补充其他候选的证据。页面不会发起上游请求，也不会占用探索或试用名额。',
           )}
         </Text>
       </Card>

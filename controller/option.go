@@ -431,20 +431,44 @@ func UpdateOption(c *gin.Context) {
 				return
 			}
 		}
-	case "AutoModelScoreBandWidth":
-		// 模型得分同档宽度是浮点数,不能走"至少 1 的整数"分支。
-		// 只拒绝负数与 NaN/Inf:0(仅同分随机)和 >= 1(同优先级全部同档)
-		// 都是合法且有意义的选择。
+	case "AutoModelExploreRatio", "AutoModelExploreMaxRatio":
+		// 两个比例相互约束，必须通过成对接口一次校验、一次保存。
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "探索比例必须成对保存（/api/option/auto_model_explore_ratios）",
+		})
+		return
+	case "AutoModelReliabilityThreshold", "AutoModelLatencyToleranceRatio":
 		parsed, parseErr := strconv.ParseFloat(strings.TrimSpace(option.Value.(string)), 64)
 		if parseErr != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "该选项必须是数字",
-			})
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": "该选项必须是数字"})
 			return
 		}
-		if message := operation_setting.ValidateAutoModelScoreBandWidth(parsed); message != "" {
-			c.JSON(http.StatusOK, gin.H{"success": false, "message": message})
+		switch option.Key {
+		case "AutoModelReliabilityThreshold":
+			if message := operation_setting.ValidateAutoModelReliabilityThreshold(parsed); message != "" {
+				c.JSON(http.StatusOK, gin.H{"success": false, "message": message})
+				return
+			}
+		case "AutoModelLatencyToleranceRatio":
+			if message := operation_setting.ValidateAutoModelLatencyToleranceRatio(parsed); message != "" {
+				c.JSON(http.StatusOK, gin.H{"success": false, "message": message})
+				return
+			}
+		}
+	case "AutoModelMinObservations", "AutoModelLatencyToleranceMs":
+		parsed, parseErr := strconv.Atoi(strings.TrimSpace(option.Value.(string)))
+		if parseErr != nil {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": "该选项必须是合法的整数"})
+			return
+		}
+		if option.Key == "AutoModelMinObservations" {
+			if message := operation_setting.ValidateAutoModelMinObservations(parsed); message != "" {
+				c.JSON(http.StatusOK, gin.H{"success": false, "message": message})
+				return
+			}
+		} else if parsed < 0 {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": "该选项必须是非负整数"})
 			return
 		}
 	case "console_setting.api_info":
@@ -503,4 +527,24 @@ func UpdateOption(c *gin.Context) {
 		"message": suggestion,
 	})
 	return
+}
+
+type autoModelExploreRatiosRequest struct {
+	Base string `json:"base"`
+	Max  string `json:"max"`
+}
+
+// UpdateAutoModelExploreRatios saves the two constrained exploration ratios as
+// one transaction and one atomic runtime publication.
+func UpdateAutoModelExploreRatios(c *gin.Context) {
+	var request autoModelExploreRatiosRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "无效的参数"})
+		return
+	}
+	if err := model.UpdateAutoModelExploreRatios(request.Base, request.Max); err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": ""})
 }

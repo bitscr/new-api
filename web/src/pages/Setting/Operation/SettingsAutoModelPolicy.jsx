@@ -64,8 +64,8 @@ const NUMERIC_LABELS = {
   AutoModelMaxAttempts: 'auto 单请求最大尝试次数',
   AutoModelCooldownMaxHours: '普通冷却封顶(小时)',
   AutoModelCooldownBaseMinutes: '普通冷却起始时间(分钟)',
-  AutoModelScoreDecayMinutes: '评分衰减窗口(分钟)',
-  AutoModelScoreRefreshSeconds: '模型得分页面刷新间隔(秒)',
+  AutoModelScoreDecayMinutes: '证据衰减窗口(分钟)',
+  AutoModelScoreRefreshSeconds: '路由状态页面刷新间隔(秒)',
 };
 
 // 判据(两份关键词表)完全以数据库里的值为准:前端不做任何预填,
@@ -245,10 +245,10 @@ export default function SettingsAutoModelPolicy(props) {
             <Col xs={24} sm={12} md={8} lg={8} xl={8}>
               <Form.InputNumber
                 field={'AutoModelScoreDecayMinutes'}
-                label={t('评分衰减窗口(分钟)')}
+                label={t('证据衰减窗口(分钟)')}
                 min={16}
                 extraText={t(
-                  '默认 360,与"普通冷却封顶"联动(封顶 6 小时 = 360 分钟)。含义:一次失败把健康分从 0.5 压到 0.35,这个扣分会在本窗口内线性爬回中立 0.5。两条硬性关系:①必须大于冷却第二档(30 分钟),否则第 2 次失败解冻时分数正好归零、惩罚作废;②不能小于封顶,否则最高几档解冻时扣分已是 0,冷却只剩"等时间"。改封顶会自动同步本值;一旦你单独填过,就以你填的为准。',
+                  '默认 360,与"普通冷却封顶"联动(封顶 6 小时 = 360 分钟)。含义:成功/失败计数和两类延迟样本按本窗口线性衰减;冷却到期时证据仍保留衰减余量,惩罚不会提前归零。延迟数值本身不随空闲下降,证据陈旧时按未知处理。两条硬性关系:①必须大于冷却第二档(30 分钟),否则第 2 次失败解冻时证据已基本归零、惩罚作废;②不能小于封顶,否则最高几档解冻时证据已经失效,冷却只剩"等时间"。改封顶会自动同步本值;一旦你单独填过,就以你填的为准。',
                 )}
                 onChange={(value) =>
                   setInputs({
@@ -261,10 +261,10 @@ export default function SettingsAutoModelPolicy(props) {
             <Col xs={24} sm={12} md={8} lg={8} xl={8}>
               <Form.InputNumber
                 field={'AutoModelScoreRefreshSeconds'}
-                label={t('模型得分页面刷新间隔(秒)')}
+                label={t('路由状态页面刷新间隔(秒)')}
                 min={1}
                 extraText={t(
-                  '默认 60。「模型得分」页面按此间隔自动刷新,登录用户顶部栏「模型得分」入口进入后生效。',
+                  '默认 60。「auto 路由状态」页面按此间隔自动刷新,登录用户顶部栏「路由状态」入口进入后生效。',
                 )}
                 onChange={(value) =>
                   setInputs({

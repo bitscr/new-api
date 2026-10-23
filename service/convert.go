@@ -620,8 +620,11 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info *relayco
 	}
 	for _, choice := range openAIResponse.Choices {
 		stopReason = stopReasonOpenAI2Claude(choice.FinishReason)
-		if choice.FinishReason == "tool_calls" {
-			for _, toolUse := range choice.Message.ParseToolCalls() {
+		if reasoning := choice.Message.GetReasoningContent(); reasoning != "" {
+			contents = append(contents, dto.ClaudeMediaMessage{Type: "thinking", Thinking: common.GetPointer(reasoning)})
+		}
+		if toolCalls := choice.Message.ParseToolCalls(); len(toolCalls) > 0 {
+			for _, toolUse := range toolCalls {
 				claudeContent := dto.ClaudeMediaMessage{}
 				claudeContent.Type = "tool_use"
 				claudeContent.Id = toolUse.ID
@@ -634,10 +637,9 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info *relayco
 				}
 				contents = append(contents, claudeContent)
 			}
-		} else {
-			claudeContent := dto.ClaudeMediaMessage{}
-			claudeContent.Type = "text"
-			claudeContent.SetText(choice.Message.StringContent())
+		} else if textContent := choice.Message.StringContent(); textContent != "" {
+			claudeContent := dto.ClaudeMediaMessage{Type: "text"}
+			claudeContent.SetText(textContent)
 			contents = append(contents, claudeContent)
 		}
 	}
@@ -868,6 +870,11 @@ func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info *relayco
 			Parts: make([]dto.GeminiPart, 0),
 		}
 
+		// 思考内容以 Gemini thought part 保留；它不是正文，但确实是模型输出。
+		if reasoning := choice.Message.GetReasoningContent(); reasoning != "" {
+			content.Parts = append(content.Parts, dto.GeminiPart{Text: reasoning, Thought: true})
+		}
+
 		// 处理工具调用
 		toolCalls := choice.Message.ParseToolCalls()
 		if len(toolCalls) > 0 {
@@ -914,7 +921,8 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 	hasContent := false
 	hasFinishReason := false
 	for _, choice := range openAIResponse.Choices {
-		if len(choice.Delta.GetContentString()) > 0 || (choice.Delta.ToolCalls != nil && len(choice.Delta.ToolCalls) > 0) {
+		if len(choice.Delta.GetContentString()) > 0 || len(choice.Delta.GetReasoningContent()) > 0 ||
+			(choice.Delta.ToolCalls != nil && len(choice.Delta.ToolCalls) > 0) {
 			hasContent = true
 		}
 		if choice.FinishReason != nil {
@@ -970,6 +978,10 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 		content := dto.GeminiChatContent{
 			Role:  "model",
 			Parts: make([]dto.GeminiPart, 0),
+		}
+
+		if reasoning := choice.Delta.GetReasoningContent(); reasoning != "" {
+			content.Parts = append(content.Parts, dto.GeminiPart{Text: reasoning, Thought: true})
 		}
 
 		// 处理工具调用

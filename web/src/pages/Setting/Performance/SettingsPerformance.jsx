@@ -559,24 +559,24 @@ export default function SettingsPerformance(props) {
                   >
                     &nbsp;
                   </Text>
-                <Popconfirm
-                  title={t('确认清理日志文件？')}
-                  content={
-                    logCleanupMode === 'by_count'
-                      ? t(
-                          '将只保留最近 {{value}} 个日志文件，其余将被删除。',
-                          { value: logCleanupValue },
-                        )
-                      : t('将删除 {{value}} 天前的日志文件。', {
-                          value: logCleanupValue,
-                        })
-                  }
-                  onConfirm={cleanupLogFiles}
-                >
-                  <Button type='danger' loading={logCleanupLoading}>
-                    {t('清理日志文件')}
-                  </Button>
-                </Popconfirm>
+                  <Popconfirm
+                    title={t('确认清理日志文件？')}
+                    content={
+                      logCleanupMode === 'by_count'
+                        ? t(
+                            '将只保留最近 {{value}} 个日志文件，其余将被删除。',
+                            { value: logCleanupValue },
+                          )
+                        : t('将删除 {{value}} 天前的日志文件。', {
+                            value: logCleanupValue,
+                          })
+                    }
+                    onConfirm={cleanupLogFiles}
+                  >
+                    <Button type='danger' loading={logCleanupLoading}>
+                      {t('清理日志文件')}
+                    </Button>
+                  </Popconfirm>
                 </div>
               </Col>
             </Row>

@@ -37,12 +37,12 @@ func TestAutoModelRouteBuilderDropsFailedModelAcrossChannels(t *testing.T) {
 		},
 	}
 
-	got := buildAutoModelRoutesFromSnapshot("g", []string{"failed", "healthy"}, snapshot, func() float64 { return 0 })
-	require.Equal(t, []AutoModelRoute{
-		{Group: "g", ModelName: "healthy", ChannelID: 1},
-		{Group: "g", ModelName: "healthy", ChannelID: 2},
-	}, got, "a model-scoped failure must remove every channel route for that model")
+	got, _ := buildAutoModelRoutesFromSnapshot("g", []string{"failed", "healthy"}, snapshot, false, func() float64 { return 0 })
+	require.Len(t, got, 2, "a model-scoped failure must remove every channel route for that model")
+	for _, route := range got {
+		require.Equal(t, "healthy", route.ModelName)
+	}
 
-	otherGroup := buildAutoModelRoutesFromSnapshot("other", []string{"failed", "healthy"}, snapshot, func() float64 { return 0 })
+	otherGroup, _ := buildAutoModelRoutesFromSnapshot("other", []string{"failed", "healthy"}, snapshot, false, func() float64 { return 0 })
 	require.Len(t, otherGroup, 4, "the exclusion must not leak into another group")
 }

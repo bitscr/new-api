@@ -212,8 +212,12 @@ func TestOaiStreamHandlerIgnoresErrorMetadata(t *testing.T) {
 			logObservationWire(t, w, usage)
 			require.Nil(t, apiErr)
 			require.Equal(t, observationSSE(body), w.Body.String())
+			// The error field is metadata, not a protocol error. The stream still
+			// delivered no answer at all, so the empty-response rule applies and
+			// must be reported for that reason rather than as an explicit error.
 			unusable, reason := info.ClientAnswerUnusable()
-			require.False(t, unusable, "metadata is not an explicit error: %s", reason)
+			require.True(t, unusable, "an empty stream is unusable: %s", reason)
+			require.NotContains(t, reason, "显式协议错误", "metadata is not an explicit error")
 		})
 	}
 }

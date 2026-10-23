@@ -1,8 +1,10 @@
 package common
 
 import (
+	"strings"
 	"testing"
 
+	basecommon "github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/require"
 )
 
@@ -106,6 +108,87 @@ func TestClientAnswerUnusable(t *testing.T) {
 			require.Equal(t, tc.unusable, unusable, "reason=%s", reason)
 		})
 	}
+}
+
+func TestNativeBannerOnlyAnswersAreUnusable(t *testing.T) {
+	cases := map[string][]string{
+		"claude": {
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"[Gateway Warn"}}`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ing: busy]"}}`,
+		},
+		"claude non-stream": {
+			`{"type":"message","content":[{"type":"text","text":"[Gateway Warning: busy]"}]}`,
+		},
+		"gemini": {
+			`data: {"candidates":[{"content":{"parts":[{"text":"[Gateway Warn"}]}}]}`,
+			`data: {"candidates":[{"content":{"parts":[{"text":"ing: busy]"}]}}]}`,
+		},
+		"responses": {
+			`data: {"type":"response.output_text.delta","item_id":"msg_1","content_index":0,"delta":"[Gateway Warn"}`,
+			`data: {"type":"response.output_text.delta","item_id":"msg_1","content_index":0,"delta":"ing: busy]"}`,
+		},
+		"responses completed": {
+			`{"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"[Gateway Warning: busy]"}]}]}}`,
+		},
+	}
+	for name, payloads := range cases {
+		t.Run(name, func(t *testing.T) {
+			info := newAnswerTestInfo()
+			for _, payload := range payloads {
+				info.ObserveClientAnswer([]byte(payload))
+			}
+			unusable, reason := info.ClientAnswerUnusable()
+			require.True(t, unusable, "banner-only native answer must be unusable: %s", reason)
+			require.Contains(t, reason, "告警横幅")
+		})
+	}
+}
+
+func TestResponsesSnapshotDoesNotDoubleCountBannerLength(t *testing.T) {
+	banner := "[Gateway Warning: " + strings.Repeat("x", 2200) + "]"
+	body := `{"type":"message","id":"msg_snap","content":[{"type":"output_text","text":` +
+		string(mustMarshalJSON(t, banner)) + `}]}`
+	completed := `{"type":"response.completed","response":{"output":[` + body + `]}}`
+	partDone := `{"type":"response.content_part.done","item_id":"msg_snap","output_index":0,"content_index":0,"part":{"type":"output_text","text":` +
+		string(mustMarshalJSON(t, banner)) + `}}`
+	itemDone := `{"type":"response.output_item.done","output_index":0,"item":` + body + `}`
+	delta := `{"type":"response.output_text.delta","item_id":"msg_snap","output_index":0,"content_index":0,"delta":` +
+		string(mustMarshalJSON(t, banner)) + `}`
+
+	info := newAnswerTestInfo()
+	for _, payload := range []string{delta, partDone, itemDone, completed} {
+		info.ObserveClientAnswer([]byte(payload))
+	}
+	unusable, reason := info.ClientAnswerUnusable()
+	require.True(t, unusable, "a 2.2KB banner followed by full snapshots is still unusable: %s", reason)
+	require.Contains(t, reason, "告警横幅")
+	require.False(t, info.answer.undecidable, "repeated full snapshots must not overflow the delta budget")
+	require.Len(t, info.answer.nativeTexts, 1, "delta and snapshot events must share one channel")
+
+	onlySnapshot := newAnswerTestInfo()
+	onlySnapshot.ObserveClientAnswer([]byte(completed))
+	unusable, reason = onlySnapshot.ClientAnswerUnusable()
+	require.True(t, unusable, "final-snapshot-only banner is unusable: %s", reason)
+	require.Contains(t, reason, "告警横幅")
+
+	overLimit := newAnswerTestInfo()
+	huge := "[Gateway Warning: " + strings.Repeat("y", answerContentLimit+100) + "]"
+	overLimit.ObserveClientAnswer([]byte(`{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_big","content":[{"type":"output_text","text":` +
+		string(mustMarshalJSON(t, huge)) + `}]}]}}`))
+	unusable, _ = overLimit.ClientAnswerUnusable()
+	require.False(t, unusable, "genuinely oversized content remains undecidable")
+
+	healthy := newAnswerTestInfo()
+	healthy.ObserveClientAnswer([]byte(`{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_ok","content":[{"type":"output_text","text":"answer"}]}]}}`))
+	unusable, reason = healthy.ClientAnswerUnusable()
+	require.False(t, unusable, "snapshot-only healthy answer must remain usable: %s", reason)
+}
+
+func mustMarshalJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	encoded, err := basecommon.Marshal(value)
+	require.NoError(t, err)
+	return encoded
 }
 
 func TestClientAnswerProtocolError(t *testing.T) {

@@ -10,8 +10,16 @@ import (
 )
 
 const (
-	AutoModelScoreVersion    = 1
+	// Version 2 separates reliability counts from stream/non-stream success
+	// latency evidence. Version 1 rows are kept for storage compatibility but are
+	// never loaded as routing evidence.
+	AutoModelScoreVersion    = 2
 	AutoModelScoreScopeModel = "model"
+	// AutoModelScoreTombstoneVersion marks an administrator clear in the same
+	// table. A tombstone is not evidence: it stores the clear time in observed_at
+	// only so every snapshot captured before the clear loses the per-key ordering
+	// guard. A real post-clear observation has a later time and replaces it.
+	AutoModelScoreTombstoneVersion = 3
 
 	// autoModelScoresTable 是物理表名:冲突条件必须显式限定"库内已存行",
 	// 不能依赖 GORM 的默认别名。
@@ -54,14 +62,27 @@ const (
 // 两列都可为空(旧行由 ALTER TABLE 增列产生,值为 NULL):读取时按零值处理,
 // SQL 比较一律经过 COALESCE,因此旧行与新行可以同表共存。
 type AutoModelScore struct {
-	Scope        string  `gorm:"type:varchar(8);primaryKey;not null"`
-	Group        string  `gorm:"type:varchar(64);primaryKey;not null"`
-	Model        string  `gorm:"type:varchar(255);primaryKey;not null"`
-	ChannelID    int     `gorm:"primaryKey;autoIncrement:false;not null"`
+	Scope     string `gorm:"type:varchar(8);primaryKey;not null"`
+	Group     string `gorm:"type:varchar(64);primaryKey;not null"`
+	Model     string `gorm:"type:varchar(255);primaryKey;not null"`
+	ChannelID int    `gorm:"primaryKey;autoIncrement:false;not null"`
+	// Legacy version-1 summary columns. Version 2 writes neutral placeholders and
+	// never reads them for routing; they remain NOT NULL for schema compatibility.
 	Score        float64 `gorm:"not null"`
 	LatencyMS    float64 `gorm:"not null"`
 	Observations float64 `gorm:"not null"`
-	ObservedAt   int64   `gorm:"not null;index;autoCreateTime:false;autoUpdateTime:false"`
+
+	// Version 2 evidence.
+	SuccessCount            float64 `gorm:"not null;default:0"`
+	FailureCount            float64 `gorm:"not null;default:0"`
+	StreamLatencyMS         float64 `gorm:"not null;default:0"`
+	StreamLatencySamples    float64 `gorm:"not null;default:0"`
+	StreamLatencyAt         int64   `gorm:"not null;default:0"`
+	NonStreamLatencyMS      float64 `gorm:"not null;default:0"`
+	NonStreamLatencySamples float64 `gorm:"not null;default:0"`
+	NonStreamLatencyAt      int64   `gorm:"not null;default:0"`
+	PendingRecovery         bool    `gorm:"not null;default:false"`
+	ObservedAt              int64   `gorm:"not null;index;autoCreateTime:false;autoUpdateTime:false"`
 	// ObservationSeq 是同一实例内该三元组的观测序号(从 1 起),同刻度时大者胜。
 	ObservationSeq int64 `gorm:"column:observation_seq;autoCreateTime:false;autoUpdateTime:false"`
 	// WriterID 是写入该快照的进程标识;序号也相同时,字典序大者胜(确定性冲突规则)。
@@ -74,7 +95,14 @@ type AutoModelScore struct {
 // 顺序对 MySQL 有意义:它的赋值从左到右求值,而守卫条件引用的正是这三列排序
 // 元数据,所以 writer_id、observation_seq 必须排在被比较的其它列之后、
 // observed_at 之前——observed_at 最后赋值,前面每一列的守卫都还能看到旧值。
-var autoModelScoreConflictFields = []string{"score", "latency_ms", "observations", "version", "writer_id", "observation_seq", "observed_at"}
+var autoModelScoreConflictFields = []string{
+	"score", "latency_ms", "observations",
+	"success_count", "failure_count",
+	"stream_latency_ms", "stream_latency_samples", "stream_latency_at",
+	"non_stream_latency_ms", "non_stream_latency_samples", "non_stream_latency_at",
+	"pending_recovery", "version",
+	"writer_id", "observation_seq", "observed_at",
+}
 
 // AutoModelScoreIsNewer reports whether candidate strictly outranks stored in
 // the snapshot ordering: real observation time first, then the per-instance
@@ -174,7 +202,7 @@ func SaveAutoModelScores(ctx context.Context, db *gorm.DB, rows []AutoModelScore
 		// to verify, so no per-row outcome is reported.
 		return nil, nil
 	}
-	if autoModelScoreSaveAcceptedAll(db, affected, len(rows)) {
+	if autoModelScoreSaveAcceptedAll(db.Dialector.Name(), affected, len(rows)) {
 		// 每一条都被数据库接纳:此刻的批量影响行数足以证明,不需要额外回读。
 		return autoModelScoreStoredOutcomes(len(rows)), nil
 	}
@@ -188,11 +216,12 @@ func SaveAutoModelScores(ctx context.Context, db *gorm.DB, rows []AutoModelScore
 // autoModelScoreSaveAcceptedAll 判断一个批次是否每一条都被接纳。
 //
 // SQLite/PostgreSQL 的 upsert 对"插入"与"真正更新"各计 1 行,被排序规则拒绝的
-// 行计 0;MySQL 对更新计 2 行、对"值没变"计 0。所以非 MySQL 用"等于行数"、
-// MySQL 用"不少于行数"作为判据,任何"可能没写进去"的批次都交给逐条回读核实。
-func autoModelScoreSaveAcceptedAll(db *gorm.DB, affected int64, rows int) bool {
-	if db.Dialector.Name() == "mysql" {
-		return affected >= int64(rows)
+// 行计 0,所以"等于行数"可以证明全部写入。MySQL 对更新计 2 行、对"值没变"计 0:
+// 两条记录里一条更新(2)、另一条被拒绝(0),总数也等于 2,因此 MySQL 的
+// RowsAffected 永远不能证明逐条成功,必须按键回读。
+func autoModelScoreSaveAcceptedAll(dialect string, affected int64, rows int) bool {
+	if dialect == "mysql" {
+		return false
 	}
 	return affected == int64(rows)
 }

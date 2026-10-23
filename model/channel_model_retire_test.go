@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/glebarez/sqlite"
@@ -22,6 +23,56 @@ func newAutoModelRetireTestDB(t *testing.T) *gorm.DB {
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 	require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}))
 	return db
+}
+
+func TestRetireChannelModelHonorsDeadlineWhileQueryBlocks(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "retire-deadline.db")), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}))
+	oldDB := DB
+	DB = db
+	t.Cleanup(func() { DB = oldDB })
+
+	require.NoError(t, db.Create(&Channel{
+		Id: 5, Key: "k", Status: common.ChannelStatusEnabled, Group: "g", Models: "a,b",
+	}).Error)
+	require.NoError(t, db.Create(&Ability{
+		Group: "g", Model: "a", ChannelId: 5, Enabled: true,
+	}).Error)
+
+	const callbackName = "test:retire_blocked_query"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table != "channels" {
+			return
+		}
+		<-tx.Statement.Context.Done()
+		tx.AddError(tx.Statement.Context.Err())
+	}))
+	removed := false
+	t.Cleanup(func() {
+		if !removed {
+			_ = db.Callback().Query().Remove(callbackName)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = RetireChannelModel(ctx, 5, "a", "确定性失败")
+	require.Error(t, err, "a blocked retire query must end at the caller's deadline")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.NoError(t, db.Callback().Query().Remove(callbackName))
+	removed = true
+
+	var channel Channel
+	require.NoError(t, db.First(&channel, "id = ?", 5).Error)
+	require.Equal(t, "a,b", channel.Models, "a timed-out retire must not commit anything")
+	var abilities []Ability
+	require.NoError(t, db.Where("channel_id = ?", 5).Find(&abilities).Error)
+	require.Len(t, abilities, 1)
+	require.Equal(t, "a", abilities[0].Model)
 }
 
 // 摘除必须是原子的:models 更新、abilities 重建、摘空后的状态变更要么全成,要么全不成。

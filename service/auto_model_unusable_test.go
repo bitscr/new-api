@@ -26,8 +26,9 @@ func TestRecordAutoModelUnusableAnswerCoolsModelOnly(t *testing.T) {
 
 	outcome, ok := autoModelHealth.Get(autoModelHealthKey(group, "banner-model", 7))
 	require.True(t, ok, "应该记下这次观测")
-	require.InDelta(t, 1, outcome.Observations, 1e-9)
-	require.Less(t, outcome.Score, 0.5, "不计成功：分数要向失败方向移动")
+	require.InDelta(t, 1, outcome.FailureCount, 1e-9)
+	require.Zero(t, outcome.SuccessCount)
+	require.True(t, outcome.PendingRecovery, "unusable answers must require real recovery evidence")
 
 	// 再犯一次：等级递增（窗口翻倍），仍然是模型级
 	RecordAutoModelUnusableAnswer(group, "banner-model", 7, "响应正文只是上游网关的告警横幅")

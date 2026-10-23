@@ -122,6 +122,30 @@ func TestRelayInfoBeginAttemptResetsAnswerObservation(t *testing.T) {
 	require.Nil(t, unobserved.answer, "do not enable observation on manually constructed relay info")
 }
 
+func TestRelayInfoDispatchTiming(t *testing.T) {
+	info := &RelayInfo{}
+	info.BeginAttempt()
+	start := info.AttemptStartTime
+	require.True(t, info.AttemptDispatchTime.IsZero())
+	info.MarkUpstreamDispatch()
+	require.False(t, info.AttemptDispatchTime.IsZero())
+	require.False(t, info.AttemptDispatchTime.Before(start))
+	dispatch := info.AttemptDispatchTime
+	info.MarkUpstreamDispatch()
+	require.Equal(t, dispatch, info.AttemptDispatchTime, "only the first dispatch timestamp is kept")
+	info.AttemptFirstValidOutputTime = dispatch.Add(1500 * time.Millisecond)
+	info.AttemptEndTime = dispatch.Add(3 * time.Second)
+	latency, ok := info.AttemptFirstValidOutputLatency()
+	require.True(t, ok)
+	require.Equal(t, 1500*time.Millisecond, latency)
+	require.Equal(t, 3*time.Second, info.AttemptDispatchElapsed())
+	require.False(t, info.AttemptElapsed() < 3*time.Second,
+		"full attempt elapsed still includes pre-dispatch work")
+
+	info.BeginAttempt()
+	require.True(t, info.AttemptDispatchTime.IsZero(), "a retry must not inherit the dispatch timestamp")
+}
+
 func TestRelayInfoBeginAttemptResetsUpstreamDispatch(t *testing.T) {
 	var missing *RelayInfo
 	missing.MarkUpstreamDispatch()

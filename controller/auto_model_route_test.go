@@ -36,7 +36,7 @@ func openAutoModelRouteControllerTestDB(t *testing.T) *gorm.DB {
 	dsn := fmt.Sprintf("file:auto_route_%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.AutoModelCooldown{}, &model.User{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.AutoModelCooldown{}, &model.AutoModelScore{}, &model.User{}))
 	model.DB, model.LOG_DB = db, db
 	model.InvalidateAutoModelRoutingTargetsCache()
 	common.UsingSQLite, common.UsingMySQL, common.UsingPostgreSQL = true, false, false

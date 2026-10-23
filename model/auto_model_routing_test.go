@@ -92,11 +92,11 @@ func TestAutoModelRoutingTargetsSnapshot(t *testing.T) {
 				queries++
 			}))
 			t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove(callbackName)) })
-		want := map[string][]AutoModelRoutingTarget{
-			"m":        {{ChannelID: 1, Priority: 7, Weight: 3}},
-			"other":    {{ChannelID: 1, Priority: 7, Weight: 3}},
-			"defaults": {{ChannelID: 4, Weight: 0}},
-		}
+			want := map[string][]AutoModelRoutingTarget{
+				"m":        {{ChannelID: 1, Priority: 7, Weight: 3}},
+				"other":    {{ChannelID: 1, Priority: 7, Weight: 3}},
+				"defaults": {{ChannelID: 4, Weight: 0}},
+			}
 			targets, err := GetAutoModelRoutingTargets("g")
 			require.NoError(t, err)
 			require.Equal(t, want, targets, "ability metadata must never override channel metadata")

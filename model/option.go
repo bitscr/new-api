@@ -1,18 +1,20 @@
 package model
 
 import (
+	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"gorm.io/gorm"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/performance_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"gorm.io/gorm"
 )
 
 type Option struct {
@@ -201,8 +203,16 @@ func InitOptionMap() {
 	common.OptionMap["AutoModelScoreRefreshSeconds"] = strconv.Itoa(operation_setting.AutoModelScoreRefreshSeconds())
 	common.OptionMap["AutoModelPermanentKeywords"] = operation_setting.AutoModelPermanentKeywordsToString()
 	common.OptionMap["AutoModelTransientKeywords"] = operation_setting.AutoModelTransientKeywordsToString()
-	common.OptionMap["AutoModelScoreBandWidth"] = strconv.FormatFloat(
-		operation_setting.AutoModelScoreBandWidth(), 'f', -1, 64)
+	common.OptionMap["AutoModelReliabilityThreshold"] = strconv.FormatFloat(
+		operation_setting.AutoModelReliabilityThreshold(), 'f', -1, 64)
+	common.OptionMap["AutoModelMinObservations"] = strconv.Itoa(operation_setting.AutoModelMinObservations())
+	common.OptionMap["AutoModelLatencyToleranceRatio"] = strconv.FormatFloat(
+		operation_setting.AutoModelLatencyToleranceRatio(), 'f', -1, 64)
+	common.OptionMap["AutoModelLatencyToleranceMs"] = strconv.FormatInt(operation_setting.AutoModelLatencyToleranceMs(), 10)
+	common.OptionMap["AutoModelExploreRatio"] = strconv.FormatFloat(
+		operation_setting.AutoModelExploreRatio(), 'f', -1, 64)
+	common.OptionMap["AutoModelExploreMaxRatio"] = strconv.FormatFloat(
+		operation_setting.AutoModelExploreMaxRatio(), 'f', -1, 64)
 	common.OptionMap["ExposeRatioEnabled"] = strconv.FormatBool(ratio_setting.IsExposeRatioEnabled())
 
 	// 自动添加所有注册的模型配置
@@ -215,124 +225,112 @@ func InitOptionMap() {
 	loadOptionsFromDatabase()
 }
 
+// The exploration ratios have three writers to coordinate: the paired API
+// save, the periodic database reload and their runtime/OptionMap publications.
+// The version is captured before a sync read and checked under the mutation
+// mutex before applying; a save that wins the race makes the sync snapshot
+// stale instead of letting it overwrite the newer pair.
+var (
+	autoModelExploreRatiosMutationMu sync.Mutex
+	autoModelExploreRatiosVersion    uint64
+)
+
+func autoModelExploreRatiosVersionSnapshot() uint64 {
+	autoModelExploreRatiosMutationMu.Lock()
+	defer autoModelExploreRatiosMutationMu.Unlock()
+	return autoModelExploreRatiosVersion
+}
+
 func loadOptionsFromDatabase() {
+	versionAtRead := autoModelExploreRatiosVersionSnapshot()
 	options, err := AllOption()
 	if err != nil {
 		common.SysLog("failed to load options from database: " + err.Error())
 		return
 	}
 	options = withEmailDomainExemptionOptions(options)
-	newBandWidth, hasNewBandWidth := "", false
-	legacyBandWidth, hasLegacyBandWidth := "", false
+	pairHandled := loadAutoModelExploreRatiosFromDatabase(options, versionAtRead)
 	for _, option := range options {
-		switch option.Key {
-		case "AutoModelScoreBandWidth":
-			newBandWidth, hasNewBandWidth = option.Value, true
-		case "AutoModelPriorityOverrideMargin":
-			legacyBandWidth, hasLegacyBandWidth = option.Value, true
+		if pairHandled[option.Key] {
+			continue
 		}
 		err := updateOptionMap(option.Key, option.Value)
 		if err != nil {
 			common.SysLog("failed to update option map: " + err.Error())
 		}
 	}
-	migrateAutoModelScoreBandWidthOption(newBandWidth, hasNewBandWidth, legacyBandWidth, hasLegacyBandWidth)
+	// The old blended-score band width and its predecessor are retired. Remove
+	// their rows so they cannot reappear through older tooling.
+	if DB != nil && commonKeyCol != "" {
+		if err := DB.Where(commonKeyCol+" IN ?", []string{
+			"AutoModelScoreBandWidth", "AutoModelPriorityOverrideMargin",
+		}).Delete(&Option{}).Error; err != nil {
+			common.SysLog("failed to remove retired auto routing options: " + err.Error())
+		}
+	}
 }
 
-// migrateAutoModelScoreBandWidthOption performs a one-time DB-row migration from
-// the legacy key AutoModelPriorityOverrideMargin to AutoModelScoreBandWidth
-// (docs/auto-routing-priority-model-bands-plan.md §7). Presence is supplied from
-// actual AllOption rows, never inferred from the in-memory default value.
-//
-//   - new key exists: keep it; drop the obsolete legacy row so the option API no
-//     longer lists it;
-//   - new key missing + legacy value valid (explicit 0 included): copy the value
-//     to the new key and delete the legacy row in one transaction;
-//   - legacy value invalid: do not copy, log the error, fall back to the normal
-//     runtime default, and drop the unsupported obsolete row;
-//   - neither present: env/default seed applies, nothing to do.
-//
-// Idempotent: later loads/syncs see the new key and no legacy row. Failures are
-// reported and never silently fall back to the old algorithm.
-func migrateAutoModelScoreBandWidthOption(newRaw string, hasNew bool, oldRaw string, hasOld bool) {
-	const newKey = "AutoModelScoreBandWidth"
-	const legacyKey = "AutoModelPriorityOverrideMargin"
-	if !hasOld {
-		return
-	}
-	if hasNew {
-		parsed, parseErr := strconv.ParseFloat(strings.TrimSpace(newRaw), 64)
-		if parseErr != nil || operation_setting.ValidateAutoModelScoreBandWidth(parsed) != "" {
-			common.SysError("invalid " + newKey + " in database; using runtime default")
-			operation_setting.SetAutoModelScoreBandWidth(0.01)
-			common.OptionMapRWMutex.Lock()
-			common.OptionMap[newKey] = "0.01"
-			common.OptionMapRWMutex.Unlock()
+// loadAutoModelExploreRatiosFromDatabase collects both exploration ratios
+// before applying either. The DB row order is not guaranteed, and applying the
+// maximum first can be rejected against the previous base (or vice versa),
+// leaving the page and runtime with different pairs.
+func loadAutoModelExploreRatiosFromDatabase(options []*Option, versionAtRead uint64) map[string]bool {
+	handled := make(map[string]bool, 2)
+	var baseRaw, maxRaw string
+	var baseFound, maxFound bool
+	for _, option := range options {
+		switch option.Key {
+		case "AutoModelExploreRatio":
+			baseRaw, baseFound = option.Value, true
+		case "AutoModelExploreMaxRatio":
+			maxRaw, maxFound = option.Value, true
 		}
-		if err := deleteLegacyAutoModelBandWidthOptionRow(legacyKey); err != nil {
-			common.SysError("failed to remove legacy " + legacyKey + " row: " + err.Error())
-			return
-		}
-		common.OptionMapRWMutex.Lock()
-		delete(common.OptionMap, legacyKey)
-		common.OptionMapRWMutex.Unlock()
-		return
 	}
+	if !baseFound && !maxFound {
+		return handled
+	}
+	if !baseFound || !maxFound {
+		// A lone value is applied against the current pair, but only if no newer
+		// paired save completed before this database snapshot is applied.
+		autoModelExploreRatiosMutationMu.Lock()
+		defer autoModelExploreRatiosMutationMu.Unlock()
+		if autoModelExploreRatiosVersion != versionAtRead {
+			handled["AutoModelExploreRatio"] = true
+			handled["AutoModelExploreMaxRatio"] = true
+			return handled
+		}
+		if baseFound {
+			handled["AutoModelExploreRatio"] = true
+			_ = updateOptionMap("AutoModelExploreRatio", baseRaw)
+		} else {
+			handled["AutoModelExploreMaxRatio"] = true
+			_ = updateOptionMap("AutoModelExploreMaxRatio", maxRaw)
+		}
+		return handled
+	}
+	handled["AutoModelExploreRatio"] = true
+	handled["AutoModelExploreMaxRatio"] = true
+	base, baseErr := strconv.ParseFloat(strings.TrimSpace(baseRaw), 64)
+	maximum, maxErr := strconv.ParseFloat(strings.TrimSpace(maxRaw), 64)
 
-	parsed, parseErr := strconv.ParseFloat(strings.TrimSpace(oldRaw), 64)
-	if parseErr != nil || operation_setting.ValidateAutoModelScoreBandWidth(parsed) != "" {
-		common.SysError("invalid legacy " + legacyKey + " value; not migrated: " + oldRaw)
-		if err := deleteLegacyAutoModelBandWidthOptionRow(legacyKey); err != nil {
-			common.SysError("failed to remove invalid legacy " + legacyKey + " row: " + err.Error())
-			return
-		}
-		common.OptionMapRWMutex.Lock()
-		delete(common.OptionMap, legacyKey)
-		common.OptionMapRWMutex.Unlock()
-		return
+	autoModelExploreRatiosMutationMu.Lock()
+	defer autoModelExploreRatiosMutationMu.Unlock()
+	if autoModelExploreRatiosVersion != versionAtRead {
+		// A paired save published newer values while this read was in flight.
+		return handled
 	}
-	value := strconv.FormatFloat(parsed, 'f', -1, 64)
-	storedValue, err := migrateReplaceLegacyBandWidthOption(newKey, legacyKey, value)
-	if err != nil {
-		common.SysError("failed to migrate " + legacyKey + " to " + newKey + ": " + err.Error())
-		return
+	if baseErr != nil || maxErr != nil {
+		common.SysLog("failed to parse stored auto model exploration ratios; keeping previous pair")
+	} else if message := operation_setting.SetAutoModelExploreRatios(base, maximum); message != "" {
+		common.SysLog("stored auto model exploration ratio pair is invalid; keeping previous pair: " + message)
 	}
-	if storedValue == "" {
-		storedValue = value
-	}
-	parsedStored, err := strconv.ParseFloat(strings.TrimSpace(storedValue), 64)
-	if err != nil || operation_setting.ValidateAutoModelScoreBandWidth(parsedStored) != "" {
-		common.SysError("migrated " + newKey + " row is invalid; using runtime default")
-		parsedStored, storedValue = 0.01, "0.01"
-	}
-	operation_setting.SetAutoModelScoreBandWidth(parsedStored)
+	// Keep the page in sync with the stored values even when the pair is invalid;
+	// the runtime deliberately keeps the last valid pair rather than applying half.
 	common.OptionMapRWMutex.Lock()
-	common.OptionMap[newKey] = storedValue
-	delete(common.OptionMap, legacyKey)
+	common.OptionMap["AutoModelExploreRatio"] = baseRaw
+	common.OptionMap["AutoModelExploreMaxRatio"] = maxRaw
 	common.OptionMapRWMutex.Unlock()
-}
-
-// migrateReplaceLegacyBandWidthOption writes the new key without overwriting a
-// concurrently-created new value (Attrs only fills a newly created row) and
-// deletes the legacy row in one transaction.
-func migrateReplaceLegacyBandWidthOption(newKey, legacyKey, value string) (string, error) {
-	var storedValue string
-	err := DB.Transaction(func(tx *gorm.DB) error {
-		option := Option{Key: newKey}
-		if err := tx.Where(commonKeyCol+" = ?", newKey).Attrs(Option{Value: value}).FirstOrCreate(&option).Error; err != nil {
-			return err
-		}
-		storedValue = option.Value
-		return tx.Where(commonKeyCol+" = ?", legacyKey).Delete(&Option{}).Error
-	})
-	return storedValue, err
-}
-
-// deleteLegacyAutoModelBandWidthOptionRow removes the obsolete legacy option row.
-func deleteLegacyAutoModelBandWidthOptionRow(legacyKey string) error {
-	return DB.Transaction(func(tx *gorm.DB) error {
-		return tx.Where(commonKeyCol+" = ?", legacyKey).Delete(&Option{}).Error
-	})
+	return handled
 }
 
 func SyncOptions(frequency int) {
@@ -359,6 +357,56 @@ func UpdateOption(key string, value string) error {
 	return updateOptionMap(key, value)
 }
 
+// UpdateAutoModelExploreRatios persists and publishes the pair atomically.
+// The two values constrain each other; writing them through independent option
+// requests can reject a valid new pair or expose a mixed old/new runtime state.
+func UpdateAutoModelExploreRatios(baseRaw, maxRaw string) error {
+	base, err := strconv.ParseFloat(strings.TrimSpace(baseRaw), 64)
+	if err != nil {
+		return errors.New("基础探索比例必须是数字")
+	}
+	maximum, err := strconv.ParseFloat(strings.TrimSpace(maxRaw), 64)
+	if err != nil {
+		return errors.New("最高探索比例必须是数字")
+	}
+	if message := operation_setting.ValidateAutoModelExploreRatios(base, maximum); message != "" {
+		return errors.New(message)
+	}
+	autoModelExploreRatiosMutationMu.Lock()
+	defer autoModelExploreRatiosMutationMu.Unlock()
+	values := []Option{
+		{Key: "AutoModelExploreRatio", Value: strconv.FormatFloat(base, 'f', -1, 64)},
+		{Key: "AutoModelExploreMaxRatio", Value: strconv.FormatFloat(maximum, 'f', -1, 64)},
+	}
+	if DB != nil {
+		if err := DB.Transaction(func(tx *gorm.DB) error {
+			for _, value := range values {
+				option := Option{Key: value.Key}
+				if err := tx.FirstOrCreate(&option, Option{Key: value.Key}).Error; err != nil {
+					return err
+				}
+				option.Value = value.Value
+				if err := tx.Save(&option).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	if message := operation_setting.SetAutoModelExploreRatios(base, maximum); message != "" {
+		return errors.New(message)
+	}
+	common.OptionMapRWMutex.Lock()
+	for _, value := range values {
+		common.OptionMap[value.Key] = value.Value
+	}
+	common.OptionMapRWMutex.Unlock()
+	autoModelExploreRatiosVersion++
+	return nil
+}
+
 // autoModelSetIntOption 解析面板提交的整数字符串再交给 setter。
 // 解析失败保持原值不动,不把 0 或负数写进运行时配置。
 func autoModelSetIntOption(value string, set func(int)) {
@@ -382,6 +430,11 @@ func autoModelSetFloatOption(value string, set func(float64)) {
 func updateOptionMap(key string, value string) (err error) {
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
+	// Retired routing keys must not reappear through the generic option API.
+	if key == "AutoModelScoreBandWidth" || key == "AutoModelPriorityOverrideMargin" {
+		delete(common.OptionMap, key)
+		return nil
+	}
 	common.OptionMap[key] = value
 
 	// 检查是否是模型配置 - 使用更规范的方式处理
@@ -734,8 +787,18 @@ func updateOptionMap(key string, value string) (err error) {
 		operation_setting.SetAutoModelPermanentKeywords(value)
 	case "AutoModelTransientKeywords":
 		operation_setting.SetAutoModelTransientKeywords(value)
-	case "AutoModelScoreBandWidth":
-		autoModelSetFloatOption(value, operation_setting.SetAutoModelScoreBandWidth)
+	case "AutoModelReliabilityThreshold":
+		autoModelSetFloatOption(value, operation_setting.SetAutoModelReliabilityThreshold)
+	case "AutoModelMinObservations":
+		autoModelSetIntOption(value, operation_setting.SetAutoModelMinObservations)
+	case "AutoModelLatencyToleranceRatio":
+		autoModelSetFloatOption(value, operation_setting.SetAutoModelLatencyToleranceRatio)
+	case "AutoModelLatencyToleranceMs":
+		autoModelSetIntOption(value, func(v int) { operation_setting.SetAutoModelLatencyToleranceMs(int64(v)) })
+	case "AutoModelExploreRatio":
+		autoModelSetFloatOption(value, operation_setting.SetAutoModelExploreRatio)
+	case "AutoModelExploreMaxRatio":
+		autoModelSetFloatOption(value, operation_setting.SetAutoModelExploreMaxRatio)
 	case "StreamCacheQueueLength":
 		setting.StreamCacheQueueLength, _ = strconv.Atoi(value)
 	case "PayMethods":

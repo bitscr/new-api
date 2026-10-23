@@ -254,6 +254,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.LastError = nil
 	// Commit only the final outcome of each (group, model, channel) in this request.
 	// A failed attempt must not consume the feedback slot of a later success.
+	// Trial slots are released by flushAutoModelFeedback after that route's
+	// observation is published; a slot must not be reusable while its feedback is
+	// still only queued and another long backup attempt is running. This safety
+	// net runs after flush (LIFO) even if publication itself panics.
+	defer releaseAllAutoModelTrialSlots(c)
 	defer flushAutoModelFeedback(c)
 
 	var autoBudget autoModelAttemptBudget
@@ -284,7 +289,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if current, ok := service.GetCurrentAutoModelRoute(c); ok {
 				markAutoModelRouteLocallyRejected(c, current)
 			}
-			// auto 计划按"渠道 priority 降序 → 模型得分分档 → 档内两级加权随机"排好;
+			// auto 计划按"渠道 priority 降序 → 可靠性准入 → 成功延迟池 → 池内两级加权随机"排好;
 			// 换路 = 对剩余候选重新规划,既不是逐个试完本渠道的剩余模型,也不是随机选渠。
 			if trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
 				continue
@@ -338,8 +343,24 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				model.ReleaseChannelDailySuccess(reservation)
 				break
 			}
+			if currentRoute, ok := service.GetCurrentAutoModelRoute(c); ok && service.IsAutoModelTrialRoute(c, currentRoute) {
+				release, acquired := service.AcquireAutoModelTrialSlot(currentRoute)
+				if !acquired {
+					model.ReleaseChannelDailySuccess(reservation)
+					markAutoModelRouteLocallyRejected(c, currentRoute)
+					newAPIError = newAutoModelRouteError("auto model trial route is busy")
+					if trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
+						continue
+					}
+					break
+				}
+				holdAutoModelTrialSlot(c, currentRoute, release)
+			}
 			if (autoBudget.attempts > 0 && !canRetryAutoModelRequest(c, relayInfo)) || !autoBudget.reserveAttempt() {
 				model.ReleaseChannelDailySuccess(reservation)
+				if currentRoute, ok := service.GetCurrentAutoModelRoute(c); ok {
+					releaseAutoModelTrialSlot(c, currentRoute)
+				}
 				break
 			}
 			markCurrentAutoModelRouteAttempted(c)
@@ -360,6 +381,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if autoRequest {
 			// 只有真正进入上游派发的尝试才占用 auto 的真实派发预算。
 			autoBudget.confirmAttempt(relayInfo.HasUpstreamDispatch())
+			if !relayInfo.HasUpstreamDispatch() {
+				// 本地拒绝/转换失败没有上游证据，试用名额立即可用；已派发的尝试
+				// 则保留名额，直到 flush 发布它的反馈。
+				if currentRoute, ok := service.GetCurrentAutoModelRoute(c); ok {
+					releaseAutoModelTrialSlot(c, currentRoute)
+				}
+			}
 		}
 
 		if newAPIError == nil {
@@ -978,11 +1006,13 @@ func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam 
 	routes, rebuildStatus := service.RebuildAutoModelRoutePlanForRetry(c, rebuildGroup, excludedRoutes)
 	switch rebuildStatus {
 	case service.AutoModelRebuildReplaced:
-		service.ReplaceAutoModelRoutePlan(c, routes)
+		service.ReplaceAutoModelRoutePlan(c, routes.Routes)
+		service.SetAutoModelRoutePlanMeta(c, routes.Meta)
 		next = 0
 	case service.AutoModelRebuildEmpty:
 		// 重排后确无候选:清空计划并结束,绝不回退旧路线。
 		service.ReplaceAutoModelRoutePlan(c, nil)
+		service.SetAutoModelRoutePlanMeta(c, service.AutoModelRoutePlanMeta{})
 		return false
 	case service.AutoModelRebuildFailed:
 		// 刷新失败:停止继续派发,让调用方保留真实最后上游错误。
@@ -1122,6 +1152,13 @@ func bindAutoModelRoute(c *gin.Context, info *relaycommon.RelayInfo, retryParam 
 	if newStorage != nil && oldStorage != nil {
 		_ = oldStorage.Close()
 	}
+	planMeta := service.GetAutoModelRoutePlanMeta(c)
+	if category := planMeta.Categories[route]; category != "" {
+		logger.LogDebug(c, "auto route: %s/%s#%d category=%s reason=%s explored=%t ratio=%.3f cold_start=%t",
+			route.Group, route.ModelName, route.ChannelID, category,
+			planMeta.Reasons[route], planMeta.Explored && planMeta.ExplorationRoute == route,
+			planMeta.ExplorationRatio, planMeta.ColdStart)
+	}
 	return nil
 }
 
@@ -1203,10 +1240,13 @@ func recordAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, succes
 	if !shouldRecordAutoHealthFeedback(c, info) {
 		return
 	}
+	latencyMS := observedAutoLatency(info, success)
 	queueAutoModelFeedback(c, info, autoModelFeedback{
-		success:   success,
-		latencyMS: observedAutoLatency(info, success),
-		elapsedMS: observedAutoModelCooldownLatency(info, success),
+		success:      success,
+		stream:       info.IsStream,
+		latencyKnown: latencyMS > 0,
+		latencyMS:    latencyMS,
+		elapsedMS:    observedAutoModelCooldownLatency(info, success),
 	})
 }
 
@@ -1226,6 +1266,7 @@ func recordAutoModelUpstreamFailure(c *gin.Context, info *relaycommon.RelayInfo,
 	elapsedMS := observedAutoModelCooldownLatency(info, false)
 	queueAutoModelFeedback(c, info, autoModelFeedback{
 		success:   false,
+		stream:    info.IsStream,
 		latencyMS: elapsedMS,
 		elapsedMS: elapsedMS,
 		permanent: service.AutoModelPermanentFailure(err),
@@ -1242,6 +1283,7 @@ func recordAutoModelStreamFailure(c *gin.Context, info *relaycommon.RelayInfo, r
 	elapsedMS := observedAutoModelCooldownLatency(info, false)
 	queueAutoModelFeedback(c, info, autoModelFeedback{
 		success:   false,
+		stream:    info.IsStream,
 		latencyMS: elapsedMS,
 		elapsedMS: elapsedMS,
 		reason:    reason,
@@ -1253,7 +1295,7 @@ func recordAutoModelUnusableAnswer(c *gin.Context, info *relaycommon.RelayInfo, 
 	if !shouldRecordAutoHealthFeedback(c, info) {
 		return
 	}
-	queueAutoModelFeedback(c, info, autoModelFeedback{unusable: true, reason: reason})
+	queueAutoModelFeedback(c, info, autoModelFeedback{stream: info.IsStream, unusable: true, reason: reason})
 }
 
 // autoModelClientAbandoned 判断"客户端在拿到本次交付物之前就离开了"。
@@ -1286,18 +1328,64 @@ type autoModelFeedbackKey struct {
 }
 
 type autoModelFeedback struct {
-	sequence  int // order of this key's last observation in the request
-	success   bool
-	latencyMS int64
-	elapsedMS int64 // cooldown signal: successful TTFB (or non-stream elapsed), failed elapsed
-	unusable  bool
-	reason    string
+	sequence     int // order of this key's last observation in the request
+	success      bool
+	stream       bool
+	latencyKnown bool
+	latencyMS    int64
+	elapsedMS    int64 // cooldown signal: successful TTFB (or non-stream elapsed), failed elapsed
+	unusable     bool
+	reason       string
+	// observedAt 在入队时固定为这次尝试的真实观测时间。flush 可能发生在后续
+	// 长请求之后,不能用 flush 时间刷新早先观测的新鲜度。
+	observedAt time.Time
 	// permanent 在入队时定格:这次失败是否命中管理员配置的确定性失败关键词。
 	// 队列是延迟 flush 的,不能等到 flush 时再读可能已被复用/覆盖的 RelayInfo。
 	permanent bool
 }
 
 const autoModelFeedbackContextKey = "auto_model_feedback_pending"
+const autoModelTrialSlotsContextKey = "auto_model_trial_slots"
+
+func holdAutoModelTrialSlot(c *gin.Context, route service.AutoModelRoute, release func()) {
+	if c == nil || release == nil {
+		return
+	}
+	value, _ := c.Get(autoModelTrialSlotsContextKey)
+	slots, _ := value.(map[service.AutoModelRoute]func())
+	if slots == nil {
+		slots = make(map[service.AutoModelRoute]func())
+	}
+	slots[route] = release
+	c.Set(autoModelTrialSlotsContextKey, slots)
+}
+
+func releaseAutoModelTrialSlot(c *gin.Context, route service.AutoModelRoute) {
+	if c == nil {
+		return
+	}
+	value, _ := c.Get(autoModelTrialSlotsContextKey)
+	slots, _ := value.(map[service.AutoModelRoute]func())
+	release, ok := slots[route]
+	if !ok {
+		return
+	}
+	delete(slots, route)
+	c.Set(autoModelTrialSlotsContextKey, slots)
+	release()
+}
+
+func releaseAllAutoModelTrialSlots(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	value, _ := c.Get(autoModelTrialSlotsContextKey)
+	slots, _ := value.(map[service.AutoModelRoute]func())
+	c.Set(autoModelTrialSlotsContextKey, nil)
+	for _, release := range slots {
+		release()
+	}
+}
 
 func queueAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, feedback autoModelFeedback) {
 	channelID := 0
@@ -1316,6 +1404,7 @@ func queueAutoModelFeedback(c *gin.Context, info *relaycommon.RelayInfo, feedbac
 	for _, previous := range pending {
 		feedback.sequence = max(feedback.sequence, previous.sequence+1)
 	}
+	feedback.observedAt = time.Now()
 	pending[key] = feedback
 	c.Set(autoModelFeedbackContextKey, pending)
 }
@@ -1346,16 +1435,25 @@ func flushAutoModelFeedback(c *gin.Context) {
 		feedback := pending[key]
 		switch {
 		case feedback.unusable:
-			service.RecordAutoModelUnusableAnswer(key.group, key.modelName, key.channelID, feedback.reason)
+			service.RecordAutoModelUnusableAnswerAt(key.group, key.modelName, key.channelID, feedback.reason, feedback.observedAt)
 		case feedback.permanent:
 			// 确定性失败:直接把这个模型从这条渠道里摘除(渠道无剩余模型时自动
 			// 禁用),没有冷却等待;仍然只挡这一个组合。
-			service.RecordAutoModelPermanentFailure(key.group, key.modelName, key.channelID, feedback.reason)
+			service.RecordAutoModelPermanentFailureAt(key.group, key.modelName, key.channelID, feedback.reason, feedback.observedAt)
 		default:
-			service.RecordAutoModelOutcomeWithReason(key.group, key.modelName, key.channelID,
-				feedback.success, feedback.latencyMS, feedback.elapsedMS, feedback.reason)
+			service.RecordAutoModelOutcomeWithModeAt(key.group, key.modelName, key.channelID,
+				feedback.success, feedback.stream, feedback.latencyKnown,
+				feedback.latencyMS, feedback.elapsedMS, feedback.reason, feedback.observedAt)
 		}
+		// The observation is now published; only now may another request use the
+		// same trial route.
+		releaseAutoModelTrialSlot(c, service.AutoModelRoute{
+			Group: key.group, ModelName: key.modelName, ChannelID: key.channelID,
+		})
 	}
+	// Slots whose attempt produced no feedback (pre-dispatch/local rejection or
+	// client abandonment) are safe to release once the request has finished.
+	releaseAllAutoModelTrialSlots(c)
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
@@ -1824,20 +1922,22 @@ func observedAutoLatency(info *relaycommon.RelayInfo, success bool) int64 {
 	if info == nil || !success {
 		return 0
 	}
-	if latency, ok := info.AttemptFirstResponseLatency(); ok {
-		// Zero is reserved for missing timing. A real sub-millisecond response
-		// must still clear an earlier cooldown on a successful attempt.
-		return max(int64(1), latency.Milliseconds())
-	}
 	if info.IsStream {
-		// Without a valid first response, generation duration is not a TTFB
-		// estimate. Do not turn a fast-starting long stream into a slow outcome.
+		// Only the first actual answer delta is a stream success-speed sample.
+		// First byte/heartbeat/metadata and a fast partial stream that later fails
+		// must not look fast.
+		if latency, ok := info.AttemptFirstValidOutputLatency(); ok {
+			return max(int64(1), latency.Milliseconds())
+		}
 		return 0
 	}
-	if info.AttemptStartTime.IsZero() || (!info.AttemptEndTime.IsZero() && info.AttemptEndTime.Before(info.AttemptStartTime)) {
+	// 非流式成功速度从真实派发开始计算，排除参数转换、图片下载与编码；
+	// 请求总耗时仍由 AttemptElapsed 供日志使用。
+	duration := info.AttemptDispatchElapsed()
+	if duration <= 0 {
 		return 0
 	}
-	return max(int64(1), observedAutoModelElapsed(info))
+	return max(int64(1), duration.Milliseconds())
 }
 
 func observedAutoModelCooldownLatency(info *relaycommon.RelayInfo, success bool) int64 {

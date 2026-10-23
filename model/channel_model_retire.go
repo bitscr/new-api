@@ -48,15 +48,32 @@ func RetireChannelModel(ctx context.Context, channelID int, modelName string, re
 	}
 	var lastErr error
 	for attempt := 0; attempt < autoModelRetireMaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return ChannelModelRetireResult{}, err
+		}
 		result, err := retireChannelModelOnce(ctx, channelID, modelName, reason)
 		if err == nil {
 			return result, nil
 		}
 		lastErr = err
+		// The driver may return its own cancellation error; surface the context
+		// reason so the caller can report the bounded budget instead of retrying.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ChannelModelRetireResult{}, ctxErr
+		}
 		if errors.Is(err, errAutoModelRetireConflict) || isAutoModelRetireBusy(err) {
 			// 有限重试 + 小退避。冲突与忙错都说明别的写入正在进行,重新读最新
-			// 状态再试;超过上限就带着明确错误返回,不假报成功。
-			time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+			// 状态再试;超过上限就带着明确错误返回,不假报成功。退避必须响应
+			// 同一个截止时间,否则五次等待会把调用方的两秒预算拖长。
+			timer := time.NewTimer(time.Duration(attempt+1) * 5 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return ChannelModelRetireResult{}, ctx.Err()
+			case <-timer.C:
+			}
 			continue
 		}
 		return ChannelModelRetireResult{}, err

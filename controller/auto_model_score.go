@@ -12,19 +12,29 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// GetAutoModelScores 返回模型得分明细(登录可见),供前台按得分排序展示。
+// GetAutoModelScores 返回 auto 路由证据与分类(登录可见),供路由状态页展示。
 // refresh_seconds 是页面自动刷新间隔,可在后台配置(单位秒)。
 func GetAutoModelScores(c *gin.Context) {
+	stream := c.Query("stream") == "true" || c.Query("mode") == "stream"
+	data, err := service.ListAutoModelScores(timeNow(), stream)
+	if err != nil {
+		common.SysError("failed to list auto model route status: " + err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "读取路由状态失败: " + err.Error(),
+		})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":         true,
 		"message":         "",
-		"data":            service.ListAutoModelScores(timeNow()),
+		"data":            data,
 		"refresh_seconds": operation_setting.AutoModelScoreRefreshSeconds(),
 	})
 }
 
 // ClearAutoModelNegativeEffects 一键清除某个 (分组, 模型, 渠道) 组合的负面效果:
-// 得分恢复中立 0.5 并解除冷却。参数不全一律拒绝,避免误清整片观测。
+// 清空业务证据并解除冷却。参数不全一律拒绝,避免误清整片观测。
 func ClearAutoModelNegativeEffects(c *gin.Context) {
 	group := strings.TrimSpace(c.Query("group"))
 	modelName := strings.TrimSpace(c.Query("model"))
@@ -43,10 +53,19 @@ func ClearAutoModelNegativeEffects(c *gin.Context) {
 		})
 		return
 	}
-	if !service.ClearAutoModelNegativeEffects(group, modelName, channelID) {
+	cleared, persistErr := service.ClearAutoModelNegativeEffects(group, modelName, channelID)
+	if !cleared {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
-			"message": "该组合暂无观测数据,本就是中立得分",
+			"message": "该组合暂无业务证据或冷却",
+		})
+		return
+	}
+	if persistErr != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "内存证据已清空，但数据库写入失败，后台会自动重试: " + persistErr.Error(),
+			"data":    gin.H{"cleared": true, "persistence_pending": true},
 		})
 		return
 	}
@@ -106,21 +125,33 @@ func ClearAutoModelNegativeEffectsBatch(c *gin.Context) {
 		items = append(items, item)
 	}
 
-	cleared, skipped := 0, 0
+	cleared, skipped, persistencePending := 0, 0, 0
 	for _, item := range items {
-		if service.ClearAutoModelNegativeEffects(item.Group, item.Model, item.ChannelID) {
-			cleared++
-		} else {
+		ok, persistErr := service.ClearAutoModelNegativeEffects(item.Group, item.Model, item.ChannelID)
+		switch {
+		case !ok:
 			skipped++
+		case persistErr != nil:
+			cleared++
+			persistencePending++
+		default:
+			cleared++
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"success": true,
 		"message": "",
 		"data": gin.H{
-			"cleared_count": cleared,
-			"skipped_count": skipped,
+			"cleared_count":             cleared,
+			"skipped_count":             skipped,
+			"persistence_pending_count": persistencePending,
 		},
-	})
+	}
+	if persistencePending > 0 {
+		// 内存证据已清空，但不是所有清除都已写入数据库；不要把它报告成完全成功。
+		response["success"] = false
+		response["message"] = "部分清除已在内存生效，但数据库写入失败，后台会自动重试"
+	}
+	c.JSON(http.StatusOK, response)
 }

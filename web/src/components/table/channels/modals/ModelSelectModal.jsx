@@ -108,6 +108,32 @@ const ModelSelectModal = ({
       .toLowerCase()
       .includes(keyword.toLowerCase()),
   );
+  const removedModels = useMemo(() => {
+    const fetchedSet = new Set(
+      (models || []).map(normalizeModelName).filter(Boolean),
+    );
+    const redirectSet = new Set(normalizedRedirectModels);
+    const seen = new Set();
+    return (selected || []).map(normalizeModelName).filter((model) => {
+      if (
+        !model ||
+        fetchedSet.has(model) ||
+        redirectSet.has(model) ||
+        seen.has(model)
+      ) {
+        return false;
+      }
+      seen.add(model);
+      return true;
+    });
+  }, [models, selected, normalizedRedirectModels]);
+  const filteredRemovedModels = useMemo(
+    () =>
+      removedModels.filter((model) =>
+        model.toLowerCase().includes(keyword.toLowerCase()),
+      ),
+    [removedModels, keyword],
+  );
 
   // 分类模型：新获取的模型和已有模型
   const isExistingModel = (model) =>
@@ -116,6 +142,7 @@ const ModelSelectModal = ({
   const existingModels = filteredModels.filter((model) =>
     isExistingModel(model),
   );
+  const hasNewModels = models.some((model) => !isExistingModel(model));
 
   // 同步外部选中值
   useEffect(() => {
@@ -124,14 +151,40 @@ const ModelSelectModal = ({
     }
   }, [visible, normalizedSelected]);
 
-  // 当模型列表变化时，设置默认tab
+  // 当模型列表变化时，设置默认tab：优先新模型，其次已移除模型，最后已有模型。
+  // 上游删除了模型时，必须先让用户看到这些模型，否则它们既无法确认也无法移除。
   useEffect(() => {
     if (visible) {
-      // 默认显示新获取模型tab，如果没有新模型则显示已有模型
-      const hasNewModels = newModels.length > 0;
-      setActiveTab(hasNewModels ? 'new' : 'existing');
+      if (hasNewModels) {
+        setActiveTab('new');
+      } else if (removedModels.length > 0) {
+        setActiveTab('removed');
+      } else {
+        setActiveTab('existing');
+      }
     }
-  }, [visible, newModels.length, selected]);
+  }, [visible, hasNewModels, removedModels.length, selected]);
+
+  // 搜索把当前 tab 过滤空时，自动落到仍有内容的 tab，避免弹窗主体空白。
+  useEffect(() => {
+    if (!visible) return;
+    if (
+      (activeTab === 'new' && newModels.length > 0) ||
+      (activeTab === 'existing' && existingModels.length > 0) ||
+      (activeTab === 'removed' && filteredRemovedModels.length > 0)
+    ) {
+      return;
+    }
+    if (newModels.length > 0) setActiveTab('new');
+    else if (existingModels.length > 0) setActiveTab('existing');
+    else if (filteredRemovedModels.length > 0) setActiveTab('removed');
+  }, [
+    visible,
+    activeTab,
+    newModels.length,
+    existingModels.length,
+    filteredRemovedModels.length,
+  ]);
 
   const handleOk = () => {
     onConfirm && onConfirm(checkedList);
@@ -178,6 +231,7 @@ const ModelSelectModal = ({
 
   const newModelsByCategory = categorizeModels(newModels);
   const existingModelsByCategory = categorizeModels(existingModels);
+  const removedModelsByCategory = categorizeModels(filteredRemovedModels);
 
   // Tab列表配置
   const tabList = [
@@ -194,6 +248,14 @@ const ModelSelectModal = ({
           {
             tab: `${t('已有的模型')} (${existingModels.length})`,
             itemKey: 'existing',
+          },
+        ]
+      : []),
+    ...(filteredRemovedModels.length > 0
+      ? [
+          {
+            tab: `${t('已移除模型')} (${filteredRemovedModels.length})`,
+            itemKey: 'removed',
           },
         ]
       : []),
@@ -343,9 +405,9 @@ const ModelSelectModal = ({
         showClear
       />
 
-      <Spin spinning={!models || models.length === 0}>
+      <Spin spinning={!Array.isArray(models)}>
         <div style={{ maxHeight: 400, overflowY: 'auto', paddingRight: 8 }}>
-          {filteredModels.length === 0 ? (
+          {filteredModels.length === 0 && filteredRemovedModels.length === 0 ? (
             <Empty
               image={
                 <IllustrationNoResult style={{ width: 150, height: 150 }} />
@@ -369,6 +431,20 @@ const ModelSelectModal = ({
                   {renderModelsByCategory(existingModelsByCategory, 'existing')}
                 </div>
               )}
+              {activeTab === 'removed' && filteredRemovedModels.length > 0 && (
+                <div>
+                  <Typography.Text
+                    type='secondary'
+                    size='small'
+                    className='block mb-2'
+                  >
+                    {t(
+                      '这些模型未出现在上游返回的列表中。取消勾选可在保存时移除；保存前仍可重新勾选。',
+                    )}
+                  </Typography.Text>
+                  {renderModelsByCategory(removedModelsByCategory, 'removed')}
+                </div>
+              )}
             </Checkbox.Group>
           )}
         </div>
@@ -382,7 +458,11 @@ const ModelSelectModal = ({
         <div className='flex items-center justify-end gap-2'>
           {(() => {
             const currentModels =
-              activeTab === 'new' ? newModels : existingModels;
+              activeTab === 'new'
+                ? newModels
+                : activeTab === 'removed'
+                  ? filteredRemovedModels
+                  : existingModels;
             const currentSelected = currentModels.filter((model) =>
               checkedList.includes(model),
             ).length;

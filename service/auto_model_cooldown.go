@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
+	"gorm.io/gorm"
 )
 
 // auto 候选冷却：把"这个 (分组, 模型, 渠道) 刚才慢或者挂了"记住一段明确的时间，
@@ -93,6 +95,11 @@ type autoModelCooldownPendingWrite struct {
 var (
 	autoModelCooldowns        = types.NewRWMap[string, autoModelCooldownState]()
 	autoModelCooldownLoadOnce sync.Once
+	// autoModelCooldownRecoveries 保存每个键最近一次“恢复正常/管理员清除”的
+	// 观测时间。冷却行删除后，这个时间屏障仍要保留，否则一个在恢复前观测、
+	// 经过长后备请求才发布的旧失败会重新冷却已经恢复的路线。
+	// 由 autoModelCooldownMutex 保护。
+	autoModelCooldownRecoveries = make(map[string]time.Time)
 	// 同一把锁覆盖内存读改写及数据库操作，避免并发升级丢失、写入/清除乱序，
 	// 以及重新载入旧快照覆盖刚收到的请求结果。锁顺序始终是本锁 → RWMap。
 	autoModelCooldownMutex sync.Mutex
@@ -101,21 +108,24 @@ var (
 // LoadAutoModelCooldowns 从数据库重新载入冷却记录，过期的顺手清库。
 // 可重复调用（测试也用它）；生产路径只缓存成功的首次载入。
 func LoadAutoModelCooldowns() {
+	db := model.DB
+	ctx, cancel := context.WithTimeout(context.Background(), autoModelScoreIOTimeout)
+	defer cancel()
 	autoModelCooldownMutex.Lock()
 	defer autoModelCooldownMutex.Unlock()
-	if loadAutoModelCooldownsLocked() {
+	if loadAutoModelCooldownsLocked(ctx, db) {
 		autoModelCooldownLoadOnce.Do(func() {})
 	}
-	flushPendingAutoModelCooldownsLocked()
+	flushPendingAutoModelCooldownsLocked(ctx, db)
 }
 
 // loadAutoModelCooldownsLocked 的调用方必须持有 autoModelCooldownMutex。
-// 失败时保留已有内存状态，且不把这次尝试当成成功初始化。
-func loadAutoModelCooldownsLocked() bool {
-	if model.DB == nil {
+// 失败或超时保留已有内存状态，且不把这次尝试当成成功初始化。
+func loadAutoModelCooldownsLocked(ctx context.Context, db *gorm.DB) bool {
+	if db == nil {
 		return false
 	}
-	rows, err := model.GetAutoModelCooldowns()
+	rows, err := model.GetAutoModelCooldownsContext(ctx, db)
 	if err != nil {
 		common.SysError("failed to load auto model cooldowns: " + err.Error())
 		return false
@@ -123,29 +133,32 @@ func loadAutoModelCooldownsLocked() bool {
 	now := time.Now()
 	loaded := make(map[string]autoModelCooldownState, len(rows))
 	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			common.SysError("failed to finish auto model cooldown load: " + err.Error())
+			return false
+		}
+		purge := func(description string, row model.AutoModelCooldown) {
+			if err := db.WithContext(ctx).Delete(&row).Error; err != nil {
+				common.SysError("failed to purge " + description + " auto model cooldown: " + err.Error())
+			}
+		}
 		if row.Model == "" {
 			// 渠道级冷却已废弃（见 applyAutoModelCooldown）：顺手清掉历史残留，
 			// 否则旧记录还会继续让 auto 整条渠道避让，把该渠道里健康的模型一起错过。
 			// 按主键删除，避免 struct Where 忽略空 Model 而误删同渠道其它模型。
-			if err := model.DB.Delete(&row).Error; err != nil {
-				common.SysError("failed to purge legacy channel-level auto model cooldown: " + err.Error())
-			}
+			purge("legacy channel-level", row)
 			continue
 		}
 		if row.Permanent {
 			// "永久级冷却"已废弃：确定性失败不再产生冷却（命中关键词的组合会被
 			// 直接摘除）。旧版本留下的 Permanent=true 记录在这里一并清掉——新代码
 			// 没有任何路径会去清除它们，不清就永远挡路。
-			if err := model.DB.Delete(&row).Error; err != nil {
-				common.SysError("failed to purge legacy permanent auto model cooldown: " + err.Error())
-			}
+			purge("legacy permanent", row)
 			continue
 		}
 		until := time.Unix(row.Until, 0)
 		if !until.After(now) {
-			if err := model.DB.Delete(&row).Error; err != nil {
-				common.SysError("failed to purge expired auto model cooldown: " + err.Error())
-			}
+			purge("expired", row)
 			continue
 		}
 		loaded[autoModelHealthKey(row.Group, row.Model, row.ChannelId)] = autoModelCooldownState{
@@ -169,30 +182,42 @@ func loadAutoModelCooldownsLocked() bool {
 }
 
 func ensureAutoModelCooldownsLoaded() {
+	db := model.DB
+	ctx, cancel := context.WithTimeout(context.Background(), autoModelScoreIOTimeout)
+	defer cancel()
 	autoModelCooldownMutex.Lock()
 	defer autoModelCooldownMutex.Unlock()
-	ensureAutoModelCooldownsLoadedLocked()
+	ensureAutoModelCooldownsLoadedLocked(ctx, db)
 }
 
-func ensureAutoModelCooldownsLoadedLocked() bool {
+func ensureAutoModelCooldownsLoadedLocked(ctx context.Context, db *gorm.DB) bool {
 	loaded := true
 	autoModelCooldownLoadOnce.Do(func() {
-		loaded = loadAutoModelCooldownsLocked()
+		loaded = loadAutoModelCooldownsLocked(ctx, db)
 	})
 	if !loaded {
 		// sync.Once 仅表示成功载入；数据库未就绪或查询失败时允许下一次重试。
 		// Do 和重置都在事务锁内，不会与其它调用并发访问 Once。
 		autoModelCooldownLoadOnce = sync.Once{}
 	}
-	flushPendingAutoModelCooldownsLocked()
+	flushPendingAutoModelCooldownsLocked(ctx, db)
 	return loaded
 }
 
 // autoModelCooldownSnapshot 返回同一时刻的独立快照，调用方不持有事务锁。
+// The first call may load or retry pending SQL; it uses one bounded budget so a
+// blocked database cannot hold the cooldown lock indefinitely.
 func autoModelCooldownSnapshot() map[string]autoModelCooldownState {
+	db := model.DB
+	ctx, cancel := context.WithTimeout(context.Background(), autoModelScoreIOTimeout)
+	defer cancel()
+	return autoModelCooldownSnapshotContext(ctx, db)
+}
+
+func autoModelCooldownSnapshotContext(ctx context.Context, db *gorm.DB) map[string]autoModelCooldownState {
 	autoModelCooldownMutex.Lock()
 	defer autoModelCooldownMutex.Unlock()
-	ensureAutoModelCooldownsLoadedLocked()
+	ensureAutoModelCooldownsLoadedLocked(ctx, db)
 	return autoModelCooldowns.ReadAll()
 }
 
@@ -233,6 +258,12 @@ func applyAutoModelCooldown(group, name string, channelID int, success bool, ela
 // 带上游错误摘要。摘要由 service.AutoModelFailureReason 生成，只包含错误码与
 // HTTP 状态；这里再做一次长度限制，避免面板与数据库出现超长原因。
 func applyAutoModelCooldownWithReason(group, name string, channelID int, success bool, elapsedMs int64, failureReason string) {
+	applyAutoModelCooldownWithReasonAt(group, name, channelID, success, elapsedMs, failureReason, time.Now())
+}
+
+// applyAutoModelCooldownWithReasonAt 使用入队时固定的观测时间。延迟发布的旧反馈
+// 不能清除或加重一条由更新观测建立的冷却。
+func applyAutoModelCooldownWithReasonAt(group, name string, channelID int, success bool, elapsedMs int64, failureReason string, observedAt time.Time) {
 	group = strings.TrimSpace(group)
 	name = strings.TrimSpace(name)
 	if group == "" || name == "" || channelID <= 0 {
@@ -241,7 +272,10 @@ func applyAutoModelCooldownWithReason(group, name string, channelID int, success
 	if success && elapsedMs <= 0 {
 		return // 成功但没有耗时数据：不动冷却
 	}
-	now := time.Now()
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+	now := observedAt
 	if success && elapsedMs <= autoModelSlowLatencyMs {
 		clearAutoModelCooldown(group, name, channelID, now)
 		return
@@ -285,21 +319,36 @@ func tripAutoModelCooldown(group, name string, channelID int, reason string, now
 	if reason == "" {
 		reason = "请求失败"
 	}
+	db := model.DB
+	ctx, cancel := context.WithTimeout(context.Background(), autoModelScoreIOTimeout)
+	defer cancel()
 	autoModelCooldownMutex.Lock()
 	defer autoModelCooldownMutex.Unlock()
-	ensureAutoModelCooldownsLoadedLocked()
+	ensureAutoModelCooldownsLoadedLocked(ctx, db)
 
 	key := autoModelHealthKey(group, name, channelID)
+	// The recovery timestamp is the ordering barrier and must be checked BEFORE
+	// discarding a pending delete: a success that cleared the cooldown is newer
+	// evidence even when its database deletion has not been confirmed yet.
+	if recoveredAt, recovered := autoModelCooldownRecoveries[key]; recovered {
+		if recoveredAt.After(now) {
+			return
+		}
+		delete(autoModelCooldownRecoveries, key)
+	}
 	prev, _ := autoModelCooldowns.Get(key)
-	if prev.pending != nil && prev.pending.delete {
-		// A successful request already reset this combination, even if its
-		// database deletion has not succeeded yet. This is a fresh failure.
+	if !prev.UpdatedAt.IsZero() && prev.UpdatedAt.After(now) {
+		return // A stale, delayed failure must not override a newer observation.
+	}
+	if (prev.pending != nil && prev.pending.delete) || prev.Until.IsZero() {
+		// A recovered combination starts a fresh ladder; keep the ordering check
+		// above intact by clearing the old level only after it.
 		prev = autoModelCooldownState{}
 	}
 	state := nextAutoModelCooldown(prev, reason, now)
 	state.pending = &autoModelCooldownPendingWrite{group: group, name: name, channelID: channelID}
 	autoModelCooldowns.Set(key, state)
-	if !persistAutoModelCooldownLocked(key, state) {
+	if err := persistAutoModelCooldownLocked(ctx, db, key, state); err != nil {
 		return
 	}
 	common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)进入冷却,%s 后再试,等级 %d,原因:%s",
@@ -317,13 +366,29 @@ func tripAutoModelCooldown(group, name string, channelID int, reason string, now
 // 摘除失败(如数据库暂不可用)只记错误日志,组合保持可选,下次再撞上同一失败
 // 会再次尝试摘除——绝不退回抖动冷却,那会让摘除动作被一个 15 分钟窗口顶掉。
 func RecordAutoModelPermanentFailure(group, name string, channelID int, reason string) {
+	RecordAutoModelPermanentFailureAt(group, name, channelID, reason, time.Now())
+}
+
+// RecordAutoModelPermanentFailureAt applies the same clear-generation guard as
+// evidence publication: a deterministic failure observed before an administrator
+// clear must not retire the route after that clear.
+func RecordAutoModelPermanentFailureAt(group, name string, channelID int, reason string, observedAt time.Time) {
 	group = strings.TrimSpace(group)
 	name = strings.TrimSpace(name)
 	reason = strings.TrimSpace(reason)
 	if group == "" || name == "" || channelID <= 0 {
 		return
 	}
-	if err := RetireAutoModelCombination(group, name, channelID, reason); err != nil {
+	key := autoModelHealthKey(group, name, channelID)
+	unlock := lockAutoModelRoute(key)
+	defer unlock()
+	if autoModelObservationCleared(key, observedAt) {
+		return
+	}
+	// Keep the route publication lock until the retirement transaction and the
+	// cooldown cleanup have committed. An administrator clear arriving after
+	// this point installs its tombstone/barrier after the retirement.
+	if err := retireAutoModelCombinationLocked(group, name, channelID, reason); err != nil {
 		common.SysError(fmt.Sprintf("auto model: retire %s(渠道 %d) failed: %s", name, channelID, err.Error()))
 	}
 }
@@ -346,7 +411,10 @@ func RecordAutoModelAbandonedAttempt(group, name string, channelID int, elapsedM
 		return
 	}
 	reason := fmt.Sprintf("客户端取消(上游 %dms 零响应)", elapsedMs)
-	tripAutoModelCooldown(group, name, channelID, reason, time.Now())
+	// A 20s+ zero-byte upstream attempt is real failure evidence: it must also
+	// mark the pair pending recovery so a cooldown expiry cannot silently make it
+	// a main-traffic candidate again.
+	recordAutoModelOutcome(group, name, channelID, false, false, false, 0, elapsedMs, false, reason, time.Now())
 }
 
 // RetireAutoModelCombination 把一个命中确定性关键词的 (分组, 模型, 渠道) 组合从
@@ -365,13 +433,30 @@ func RetireAutoModelCombination(group, name string, channelID int, reason string
 	if group == "" || name == "" || channelID <= 0 {
 		return nil
 	}
-	// model.RetireChannelModel 自带 DB 未初始化检查,这里不复述。
-	result, err := model.RetireChannelModel(context.Background(), channelID, name, reason)
+	unlock := lockAutoModelRoute(autoModelHealthKey(group, name, channelID))
+	defer unlock()
+	return retireAutoModelCombinationLocked(group, name, channelID, reason)
+}
+
+// retireAutoModelCombinationLocked must be called with the route publication
+// lock held. It deliberately keeps the score/cooldown global locks out of the
+// retirement SQL transaction.
+func retireAutoModelCombinationLocked(group, name string, channelID int, reason string) error {
+	db := model.DB
+	ctx, cancel := context.WithTimeout(context.Background(), autoModelScoreIOTimeout)
+	defer cancel()
+	// model.RetireChannelModel 自带 DB 未初始化检查,这里不复述。事务开始、查询、
+	// 更新、abilities 重建和 CAS 重试退避都受同一个截止时间约束；超时后返回，
+	// 调用方释放路线发布锁，反馈和试用名额才能继续推进。
+	result, err := model.RetireChannelModel(ctx, channelID, name, reason)
 	if err != nil {
 		return fmt.Errorf("retire %s on channel %d failed: %w", name, channelID, err)
 	}
 	// 冷却清理与成功日志放在数据库确认之后:摘除失败必须返回明确错误,不假报成功。
-	clearAutoModelCooldown(group, name, channelID, time.Now())
+	// 清理继续使用刚才的预算；若已耗尽，pending 会留给后台重试。
+	if cooldownErr := clearAutoModelCooldownWithResultContext(ctx, db, group, name, channelID, time.Now()); cooldownErr != nil {
+		common.SysLog(fmt.Sprintf("auto model: cooldown cleanup after retiring %s(渠道 %d) is pending: %s", name, channelID, cooldownErr.Error()))
+	}
 	if result.Removed {
 		common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)命中确定性失败判据,已从渠道模型列表删除(原因:%s)",
 			name, channelID, reason))
@@ -383,45 +468,96 @@ func RetireAutoModelCombination(group, name string, channelID int, reason string
 }
 
 func clearAutoModelCooldown(group, name string, channelID int, now time.Time) {
+	_ = clearAutoModelCooldownWithResult(group, name, channelID, now)
+}
+
+// clearAutoModelCooldownWithResult returns the database result of the deletion.
+// The in-memory recovery still takes effect when SQL fails; the caller may then
+// report the persistence as pending and leave the retry marker in the cache.
+func clearAutoModelCooldownWithResult(group, name string, channelID int, now time.Time) error {
+	db := model.DB
+	ctx, cancel := context.WithTimeout(context.Background(), autoModelScoreIOTimeout)
+	defer cancel()
+	return clearAutoModelCooldownWithResultContext(ctx, db, group, name, channelID, now)
+}
+
+// clearAutoModelCooldownWithResultContext lets the administrator clear share one
+// deadline (and DB handle) with the score tombstone write.
+func clearAutoModelCooldownWithResultContext(ctx context.Context, db *gorm.DB, group, name string, channelID int, now time.Time) error {
 	autoModelCooldownMutex.Lock()
 	defer autoModelCooldownMutex.Unlock()
-	loaded := ensureAutoModelCooldownsLoadedLocked()
+	loaded := ensureAutoModelCooldownsLoadedLocked(ctx, db)
 
 	key := autoModelHealthKey(group, name, channelID)
-	if _, ok := autoModelCooldowns.Get(key); !ok && loaded {
-		return
+	previous, hasPrevious := autoModelCooldowns.Get(key)
+	barrier := autoModelCooldownRecoveries[key]
+	if hasPrevious && previous.UpdatedAt.After(barrier) {
+		barrier = previous.UpdatedAt
+	}
+	if !barrier.IsZero() && now.Before(barrier) {
+		// This success is strictly older than a recovery or observation already
+		// accepted. Preserve the newer state and never move the barrier backwards.
+		// Equal timestamps keep the established test/deterministic tie semantics.
+		if barrier.After(autoModelCooldownRecoveries[key]) {
+			autoModelCooldownRecoveries[key] = barrier
+		}
+		return nil
+	}
+	if !hasPrevious {
+		if loaded {
+			// No stored cooldown to delete, but this success is still an ordering
+			// barrier: a failure observed before it must not cool the route later.
+			autoModelCooldownRecoveries[key] = now
+			return nil
+		}
+	} else if previous.pending != nil && previous.pending.delete {
+		// Keep the pending deletion but advance its ordering barrier; an older
+		// success must not replace a newer pending recovery.
+		autoModelCooldownRecoveries[key] = now
+		previous.UpdatedAt = now
+		autoModelCooldowns.Set(key, previous)
+		return persistAutoModelCooldownLocked(ctx, db, key, previous)
 	}
 	// Publish recovery immediately, but retain the deletion intent until the
 	// database confirms it. If initial loading failed, even an absent cache key
 	// may have an old stored cooldown that this successful request must clear.
+	// The recovery barrier is independent of the cooldown row lifecycle: deleting
+	// the row must not delete the evidence that this observation is newer.
+	autoModelCooldownRecoveries[key] = now
 	state := autoModelCooldownState{
 		UpdatedAt: now,
 		pending:   &autoModelCooldownPendingWrite{group: group, name: name, channelID: channelID, delete: true},
 	}
 	autoModelCooldowns.Set(key, state)
-	if !persistAutoModelCooldownLocked(key, state) {
-		return
+	if err := persistAutoModelCooldownLocked(ctx, db, key, state); err != nil {
+		return err
 	}
 	common.SysLog(fmt.Sprintf("auto model: %s（渠道 %d）恢复正常，清除冷却", name, channelID))
+	return nil
 }
 
 // persistAutoModelCooldownLocked commits one pending intent. Failures leave it
 // in the same map for later synchronous retries; callers hold the transaction lock.
-func persistAutoModelCooldownLocked(key string, state autoModelCooldownState) bool {
+func persistAutoModelCooldownLocked(ctx context.Context, db *gorm.DB, key string, state autoModelCooldownState) error {
 	pending := state.pending
 	if pending == nil {
-		return true
+		return nil
 	}
-	if model.DB == nil {
-		return false
+	if db == nil {
+		return errors.New("auto model cooldown database is not initialized")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if pending.delete {
-		if err := model.DeleteAutoModelCooldown(pending.group, pending.name, pending.channelID); err != nil {
+		if err := model.DeleteAutoModelCooldownContext(ctx, db, pending.group, pending.name, pending.channelID); err != nil {
 			common.SysError("failed to clear auto model cooldown: " + err.Error())
-			return false
+			return err
 		}
-		deleteAutoModelCooldownCache(key)
-		return true
+		// The recovery barrier lives in autoModelCooldownRecoveries; the cooldown
+		// cache key itself can be removed once the row is gone.
+		autoModelCooldowns.Delete(key)
+		return nil
 	}
 	row := &model.AutoModelCooldown{
 		Group:     pending.group,
@@ -432,31 +568,61 @@ func persistAutoModelCooldownLocked(key string, state autoModelCooldownState) bo
 		Reason:    state.Reason,
 		UpdatedAt: state.UpdatedAt.Unix(),
 	}
-	if err := model.UpsertAutoModelCooldown(row); err != nil {
+	if err := model.UpsertAutoModelCooldownContext(ctx, db, row); err != nil {
 		common.SysError("failed to save auto model cooldown: " + err.Error())
-		return false
+		return err
 	}
 	state.pending = nil
 	autoModelCooldowns.Set(key, state)
-	return true
+	return nil
 }
 
-// flushPendingAutoModelCooldownsLocked retries recovery without background jobs.
-// Pending metadata is immutable; successful writes replace the cached value.
-func flushPendingAutoModelCooldownsLocked() {
-	if model.DB == nil {
-		return
+// flushPendingAutoModelCooldownsLocked retries recovery from a synchronous read
+// path. It must use the caller's already-bounded context so loading and pending
+// writes share one deadline instead of renewing it for every stage.
+func flushPendingAutoModelCooldownsLocked(ctx context.Context, db *gorm.DB) {
+	_ = retryPendingAutoModelCooldownWritesLocked(ctx, db)
+}
+
+func retryPendingAutoModelCooldownWritesLocked(ctx context.Context, db *gorm.DB) error {
+	if db == nil {
+		return nil
 	}
+	var joined error
 	for key, state := range autoModelCooldowns.ReadAll() {
-		if state.pending != nil {
-			persistAutoModelCooldownLocked(key, state)
+		if state.pending == nil {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return errors.Join(joined, err)
+		}
+		if err := persistAutoModelCooldownLocked(ctx, db, key, state); err != nil {
+			joined = errors.Join(joined, fmt.Errorf("cooldown %s: %w", key, err))
+			if ctx.Err() != nil {
+				return joined
+			}
 		}
 	}
+	return joined
 }
 
-// deleteAutoModelCooldownCache 原子移除一条,不重建或覆盖其它组合。
-func deleteAutoModelCooldownCache(key string) {
-	autoModelCooldowns.Delete(key)
+// RetryPendingAutoModelCooldownWrites is called by the score persistence
+// worker so a failed cooldown write is retried even when no request touches the
+// affected route. It shares the worker's single deadline and stable DB handle.
+// A busy cooldown lock is skipped for this round instead of blocking the worker;
+// the pending state remains for the next tick.
+func RetryPendingAutoModelCooldownWrites(ctx context.Context, db *gorm.DB) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !autoModelCooldownMutex.TryLock() {
+		return nil
+	}
+	defer autoModelCooldownMutex.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return retryPendingAutoModelCooldownWritesLocked(ctx, db)
 }
 
 // AutoModelCooldownInfo 是给管理员看的一条当前生效的冷却。
@@ -553,18 +719,28 @@ func DeleteAutoModelCooldown(group, name string, channelID int) error {
 	if group == "" || name == "" || channelID <= 0 {
 		return fmt.Errorf("无效的冷却标识:分组/模型/渠道都必须给出")
 	}
+	key := autoModelHealthKey(group, name, channelID)
+	unlock := lockAutoModelRoute(key)
+	defer unlock()
+	db := model.DB
+	ctx, cancel := context.WithTimeout(context.Background(), autoModelScoreIOTimeout)
+	defer cancel()
 	autoModelCooldownMutex.Lock()
 	defer autoModelCooldownMutex.Unlock()
-	ensureAutoModelCooldownsLoadedLocked()
+	ensureAutoModelCooldownsLoadedLocked(ctx, db)
 
-	key := autoModelHealthKey(group, name, channelID)
 	// 先落库,成功后再撤内存:反过来的话,库写失败会让内存以为已恢复。
-	if model.DB != nil {
-		if err := model.DeleteAutoModelCooldown(group, name, channelID); err != nil {
+	if db != nil {
+		if err := model.DeleteAutoModelCooldownContext(ctx, db, group, name, channelID); err != nil {
 			return err
 		}
 	}
-	deleteAutoModelCooldownCache(key)
+	// Keep a recovery barrier for the same reason as a real success: a delayed
+	// failure observed before this manual clear must not cool the route again.
+	autoModelCooldowns.Delete(key)
+	if now := time.Now(); now.After(autoModelCooldownRecoveries[key]) {
+		autoModelCooldownRecoveries[key] = now
+	}
 	common.SysLog(fmt.Sprintf("auto model: %s(渠道 %d)的冷却被管理员手工清除", name, channelID))
 	return nil
 }

@@ -34,7 +34,8 @@ func TestAutoModelFeedbackRetrySuccessReplacesFailure(t *testing.T) {
 		recordAutoModelFeedback(c, info, false)
 	}
 	info.AttemptStartTime = start.Add(time.Minute)
-	info.AttemptFirstResponseTime = info.AttemptStartTime.Add(time.Second)
+	info.AttemptFirstResponseTime = info.AttemptStartTime.Add(500 * time.Millisecond)
+	info.AttemptFirstValidOutputTime = info.AttemptStartTime.Add(time.Second)
 	info.AttemptEndTime = info.AttemptStartTime.Add(2 * time.Minute)
 	info.IsStream = true
 	recordAutoModelFeedback(c, info, true)

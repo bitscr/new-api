@@ -77,7 +77,7 @@ var answerBannerPrefixes = []string{
 
 type answerObservation struct {
 	mu             sync.Mutex
-	parsed         bool // 见过结构可识别的完成体（带 choices）
+	parsed         bool // 见过结构可识别的完成体（OpenAI choices 或原生协议正文通道）
 	protocolError  bool // 显式上游协议错误，即使已有部分正文也不能算成功
 	textSeen       bool // 横幅之外还有正文
 	reasoningSeen  bool // 见过思考内容
@@ -89,6 +89,9 @@ type answerObservation struct {
 	// 同样会置位,供 ClientAnswerUnusable 区分"结束且为空"和"还没走到这里"。
 	exhausted bool
 	choices   []answerChoiceObservation
+	// nativeTexts 按原生协议的正文通道累积文本片段。不能逐包判断“非空文本”：
+	// 网关告警横幅完全可能被拆成多个 SSE delta，逐包都会被当成正文。
+	nativeTexts map[string]answerChoiceObservation
 }
 
 // MarkClientDeliveryBroken 记录"有一批写给客户端的字节没能完整送达"。
@@ -155,7 +158,555 @@ func (info *RelayInfo) ObserveClientAnswer(data []byte) {
 	for _, payload := range clientAnswerPayloads(data) {
 		info.ObserveUpstreamError(payload)
 		observation.observe(payload)
+		// OpenAI-shaped payloads keep the stricter banner/credit parser above;
+		// observeNativeAnswer checks for a real top-level choices key, not the
+		// literal text inside a native answer.
+		observation.observeNativeAnswer(payload)
+		if info.IsStream && observation.hasValidOutput() {
+			info.MarkFirstValidOutput()
+		}
 	}
+}
+
+func (observation *answerObservation) hasValidOutput() bool {
+	if observation == nil {
+		return false
+	}
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	return observation.textSeen || observation.reasoningSeen || observation.toolsSeen
+}
+
+// observeNativeAnswer keeps bounded per-channel text observations for native
+// Claude/Gemini/Responses frames. A non-empty delta is not enough: the gateway
+// banner may be split across several SSE packets, and each fragment looks like
+// ordinary text on its own.
+func (observation *answerObservation) observeNativeAnswer(payload []byte) {
+	if len(payload) == 0 {
+		return
+	}
+	var envelope map[string]any
+	if err := basecommon.Unmarshal(payload, &envelope); err != nil {
+		return
+	}
+	if _, openAIChoices := envelope["choices"]; openAIChoices {
+		return
+	}
+	kind, _ := envelope["type"].(string)
+	if strings.HasPrefix(kind, "response.") {
+		observation.observeResponsesEvent(kind, envelope)
+		return
+	}
+	switch kind {
+	case "content_block_delta", "content_block_start":
+		observation.observeClaudeEvent(envelope)
+		return
+	case "message":
+		observation.observeClaudeEnvelope(envelope)
+		return
+	}
+	if candidates, ok := envelope["candidates"].([]any); ok {
+		observation.observeGeminiCandidates(candidates)
+		return
+	}
+	if output, ok := envelope["output"].([]any); ok {
+		observation.observeResponsesOutput(output)
+		return
+	}
+	if content, ok := envelope["content"].([]any); ok {
+		observation.markNativeParsed()
+		observation.observeClaudeContent(content)
+	}
+}
+
+func answerKeyPart(value any) string {
+	if value == nil {
+		return "0"
+	}
+	return basecommon.Interface2String(value)
+}
+
+func (observation *answerObservation) markNativeParsed() {
+	if observation == nil {
+		return
+	}
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	observation.parsed = true
+}
+
+func (observation *answerObservation) markNativeReasoning() {
+	if observation == nil {
+		return
+	}
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	observation.parsed = true
+	observation.reasoningSeen = true
+	observation.choices = nil
+	observation.nativeTexts = nil
+}
+
+func (observation *answerObservation) markNativeTools() {
+	if observation == nil {
+		return
+	}
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	observation.parsed = true
+	observation.toolsSeen = true
+	observation.choices = nil
+	observation.nativeTexts = nil
+}
+
+func (observation *answerObservation) markNativeInline() {
+	if observation == nil {
+		return
+	}
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	observation.parsed = true
+	observation.textSeen = true
+	observation.choices = nil
+	observation.nativeTexts = nil
+}
+
+// observeNativeText applies the same prefix/banner grammar used for OpenAI
+// choices, but keyed by a protocol text channel.
+func (observation *answerObservation) observeNativeText(key, text string) {
+	if observation == nil {
+		return
+	}
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	if observation.textSeen || observation.reasoningSeen || observation.toolsSeen {
+		return
+	}
+	observation.parsed = true
+	if text == "" {
+		return
+	}
+	if observation.nativeTexts == nil {
+		observation.nativeTexts = make(map[string]answerChoiceObservation)
+	}
+	choice, exists := observation.nativeTexts[key]
+	if !exists {
+		// Only the first fragment of a channel may drop leading whitespace.
+		// Later fragments must be appended verbatim: a split banner such as
+		// "[Gateway" + " Warning: busy]" depends on its separating space.
+		text = strings.TrimLeftFunc(text, unicode.IsSpace)
+		if text == "" {
+			return
+		}
+		if len(observation.nativeTexts) >= answerChoiceLimit {
+			observation.undecidable = true
+			observation.nativeTexts = nil
+			return
+		}
+	}
+	if !choice.acceptPrefix(text) {
+		observation.textSeen = true
+		observation.choices = nil
+		observation.nativeTexts = nil
+		return
+	}
+	if len(text) > answerContentLimit-len(choice.content) {
+		observation.undecidable = true
+		observation.choices = nil
+		observation.nativeTexts = nil
+		return
+	}
+	choice.content = append(choice.content, text...)
+	if choice.prefixDone {
+		visible, banners := stripAnswerBanners(string(choice.content))
+		if banners > 0 && strings.TrimSpace(visible) != "" && !answerTextLooksLikeBannerStart(visible) {
+			observation.textSeen = true
+			observation.choices = nil
+			observation.nativeTexts = nil
+			return
+		}
+	}
+	observation.nativeTexts[key] = choice
+}
+
+// observeNativeTextSnapshot receives a complete text for one channel (part.done,
+// item.done, completed or a non-stream response). It must replace/merge the
+// channel rather than append: the standard end events repeat the same full body
+// already delivered as deltas, and appending would double-count its length.
+func (observation *answerObservation) observeNativeTextSnapshot(key, text string) {
+	if observation == nil {
+		return
+	}
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	if observation.textSeen || observation.reasoningSeen || observation.toolsSeen {
+		return
+	}
+	observation.parsed = true
+	if text == "" {
+		return
+	}
+	if observation.nativeTexts == nil {
+		observation.nativeTexts = make(map[string]answerChoiceObservation)
+	}
+	existing, exists := observation.nativeTexts[key]
+	if !exists && len(observation.nativeTexts) >= answerChoiceLimit {
+		observation.undecidable = true
+		observation.nativeTexts = nil
+		return
+	}
+	merged := text
+	if exists && len(existing.content) > 0 {
+		current := string(existing.content)
+		switch {
+		case strings.HasPrefix(text, current):
+			merged = text // snapshot extends the deltas
+		case strings.HasPrefix(current, text):
+			merged = current // deltas already contain the snapshot
+		case len(current) > len(text):
+			merged = current // never shrink a more complete channel
+		}
+	}
+	if len(merged) > answerContentLimit {
+		observation.undecidable = true
+		observation.nativeTexts = nil
+		return
+	}
+	visible, banners := stripAnswerBanners(merged)
+	if banners > 0 && strings.TrimSpace(visible) != "" && !answerTextLooksLikeBannerStart(visible) {
+		observation.textSeen = true
+		observation.choices = nil
+		observation.nativeTexts = nil
+		return
+	}
+	if banners == 0 && strings.TrimSpace(visible) != "" && !answerTextLooksLikeBannerStart(visible) {
+		observation.textSeen = true
+		observation.choices = nil
+		observation.nativeTexts = nil
+		return
+	}
+	observation.nativeTexts[key] = answerChoiceObservation{
+		content:    []byte(merged),
+		prefixDone: true,
+	}
+}
+
+// --- Claude ---
+
+func (observation *answerObservation) observeClaudeEvent(event map[string]any) {
+	index := answerKeyPart(event["index"])
+	if delta, ok := event["delta"].(map[string]any); ok {
+		switch kind, _ := delta["type"].(string); kind {
+		case "text_delta":
+			text := stringValue(delta["text"])
+			if text == "" {
+				observation.markNativeParsed()
+			} else {
+				observation.observeNativeText("claude:"+index, text)
+			}
+		case "thinking_delta":
+			if strings.TrimSpace(stringValue(delta["thinking"])) != "" {
+				observation.markNativeReasoning()
+			}
+		case "input_json_delta":
+			if strings.TrimSpace(stringValue(delta["partial_json"])) != "" {
+				observation.markNativeTools()
+			}
+		}
+	}
+	if block, ok := event["content_block"].(map[string]any); ok {
+		observation.observeClaudeBlock(block, index)
+	}
+}
+
+func (observation *answerObservation) observeClaudeEnvelope(event map[string]any) {
+	if message, ok := event["message"].(map[string]any); ok {
+		if content, ok := message["content"].([]any); ok {
+			observation.markNativeParsed()
+			observation.observeClaudeContent(content)
+			return
+		}
+	}
+	if content, ok := event["content"].([]any); ok {
+		observation.markNativeParsed()
+		observation.observeClaudeContent(content)
+	}
+}
+
+func (observation *answerObservation) observeClaudeContent(content []any) {
+	for index, raw := range content {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		observation.observeClaudeBlock(block, answerKeyPart(index))
+	}
+}
+
+func (observation *answerObservation) observeClaudeBlock(block map[string]any, key string) {
+	switch kind, _ := block["type"].(string); kind {
+	case "text":
+		text := stringValue(block["text"])
+		if text == "" {
+			observation.markNativeParsed()
+		} else {
+			observation.observeNativeText("claude:"+key, text)
+		}
+	case "thinking":
+		if strings.TrimSpace(stringValue(block["thinking"])) != "" {
+			observation.markNativeReasoning()
+		}
+	case "redacted_thinking":
+		if strings.TrimSpace(stringValue(block["data"])) != "" {
+			observation.markNativeReasoning()
+		}
+	case "tool_use", "server_tool_use":
+		if strings.TrimSpace(stringValue(block["name"])) != "" {
+			observation.markNativeTools()
+		} else {
+			observation.markNativeParsed()
+		}
+	}
+}
+
+// --- Gemini ---
+
+func (observation *answerObservation) observeGeminiCandidates(candidates []any) {
+	for candidateIndex, raw := range candidates {
+		candidate, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		observation.markNativeParsed()
+		content, ok := candidate["content"].(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, ok := content["parts"].([]any)
+		if !ok {
+			continue
+		}
+		for partIndex, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text, ok := part["text"].(string); ok {
+				if text == "" {
+					continue
+				}
+				if thought, _ := part["thought"].(bool); thought {
+					observation.markNativeReasoning()
+				} else {
+					observation.observeNativeText("gemini:"+answerKeyPart(candidateIndex)+":"+answerKeyPart(partIndex), text)
+				}
+				continue
+			}
+			if call, ok := part["functionCall"].(map[string]any); ok {
+				if strings.TrimSpace(stringValue(call["name"])) != "" {
+					observation.markNativeTools()
+				} else {
+					observation.markNativeParsed()
+				}
+				continue
+			}
+			if inline, ok := part["inlineData"].(map[string]any); ok && strings.TrimSpace(stringValue(inline["data"])) != "" {
+				observation.markNativeInline()
+				continue
+			}
+			if file, ok := part["fileData"].(map[string]any); ok && strings.TrimSpace(stringValue(file["fileUri"])) != "" {
+				observation.markNativeInline()
+			}
+		}
+	}
+}
+
+// --- OpenAI Responses ---
+
+func responsesItemKey(event map[string]any) string {
+	// output_index is present on delta, content-part and item events and is the
+	// canonical identity. item_id/item.id are only fallbacks for synthetic data.
+	if index, ok := event["output_index"]; ok && index != nil {
+		return answerKeyPart(index)
+	}
+	if itemID := stringValue(event["item_id"]); itemID != "" {
+		return itemID
+	}
+	return "0"
+}
+
+func responsesItemMapKey(item map[string]any, outputIndex any) string {
+	if outputIndex != nil {
+		return answerKeyPart(outputIndex)
+	}
+	if itemID := stringValue(item["id"]); itemID != "" {
+		return itemID
+	}
+	return "0"
+}
+
+func (observation *answerObservation) observeResponsesEvent(kind string, event map[string]any) {
+	switch kind {
+	case "response.output_text.delta":
+		delta := stringValue(event["delta"])
+		if delta == "" {
+			observation.markNativeParsed()
+			return
+		}
+		key := "responses:" + responsesItemKey(event) + ":" + answerKeyPart(event["content_index"])
+		observation.observeNativeText(key, delta)
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		if strings.TrimSpace(stringValue(event["delta"])) != "" {
+			observation.markNativeReasoning()
+		}
+	case "response.function_call_arguments.delta":
+		if strings.TrimSpace(stringValue(event["delta"])) != "" {
+			observation.markNativeTools()
+		} else {
+			observation.markNativeParsed()
+		}
+	case "response.output_item.added", "response.output_item.done":
+		if item, ok := event["item"].(map[string]any); ok {
+			// The added event is usually empty and the done event repeats the full
+			// item; both are snapshot entries, never additional deltas.
+			observation.observeResponsesItem(item, event["output_index"])
+		}
+	case "response.content_part.added", "response.content_part.done":
+		if part, ok := event["part"].(map[string]any); ok {
+			key := "responses:" + responsesItemKey(event) + ":" + answerKeyPart(event["content_index"])
+			observation.observeResponsesPart(part, key, true)
+		}
+	case "response.completed":
+		observation.markNativeParsed()
+		if response, ok := event["response"].(map[string]any); ok {
+			if output, ok := response["output"].([]any); ok {
+				observation.observeResponsesOutput(output)
+			}
+		}
+	}
+}
+
+func (observation *answerObservation) observeResponsesOutput(output []any) {
+	observation.markNativeParsed()
+	for index, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		observation.observeResponsesItem(item, index)
+	}
+}
+
+func (observation *answerObservation) observeResponsesItem(item map[string]any, outputIndex any) {
+	outputKey := responsesItemMapKey(item, outputIndex)
+	switch kind, _ := item["type"].(string); kind {
+	case "message":
+		observation.markNativeParsed()
+		content, ok := item["content"].([]any)
+		if !ok {
+			return
+		}
+		for index, rawPart := range content {
+			part, ok := rawPart.(map[string]any)
+			if !ok {
+				continue
+			}
+			key := "responses:" + outputKey + ":" + answerKeyPart(index)
+			observation.observeResponsesPart(part, key, true)
+		}
+	case "function_call":
+		if strings.TrimSpace(stringValue(item["name"])) != "" {
+			observation.markNativeTools()
+		} else {
+			observation.markNativeParsed()
+		}
+	case "reasoning":
+		observation.markNativeParsed()
+		for _, field := range []string{"summary", "content"} {
+			parts, ok := item[field].([]any)
+			if !ok {
+				continue
+			}
+			for _, rawPart := range parts {
+				part, ok := rawPart.(map[string]any)
+				if ok && answerTextNonEmpty(stringValue(part["text"])) {
+					observation.markNativeReasoning()
+					return
+				}
+			}
+		}
+	}
+}
+
+func (observation *answerObservation) observeResponsesPart(part map[string]any, key string, snapshot bool) {
+	switch kind, _ := part["type"].(string); kind {
+	case "output_text":
+		text := stringValue(part["text"])
+		if text == "" {
+			observation.markNativeParsed()
+			return
+		}
+		if snapshot {
+			observation.observeNativeTextSnapshot(key, text)
+		} else {
+			observation.observeNativeText(key, text)
+		}
+	case "refusal":
+		refusal := stringValue(part["refusal"])
+		if refusal == "" {
+			observation.markNativeParsed()
+			return
+		}
+		if snapshot {
+			observation.observeNativeTextSnapshot(key, refusal)
+		} else {
+			observation.observeNativeText(key, refusal)
+		}
+	case "reasoning_text":
+		if strings.TrimSpace(stringValue(part["text"])) != "" {
+			observation.markNativeReasoning()
+		}
+	}
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
+}
+
+func answerTextNonEmpty(text string) bool {
+	visible, _ := stripAnswerBanners(text)
+	return strings.TrimSpace(visible) != ""
+}
+
+// answerTextLooksLikeBannerStart reports whether the remaining text could still
+// be the beginning of a gateway banner (including a second banner or a partial
+// label). Such text is not enough to credit a first valid output.
+func answerTextLooksLikeBannerStart(text string) bool {
+	trimmed := strings.TrimLeftFunc(text, unicode.IsSpace)
+	if trimmed == "" {
+		return true
+	}
+	lower := strings.ToLower(trimmed)
+	keywords := []string{"gateway", "warning", "warn", "notice", "alert", "upstream", "网关", "告警", "警告"}
+	if strings.HasPrefix(lower, "[") || strings.HasPrefix(lower, "【") {
+		rest := strings.TrimLeftFunc(lower[1:], unicode.IsSpace)
+		if rest == "" {
+			return true
+		}
+		for _, keyword := range keywords {
+			if strings.HasPrefix(rest, keyword) || strings.HasPrefix(keyword, rest) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, keyword := range []string{"warn", "gateway warn", "gateway warning"} {
+		if strings.HasPrefix(lower, keyword) || strings.HasPrefix(keyword, lower) {
+			return true
+		}
+	}
+	return false
 }
 
 // MarkUpstreamProtocolError 标记"上游在流里明确报了失败"。
@@ -257,7 +808,7 @@ func (info *RelayInfo) ClientAnswerUnusable() (bool, string) {
 	// (EOF/DONE)且无软错误时标记;client_gone/timeout/scanner_error 各有专门路径。
 	if observation.exhausted && !observation.undecidable &&
 		!observation.textSeen && !observation.reasoningSeen && !observation.toolsSeen &&
-		len(observation.choices) == 0 {
+		len(observation.choices) == 0 && len(observation.nativeTexts) == 0 {
 		return true, "200 但上游未返回任何响应内容(输入有值、输出为空)"
 	}
 	if !observation.parsed || observation.undecidable {
@@ -269,14 +820,24 @@ func (info *RelayInfo) ClientAnswerUnusable() (bool, string) {
 	// Only classify whole delivered choices here, never each delta in observe.
 	// A read during a partial label must not permanently mark it as real text.
 	sample := ""
-	for _, choice := range observation.choices {
-		text := string(choice.content)
+	classify := func(text string) bool {
 		visible, banners := stripAnswerBanners(text)
 		if strings.TrimSpace(visible) != "" {
+			return true // real text outside a banner
+		}
+		if sample == "" && banners > 0 {
+			sample = truncateAnswerSample(strings.TrimSpace(text))
+		}
+		return false
+	}
+	for _, choice := range observation.choices {
+		if classify(string(choice.content)) {
 			return false, ""
 		}
-		if banners > 0 && sample == "" {
-			sample = truncateAnswerSample(strings.TrimSpace(text))
+	}
+	for _, choice := range observation.nativeTexts {
+		if classify(string(choice.content)) {
+			return false, ""
 		}
 	}
 	if sample != "" {
@@ -318,10 +879,10 @@ func (observation *answerObservation) observe(payload []byte) {
 		if body == nil {
 			continue
 		}
-		if rawHasValue(body.ToolCalls) || rawHasValue(body.FunctionCall) {
+		if validOpenAIToolCalls(body.ToolCalls) || validOpenAIFunctionCall(body.FunctionCall) {
 			observation.toolsSeen = true
 		}
-		if strings.TrimSpace(body.ReasoningContent) != "" || rawHasValue(body.Reasoning) {
+		if strings.TrimSpace(body.ReasoningContent) != "" || rawReasoningHasValue(body.Reasoning) {
 			observation.reasoningSeen = true
 		}
 		if observation.textSeen || observation.reasoningSeen || observation.toolsSeen || observation.undecidable {
@@ -387,6 +948,16 @@ func (observation *answerObservation) observeContent(index int, text string) {
 		choice.content = make([]byte, 0, answerContentLimit)
 	}
 	choice.content = append(choice.content, text...)
+	if choice.prefixDone {
+		// 增量横幅前缀可能后面才接正常正文。只有确实识别出一条完整横幅、且
+		// 横幅之外剩下的内容不再像下一条横幅的开头时,才提前记录首有效输出。
+		// 多个连续横幅或未闭合的多行横幅都保持“未判定”,等流结束再定。
+		if visible, banners := stripAnswerBanners(string(choice.content)); banners > 0 &&
+			strings.TrimSpace(visible) != "" && !answerTextLooksLikeBannerStart(visible) {
+			observation.textSeen = true
+			observation.choices = nil
+		}
+	}
 }
 
 func (choice *answerChoiceObservation) acceptPrefix(text string) bool {
@@ -506,6 +1077,87 @@ func rawHasValue(raw json.RawMessage) bool {
 		return false
 	}
 	return true
+}
+
+// validOpenAIToolCalls accepts only actual tool-call output. A tool definition
+// (name/description/parameters with no call) does not belong in delta/message
+// tool_calls, and an empty structure is not a call.
+func validOpenAIToolCalls(raw json.RawMessage) bool {
+	if !rawHasValue(raw) {
+		return false
+	}
+	var calls []map[string]any
+	if err := basecommon.Unmarshal(raw, &calls); err != nil {
+		return false
+	}
+	for _, call := range calls {
+		if function, ok := call["function"].(map[string]any); ok {
+			if strings.TrimSpace(stringValue(function["name"])) != "" ||
+				strings.TrimSpace(stringValue(function["arguments"])) != "" {
+				return true
+			}
+		}
+		if strings.TrimSpace(stringValue(call["name"])) != "" ||
+			strings.TrimSpace(stringValue(call["arguments"])) != "" ||
+			strings.TrimSpace(stringValue(call["input"])) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// rawReasoningHasValue accepts reasoning text but not an empty reasoning shape
+// or metadata object.
+func rawReasoningHasValue(raw json.RawMessage) bool {
+	if !rawHasValue(raw) {
+		return false
+	}
+	var text string
+	if err := basecommon.Unmarshal(raw, &text); err == nil {
+		return strings.TrimSpace(text) != ""
+	}
+	var object map[string]any
+	if err := basecommon.Unmarshal(raw, &object); err != nil {
+		return false
+	}
+	for _, key := range []string{"content", "text", "summary", "reasoning"} {
+		child, ok := object[key]
+		if !ok {
+			continue
+		}
+		switch typed := child.(type) {
+		case string:
+			if strings.TrimSpace(typed) != "" {
+				return true
+			}
+		case []any:
+			for _, item := range typed {
+				switch value := item.(type) {
+				case string:
+					if strings.TrimSpace(value) != "" {
+						return true
+					}
+				case map[string]any:
+					if answerTextNonEmpty(stringValue(value["text"])) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func validOpenAIFunctionCall(raw json.RawMessage) bool {
+	if !rawHasValue(raw) {
+		return false
+	}
+	var call map[string]any
+	if err := basecommon.Unmarshal(raw, &call); err != nil {
+		return false
+	}
+	return strings.TrimSpace(stringValue(call["name"])) != "" ||
+		strings.TrimSpace(stringValue(call["arguments"])) != ""
 }
 
 func truncateAnswerSample(text string) string {

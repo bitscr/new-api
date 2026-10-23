@@ -1,6 +1,10 @@
 package model
 
 import (
+	"context"
+	"errors"
+
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -30,20 +34,47 @@ func (AutoModelCooldown) TableName() string {
 }
 
 func GetAutoModelCooldowns() ([]AutoModelCooldown, error) {
+	return GetAutoModelCooldownsContext(context.Background(), DB)
+}
+
+// GetAutoModelCooldownsContext bounds both the query and the caller's wait on
+// the database handle. The startup/read paths use the same budget as writes.
+func GetAutoModelCooldownsContext(ctx context.Context, db *gorm.DB) ([]AutoModelCooldown, error) {
+	if db == nil {
+		return nil, errors.New("auto model cooldown database is not initialized")
+	}
 	var rows []AutoModelCooldown
-	err := DB.Find(&rows).Error
+	err := db.WithContext(ctx).Find(&rows).Error
 	return rows, err
 }
 
 // UpsertAutoModelCooldown 按 (分组, 模型, 渠道) 覆盖写入。
 func UpsertAutoModelCooldown(row *AutoModelCooldown) error {
-	return DB.Clauses(clause.OnConflict{
+	return UpsertAutoModelCooldownContext(context.Background(), DB, row)
+}
+
+// UpsertAutoModelCooldownContext uses a stable DB handle and the caller's
+// deadline so a blocked database cannot outlive the persistence worker budget.
+func UpsertAutoModelCooldownContext(ctx context.Context, db *gorm.DB, row *AutoModelCooldown) error {
+	if db == nil {
+		return errors.New("auto model cooldown database is not initialized")
+	}
+	return db.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "group"}, {Name: "model"}, {Name: "channel_id"}},
 		DoUpdates: clause.AssignmentColumns([]string{"until", "level", "reason", "permanent", "updated_at"}),
 	}).Create(row).Error
 }
 
 func DeleteAutoModelCooldown(group, name string, channelId int) error {
-	return DB.Where(&AutoModelCooldown{Group: group, Model: name, ChannelId: channelId}).
+	return DeleteAutoModelCooldownContext(context.Background(), DB, group, name, channelId)
+}
+
+// DeleteAutoModelCooldownContext is the bounded variant used by background
+// retries and administrator clears.
+func DeleteAutoModelCooldownContext(ctx context.Context, db *gorm.DB, group, name string, channelId int) error {
+	if db == nil {
+		return errors.New("auto model cooldown database is not initialized")
+	}
+	return db.WithContext(ctx).Where(&AutoModelCooldown{Group: group, Model: name, ChannelId: channelId}).
 		Delete(&AutoModelCooldown{}).Error
 }

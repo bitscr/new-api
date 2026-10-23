@@ -83,8 +83,14 @@ class ScoreSchemaTests(unittest.TestCase):
 
 def score_row(scope='model', model='score-a', channel=1, **changes):
     row = dict(scope=scope, group='default', model=model, channel_id=channel,
-               score=0.65, latency_ms=20.0, observations=1.0,
-               observed_at=1700000000000000000, version=1)
+               score=0.5, latency_ms=0.0, observations=1.0,
+               success_count=1.0, failure_count=0.0,
+               stream_latency_ms=0.0, stream_latency_samples=0.0, stream_latency_at=0,
+               non_stream_latency_ms=20.0, non_stream_latency_samples=1.0,
+               non_stream_latency_at=1700000000000000000,
+               pending_recovery=0,
+               observed_at=1700000000000000000, observation_seq=1,
+               writer_id='fixture', version=2)
     row.update(changes)
     return row
 
@@ -97,11 +103,11 @@ def score_snapshot(rows):
 class ScoreEvidenceTests(unittest.TestCase):
     def test_score_keys_cannot_be_missing_duplicated_or_cross_scoped(self):
         pair = score_row()
-        channel = score_row('channel', '')
-        wanted = [('model', 'default', 'score-a', 1), ('channel', 'default', '', 1)]
-        self.assertEqual(h.check_scores(score_snapshot([pair, channel]), wanted), [])
-        for rows in ([pair], [pair, channel, pair], [pair, dict(channel, model='score-a')],
-                     [pair, dict(channel, group='other')], [pair, dict(channel, channel_id=2)]):
+        sibling = score_row(model='score-b', channel=2)
+        wanted = [('model', 'default', 'score-a', 1), ('model', 'default', 'score-b', 2)]
+        self.assertEqual(h.check_scores(score_snapshot([pair, sibling]), wanted), [])
+        for rows in ([pair], [pair, sibling, pair], [pair, dict(sibling, scope='channel')],
+                     [pair, dict(sibling, group='other')], [pair, dict(sibling, channel_id=1)]):
             with self.subTest(rows=rows):
                 self.assertTrue(h.check_scores(score_snapshot(rows), wanted),
                                 'wrong scope/key/count was accepted')
@@ -111,7 +117,14 @@ class ScoreEvidenceTests(unittest.TestCase):
         for changes in ({'score': float('nan')}, {'latency_ms': float('inf')},
                         {'observations': 0}, {'observations': 21}, {'score': 1.1},
                         {'latency_ms': -1}, {'observed_at': 1.7e18},
-                        {'observed_at': 0}, {'version': 2}):
+                        {'observed_at': 0}, {'version': 1},
+                        {'success_count': -1}, {'failure_count': float('nan')},
+                        {'success_count': 60, 'failure_count': 60},
+                        {'stream_latency_samples': -1},
+                        {'stream_latency_samples': 1, 'stream_latency_at': 0},
+                        {'stream_latency_samples': 0, 'stream_latency_at': 123},
+                        {'observation_seq': -1}, {'writer_id': None},
+                        {'pending_recovery': 'yes'}):
             with self.subTest(changes=changes):
                 self.assertTrue(h.check_scores(score_snapshot([score_row(**changes)]), wanted),
                                 'invalid score evidence was accepted')
@@ -126,8 +139,12 @@ class UpdateOracleTests(unittest.TestCase):
     def test_expired_history_cannot_pass_as_a_fresh_first_observation(self):
         check = getattr(h, 'check_first_score', lambda *_: [])
         self.assertEqual(check(score_row()), [])
-        for bad in (score_row(observations=19, score=0.99), score_row(latency_ms=60000),
-                    score_row(observations=2), score_row(score=0.8), score_row(latency_ms=0)):
+        for bad in (score_row(success_count=19), score_row(non_stream_latency_ms=60000),
+                    score_row(non_stream_latency_samples=2),
+                    score_row(stream_latency_samples=1, stream_latency_ms=10,
+                              stream_latency_at=1700000000000000000),
+                    score_row(non_stream_latency_ms=0), score_row(pending_recovery=1),
+                    score_row(success_count=0, failure_count=1)):
             with self.subTest(row=bad):
                 self.assertTrue(check(bad), 'revived evidence passed the cold-start oracle')
 
@@ -147,22 +164,25 @@ class UpdateOracleTests(unittest.TestCase):
             self.assertIsInstance(caught, h.BehaviorFailure,
                                   'malformed persisted timestamp was misclassified as infrastructure')
 
-    def test_restored_update_preserves_decayed_count_score_and_latency(self):
+    def test_restored_update_preserves_decayed_counts_and_latency(self):
         check = getattr(h, 'check_update', lambda *_args, **_kwargs: [])
-        before = score_row(score=0.8, observations=8.0, latency_ms=200.0)
+        before = score_row(success_count=8.0, failure_count=1.0,
+                           non_stream_latency_ms=200.0, non_stream_latency_samples=8.0)
         # 期望值必须跟着声明的衰减窗口算,不能写死旧窗口下的数字。
         age_ms = (1700000006000000000 - before['observed_at']) // 1000000
         factor = max(0, 1 - age_ms / h.DECAY_WINDOW_MS)
-        decayed_score = 0.5 + (before['score'] - 0.5) * factor
-        decayed_n = min(20, before['observations']) * factor
-        after = score_row(score=decayed_score + 0.30 * (1 - decayed_score),
-                          observations=min(20, decayed_n + 1),
-                          latency_ms=before['latency_ms'] * factor * 0.8 + 100 * 0.2,
-                          observed_at=1700000006000000000)
+        after = score_row(
+            success_count=min(h.EVIDENCE_CAP, before['success_count'] * factor + 1),
+            failure_count=min(h.EVIDENCE_CAP, before['failure_count'] * factor),
+            non_stream_latency_ms=before['non_stream_latency_ms'] * 0.8 + 100 * 0.2,
+            non_stream_latency_samples=before['non_stream_latency_samples'] * factor + 1,
+            observed_at=1700000006000000000, observation_seq=2)
         self.assertEqual(check(before, after, sample_latency_ms=100), [])
-        for bad in (dict(after, observations=1.0, score=0.65),
-                    dict(after, score=0.8), dict(after, latency_ms=100.0),
+        for bad in (dict(after, success_count=1.0, failure_count=0.0),
+                    dict(after, non_stream_latency_ms=100.0),
+                    dict(after, non_stream_latency_samples=1.0),
                     dict(after, observed_at=before['observed_at']),
+                    dict(after, observation_seq=1),
                     dict(after, channel_id=2)):
             with self.subTest(after=bad):
                 self.assertTrue(check(before, bad, sample_latency_ms=100),
@@ -171,25 +191,26 @@ class UpdateOracleTests(unittest.TestCase):
 
 class RuntimeLatencyBridgeTests(unittest.TestCase):
     def test_case_updates_rejects_latency_reset_using_independent_request_measurements(self):
-        before = score_row(score=0.8, observations=8.0, latency_ms=200.0)
+        before = score_row(success_count=8.0, failure_count=0.0,
+                           non_stream_latency_ms=200.0, non_stream_latency_samples=8.0)
         observed_at = 1700000006000000000
         age_ms = (observed_at - before['observed_at']) // 1000000
         factor = max(0, 1 - age_ms / h.DECAY_WINDOW_MS)
-        decayed_score = 0.5 + (before['score'] - 0.5) * factor
-        decayed_n = min(20, before['observations']) * factor
-        expected = dict(score=decayed_score + 0.30 * (1 - decayed_score),
-                        observations=min(20, decayed_n + 1),
-                        latency_ms=before['latency_ms'] * factor * 0.8 + 100 * 0.2)
-        reset = score_row(observed_at=observed_at, **dict(expected, latency_ms=100.0))
+        expected = dict(success_count=min(h.EVIDENCE_CAP, before['success_count'] * factor + 1),
+                        failure_count=min(h.EVIDENCE_CAP, before['failure_count'] * factor),
+                        non_stream_latency_ms=before['non_stream_latency_ms'] * 0.8 + 100 * 0.2,
+                        non_stream_latency_samples=before['non_stream_latency_samples'] * factor + 1,
+                        observed_at=observed_at, observation_seq=2)
+        reset = score_row(**dict(expected, non_stream_latency_ms=100.0))
         response = {'sample_latency_ms': [99, 101],
                     'started_ns': 1700000005950000000, 'settled_ns': 1700000006050000000}
         with tempfile.TemporaryDirectory() as directory:
             ctx = h.Case(h.SimpleNamespace(base=pathlib.Path(directory)), 'false', 'latency',
                          {'responses': [response]})
             ctx.root.mkdir()
-            with self.assertRaisesRegex(h.BehaviorFailure, 'restored latency_ms update differs'):
+            with self.assertRaisesRegex(h.BehaviorFailure, 'restored non_stream_latency_ms update differs'):
                 ctx.updates(score_snapshot([before]), score_snapshot([reset]), [h.score_key(before)])
-            good = dict(reset, latency_ms=expected['latency_ms'])
+            good = score_row(**expected)
             ctx.updates(score_snapshot([before]), score_snapshot([good]), [h.score_key(before)])
 
 
@@ -213,10 +234,13 @@ class LatencyMeasurementTests(unittest.TestCase):
                 self.assertLess(bounds[1], 5000)
                 self.assertEqual(bounds[0], max(1, (calls[0]['reply_started_mono_ns']
                                                    - calls[0]['delay_started_mono_ns']) // 1000000))
-                predicted = h.latency_update_bounds(score_row(latency_ms=1000), bounds,
-                                                      [1700000000000000000, 1700000001000000000])
-                self.assertEqual(predicted, [1000 * (1 - 1000 / h.DECAY_WINDOW_MS) * 0.8 + bounds[0] * 0.2,
-                                             1000 * 0.8 + bounds[1] * 0.2])
+                predicted = h.latency_update_bounds(
+                    score_row(non_stream_latency_ms=1000, non_stream_latency_samples=1.0),
+                    bounds, [1700000000000000000, 1700000001000000000])
+                factor_end = max(0, 1 - 1000 / h.DECAY_WINDOW_MS)
+                self.assertEqual(predicted, [1000 * 0.8 + bounds[0] * 0.2,
+                                             1000 * 0.8 + bounds[1] * 0.2,
+                                             factor_end * 1.0 + 1, 1.0 + 1])
             finally:
                 self.assertEqual(h.stop_upstream(server, worker), [])
 

@@ -44,11 +44,7 @@ func TestClearAutoModelNegativeEffectsBatch(t *testing.T) {
 	require.Equal(t, 2, response.Data.ClearedCount, "duplicate rows must count once")
 	require.Equal(t, 1, response.Data.SkippedCount, "a row without observations is skipped")
 
-	for _, row := range service.ListAutoModelScores(time.Now()) {
-		if row.Group != group {
-			continue
-		}
-		require.InDelta(t, 0.5, row.Score, 1e-9, "cleared rows return to neutral")
-		require.False(t, row.Cooling, "cleared rows must not remain cooling")
+	for _, row := range service.ListAutoModelCooldowns(time.Now()) {
+		require.NotEqual(t, group, row.Group, "cleared rows must not remain cooling")
 	}
 }

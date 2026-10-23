@@ -25,14 +25,12 @@ func TestAutoModelRouteSnapshotDropsOnlyExcludedTriples(t *testing.T) {
 			{Group: "g", ModelName: "a", ChannelID: 1}: true,
 		},
 	}
-	require.Equal(t, []AutoModelRoute{
-		{Group: "g", ModelName: "b", ChannelID: 1},
-		{Group: "g", ModelName: "a", ChannelID: 2},
-	}, buildAutoModelRoutesFromSnapshot("g", []string{"a", "b"}, snapshot, func() float64 { return 0 }),
-		"an excluded triple must not take its sibling model or its other channels with it")
+	got, _ := buildAutoModelRoutesFromSnapshot("g", []string{"a", "b"}, snapshot, false, func() float64 { return 0 })
+	require.Len(t, got, 2, "an excluded triple must not take its sibling model or its other channels with it")
+	require.NotContains(t, got, AutoModelRoute{Group: "g", ModelName: "a", ChannelID: 1})
 
 	// 排除是"组 + 模型 + 渠道"三元组:换一个分组就不该命中。
-	other := buildAutoModelRoutesFromSnapshot("other", []string{"a", "b"}, snapshot, func() float64 { return 0 })
+	other, _ := buildAutoModelRoutesFromSnapshot("other", []string{"a", "b"}, snapshot, false, func() float64 { return 0 })
 	require.Len(t, other, 3)
 }
 
@@ -45,16 +43,16 @@ func TestRebuildAutoModelRoutePlanForRetryFallsBackWithoutAttemptsOrGroup(t *tes
 	routes, status := RebuildAutoModelRoutePlanForRetry(nil, "g", map[AutoModelRoute]bool{
 		{Group: "g", ModelName: "a", ChannelID: 1}: true,
 	})
-	require.Nil(t, routes)
+	require.Empty(t, routes.Routes)
 	require.Equal(t, AutoModelRebuildSkipped, status, "没有 gin 上下文时不能重排")
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	routes, status = RebuildAutoModelRoutePlanForRetry(c, "g", nil)
-	require.Nil(t, routes)
+	require.Empty(t, routes.Routes)
 	require.Equal(t, AutoModelRebuildSkipped, status, "空 attempted 必须退回原计划")
 	routes, status = RebuildAutoModelRoutePlanForRetry(c, "", map[AutoModelRoute]bool{
 		{Group: "g", ModelName: "a", ChannelID: 1}: true,
 	})
-	require.Nil(t, routes)
+	require.Empty(t, routes.Routes)
 	require.Equal(t, AutoModelRebuildEmpty, status, "没有请求分组时没有候选可重排")
 }
 
@@ -64,39 +62,27 @@ func TestRebuildAutoModelRoutePlanForRetryReranksAndDropsAttempted(t *testing.T)
 	db := setupAutoModelRouteRequestTest(t)
 	seedAutoModelRouteRequestChannels(t, db)
 
-	// 两条渠道 priority 相同;route-b@2 被证明最好,其余路线全中性 0.5。
+	// route-b@2 有足够业务样本和成功延迟,其余路线仍在试用范围。
 	now := time.Now()
-	autoModelHealth.Set(autoModelHealthKey("g", "route-b", 2),
-		autoModelOutcome{Score: 0.9, Observations: 20, UpdatedAt: now})
+	autoModelHealth.Set(autoModelHealthKey("g", "route-b", 2), autoModelOutcome{
+		SuccessCount: 20, LastObservedAt: now,
+		NonStreamLatencyMS: 500, NonStreamLatencySamples: 20, NonStreamLatencyUpdatedAt: now,
+	})
 
 	attempted := map[AutoModelRoute]bool{
 		{Group: "g", ModelName: "route-a", ChannelID: 1}: true,
 	}
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	routes, status := RebuildAutoModelRoutePlanForRetry(c, "g", attempted)
+	plan, status := RebuildAutoModelRoutePlanForRetry(c, "g", attempted)
 	require.Equal(t, AutoModelRebuildReplaced, status)
-	require.NotEmpty(t, routes)
-	for _, route := range routes {
+	require.NotEmpty(t, plan.Routes)
+	for _, route := range plan.Routes {
 		require.NotEqual(t, AutoModelRoute{Group: "g", ModelName: "route-a", ChannelID: 1}, route,
 			"已经打过的路不能回到重排后的计划里")
 	}
-	require.Equal(t, AutoModelRoute{Group: "g", ModelName: "route-b", ChannelID: 2}, routes[0],
-		"重排后队首是当前模型分最高的路线,同优先级内跨渠道比较")
-	require.Len(t, routes, 3, "两条渠道共 4 条路,减去已试过的 1 条")
-
-	// 对照:同一分组没有任何模型观测时,四条路线全部中性同档,队首由两级加权
-	// 随机决定(渠道权重相同,固定随机源下按稳定枚举顺序可复现:draw 0 先取
-	// 渠道 1,再取其中按名排序的第一个模型 route-a)。
-	fresh := autoModelRouteSnapshot{
-		Now:     now,
-		Targets: map[string][]model.AutoModelRoutingTarget{
-			"route-a": {{ChannelID: 1, Weight: 10}, {ChannelID: 2, Weight: 10}},
-			"route-b": {{ChannelID: 1, Weight: 10}, {ChannelID: 2, Weight: 10}},
-		},
-	}
-	require.Equal(t, AutoModelRoute{Group: "g", ModelName: "route-a", ChannelID: 1},
-		buildAutoModelRoutesFromSnapshot("g", []string{"route-a", "route-b"}, fresh,
-			func() float64 { return 0 })[0])
+	require.Equal(t, AutoModelRoute{Group: "g", ModelName: "route-b", ChannelID: 2}, plan.Routes[0],
+		"可靠且成功延迟已知的路线排在其他试用路线之前")
+	require.Len(t, plan.Routes, 3, "两条渠道共 4 条路,减去已试过的 1 条")
 }
 
 // 换计划不能顺手换分组:只有真正 bind 成功的那次提交才允许把请求挪到别的分组。

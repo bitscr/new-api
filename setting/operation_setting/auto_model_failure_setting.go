@@ -26,22 +26,23 @@ const (
 	//
 	// 阶梯是首档 15 分钟起、每犯一次翻倍:15m→30m→1h→2h→4h→封顶。本值决定封顶。
 	autoModelDefaultCooldownMaxHours = 6
-	// autoModelDefaultScoreDecayMinutes 是评分时间衰减窗口。
+	// autoModelDefaultScoreDecayMinutes 是业务证据的时间衰减窗口。
 	//
-	// 它必须比抖动冷却阶梯里"最靠前的若干档"都长,不能只比第一档(15 分钟)长。
-	// 一次失败把分数从 0.5 压到 0.35(见 autoModelScoreAlpha);衰减是线性的:
+	// 可靠性计数和流式/非流式延迟样本都按已过时间线性折算有效数量:
 	//
-	//	分数 = 0.5 + (旧分-0.5) * (1 - 已过时间/本窗口)
+	//	有效数量 = 原始数量 * (1 - 已过时间/本窗口)
 	//
-	// 若窗口只有 30 分钟,那么第 2 次失败的冷却窗口(30 分钟)一到,分数正好
-	// 归零回 0.5——它带着"零记忆"回到候选池,前面积累的教训全部作废;第 3 档
-	// 之后更是每档都在归零后才解冻,惩罚完全失效。
+	// 延迟数值本身不衰减,证据陈旧时由新鲜度判定为未知。窗口必须比抖动冷却
+	// 阶梯里"最靠前的若干档"都长,不能只比第一档(15 分钟)长。若窗口只有
+	// 30 分钟,第 2 次失败的冷却窗口(30 分钟)一到,证据已基本归零,组合会带着
+	// "零记忆"回到候选池,前面积累的教训全部作废;第 3 档之后更是每档都在
+	// 归零后才解冻,惩罚完全失效。
 	//
 	// 默认值随封顶走(与 autoModelDefaultCooldownMaxHours 对齐):封顶抬到多久,
-	// 记忆就该留多久,否则最高几档解冻时扣分已经是 0,冷却只剩"等时间"。
+	// 记忆就该留多久,否则最高几档解冻时证据已经失效,冷却只剩"等时间"。
 	// 这两者的关系由配置校验强制(见 controller/option.go)。
 	autoModelDefaultScoreDecayMinutes = 360
-	// autoModelDefaultScoreRefreshSeconds 是"模型得分"前台页面的自动刷新间隔(秒)。
+	// autoModelDefaultScoreRefreshSeconds 是"auto 路由状态"页面的自动刷新间隔(秒)。
 	autoModelDefaultScoreRefreshSeconds = 60
 )
 
@@ -265,7 +266,7 @@ func AutoModelRecommendedScoreDecayMinutes() int {
 	return minutes
 }
 
-// AutoModelScoreDecayMinutes 是评分线性衰减到中立的窗口(分钟)。
+// AutoModelScoreDecayMinutes 是业务证据有效数量的线性衰减窗口(分钟)。
 func AutoModelScoreDecayMinutes() int {
 	autoModelSettingsMutex.RLock()
 	defer autoModelSettingsMutex.RUnlock()
@@ -282,7 +283,7 @@ func SetAutoModelScoreDecayMinutes(value int) {
 	autoModelScoreDecayMinutes = sanitizePositive(value, 1)
 }
 
-// AutoModelScoreRefreshSeconds 是"模型得分"前台页面的自动刷新间隔(秒,至少 1)。
+// AutoModelScoreRefreshSeconds 是"auto 路由状态"页面的自动刷新间隔(秒,至少 1)。
 func AutoModelScoreRefreshSeconds() int {
 	autoModelSettingsMutex.RLock()
 	defer autoModelSettingsMutex.RUnlock()

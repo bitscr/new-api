@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -41,6 +42,81 @@ func cooldownRows(t *testing.T) []model.AutoModelCooldown {
 // TestAutoModelCooldownIsPerModel 锁定当前语义：冷却是"该渠道上的该模型"的事。
 // 一个渠道下试挂了 2 个模型，不代表剩下 3 个也不行，所以不再冷却整条渠道
 // （早期版本会额外写一条 model=” 的渠道级记录，让同上游的其它模型一起避让）。
+func TestLateFailureCannotReCoolRecoveredPair(t *testing.T) {
+	setupAutoModelCooldownTestDB(t)
+	group, modelName, channelID := "cooldown-recovery-race", "model-a", 41
+	now := time.Now()
+	tripAutoModelCooldown(group, modelName, channelID, "seed", now.Add(-time.Minute))
+	_, active := GetAutoModelCooldown(group, modelName, channelID, now)
+	require.True(t, active)
+
+	// A fast success observed now recovers the pair and confirms the DB delete.
+	recordAutoModelOutcome(group, modelName, channelID, true, false, true, 100, 100, false, "", now)
+	_, active = GetAutoModelCooldown(group, modelName, channelID, now)
+	require.False(t, active)
+	autoModelCooldownMutex.Lock()
+	recoveredAt, ok := autoModelCooldownRecoveries[autoModelHealthKey(group, modelName, channelID)]
+	autoModelCooldownMutex.Unlock()
+	require.True(t, ok, "the recovery barrier must remain after a successful delete")
+	require.False(t, recoveredAt.IsZero())
+
+	// The failure was observed before recovery and published late.
+	recordAutoModelOutcome(group, modelName, channelID, false, false, false, 0, 500, false, "late failure", now.Add(-time.Minute))
+	_, active = GetAutoModelCooldown(group, modelName, channelID, now)
+	require.False(t, active, "a pre-recovery failure must not re-cool the route")
+
+	// A genuinely newer failure still creates a fresh cooldown.
+	recordAutoModelOutcome(group, modelName, channelID, false, false, false, 0, 500, false, "new failure", now.Add(time.Second))
+	cooldown, active := GetAutoModelCooldown(group, modelName, channelID, now.Add(time.Second))
+	require.True(t, active)
+	require.Equal(t, 1, cooldown.Level, "the ladder restarts after recovery")
+}
+
+func TestOutOfOrderRecoveryDoesNotMoveBarrierBackwards(t *testing.T) {
+	setupAutoModelCooldownTestDB(t)
+	group, modelName, channelID := "cooldown-recovery-order", "model-a", 42
+	now := time.Now()
+	t1, t2, t3 := now.Add(-2*time.Minute), now.Add(-time.Minute), now
+
+	// Real order: t1 success -> t2 failure -> t3 success.
+	// Publication order: t3 success -> t1 success -> t2 failure.
+	require.NoError(t, clearAutoModelCooldownWithResult(group, modelName, channelID, t3))
+	require.NoError(t, clearAutoModelCooldownWithResult(group, modelName, channelID, t1))
+	tripAutoModelCooldown(group, modelName, channelID, "late failure", t2)
+	_, active := GetAutoModelCooldown(group, modelName, channelID, t3)
+	require.False(t, active, "an old success must not move the t3 barrier back to t1")
+
+	t4 := now.Add(time.Second)
+	tripAutoModelCooldown(group, modelName, channelID, "genuine new failure", t4)
+	cooldown, active := GetAutoModelCooldown(group, modelName, channelID, t4)
+	require.True(t, active)
+	require.Equal(t, 1, cooldown.Level, "a genuinely new failure starts at the first tier")
+}
+
+func TestCanceledCooldownBudgetLeavesPendingWriteAndReleasesLock(t *testing.T) {
+	setupAutoModelCooldownTestDB(t)
+	group, modelName, channelID := "cooldown-budget", "model-a", 43
+	now := time.Now()
+	tripAutoModelCooldown(group, modelName, channelID, "seed", now)
+	require.Len(t, cooldownRows(t), 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := clearAutoModelCooldownWithResultContext(ctx, model.DB, group, modelName, channelID, now.Add(time.Second))
+	require.Error(t, err, "an exhausted budget must fail instead of waiting for SQL")
+
+	key := autoModelHealthKey(group, modelName, channelID)
+	autoModelCooldownMutex.Lock()
+	state, ok := autoModelCooldowns.Get(key)
+	autoModelCooldownMutex.Unlock()
+	require.True(t, ok)
+	require.NotNil(t, state.pending)
+	require.True(t, state.pending.delete)
+
+	require.NoError(t, RetryPendingAutoModelCooldownWrites(context.Background(), model.DB))
+	require.Empty(t, cooldownRows(t), "the background retry finishes after the budget is restored")
+}
+
 func TestAutoModelCooldownIsPerModel(t *testing.T) {
 	setupAutoModelCooldownTestDB(t)
 	group := "default"

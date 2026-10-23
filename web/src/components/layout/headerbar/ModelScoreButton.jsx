@@ -21,7 +21,7 @@ import React from 'react';
 import { Button } from '@douyinfe/semi-ui';
 import { TrendingUp } from 'lucide-react';
 
-// 顶栏「模型得分」入口:仅登录后显示,点击进入 /console/model-score。
+// 顶栏路由状态入口:仅登录后显示,点击进入 /console/model-score 的 auto 路由状态页。
 const ModelScoreButton = ({ userState, navigate, t }) => {
   if (!userState?.user) return null;
 
@@ -30,12 +30,12 @@ const ModelScoreButton = ({ userState, navigate, t }) => {
       theme='borderless'
       type='tertiary'
       icon={<TrendingUp size={18} />}
-      aria-label={t('模型得分')}
+      aria-label={t('路由状态')}
       onClick={() => navigate('/console/model-score')}
       className='!px-2 !py-1.5 !text-current focus:!bg-semi-color-fill-1 !rounded-full !bg-semi-color-fill-0 hover:!bg-semi-color-fill-1'
     >
       <span className='hidden lg:inline text-xs font-medium'>
-        {t('模型得分')}
+        {t('路由状态')}
       </span>
     </Button>
   );

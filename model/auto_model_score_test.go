@@ -51,7 +51,13 @@ func TestAutoModelScoreMigrationRegistersTable(t *testing.T) {
 			for _, column := range columns {
 				names = append(names, column.Name())
 			}
-			require.ElementsMatch(t, []string{"scope", "group", "model", "channel_id", "score", "latency_ms", "observations", "observed_at", "observation_seq", "writer_id", "version"}, names, "排序元数据必须随 GORM 跨库增列一起迁移")
+			require.ElementsMatch(t, []string{
+				"scope", "group", "model", "channel_id", "score", "latency_ms", "observations",
+				"success_count", "failure_count",
+				"stream_latency_ms", "stream_latency_samples", "stream_latency_at",
+				"non_stream_latency_ms", "non_stream_latency_samples", "non_stream_latency_at",
+				"pending_recovery", "observed_at", "observation_seq", "writer_id", "version",
+			}, names, "排序元数据必须随 GORM 跨库增列一起迁移")
 		})
 	}
 }
@@ -63,10 +69,27 @@ func TestAutoModelScoreRoundTripPreservesRawFieldsAndSkipsLegacyScope(t *testing
 	defer cancel()
 	observed := time.Now().Add(-time.Minute).UnixNano()
 	want := []AutoModelScore{
-		{Scope: "model", Group: "g", Model: "m", ChannelID: 1, Score: 0.85, LatencyMS: 123.5, Observations: 3.75, ObservedAt: observed, Version: 1},
-		{Scope: "model", Group: "vip", Model: "m", ChannelID: 1, Score: 0.15, LatencyMS: 432.125, Observations: 8.5, ObservedAt: observed + 1, Version: 1},
-		{Scope: "model", Group: "g", Model: "other", ChannelID: 1, Score: 0, LatencyMS: 0, Observations: 1, ObservedAt: observed + 2, Version: 1},
-		{Scope: "model", Group: "g", Model: "m", ChannelID: 2, Score: 1, LatencyMS: 2, Observations: 20, ObservedAt: observed + 3, Version: 1},
+		{
+			Scope: "model", Group: "g", Model: "m", ChannelID: 1,
+			SuccessCount: 3, FailureCount: 1, StreamLatencyMS: 123.5, StreamLatencySamples: 2, StreamLatencyAt: observed,
+			NonStreamLatencyMS: 200, NonStreamLatencySamples: 1, NonStreamLatencyAt: observed,
+			PendingRecovery: true, ObservedAt: observed, Version: 2,
+		},
+		{
+			Scope: "model", Group: "vip", Model: "m", ChannelID: 1,
+			SuccessCount: 8, FailureCount: 0, NonStreamLatencyMS: 432.125, NonStreamLatencySamples: 8,
+			NonStreamLatencyAt: observed + 1, ObservedAt: observed + 1, Version: 2,
+		},
+		{
+			Scope: "model", Group: "g", Model: "other", ChannelID: 1,
+			SuccessCount: 1, NonStreamLatencyMS: 1, NonStreamLatencySamples: 1,
+			NonStreamLatencyAt: observed + 2, ObservedAt: observed + 2, Version: 2,
+		},
+		{
+			Scope: "model", Group: "g", Model: "m", ChannelID: 2,
+			SuccessCount: 20, StreamLatencyMS: 2, StreamLatencySamples: 20,
+			StreamLatencyAt: observed + 3, ObservedAt: observed + 3, Version: 2,
+		},
 	}
 	legacy := []AutoModelScore{
 		{Scope: "channel", Group: "g", Model: "", ChannelID: 1, Score: 0.4, LatencyMS: 321.25, Observations: 12.25, ObservedAt: observed + 4, Version: 1},
@@ -193,7 +216,15 @@ func TestAutoModelScoreSQLDialectsGuardEveryUpdatedField(t *testing.T) {
 				statements = append(statements, tx.Statement.SQL.String())
 				variables = append(variables, append([]any(nil), tx.Statement.Vars...))
 			}))
-			row := AutoModelScore{Scope: "model", Group: "g' OR 1=1 --", Model: "模型'", ChannelID: 4, Score: 0.8, LatencyMS: 123, Observations: 7.5, ObservedAt: time.Now().UnixNano(), ObservationSeq: 3, WriterID: "writer-a", Version: 1}
+			row := AutoModelScore{
+				Scope: "model", Group: "g' OR 1=1 --", Model: "模型'", ChannelID: 4,
+				Score: 0.8, LatencyMS: 123, Observations: 7.5,
+				SuccessCount: 3, FailureCount: 1,
+				StreamLatencyMS: 100, StreamLatencySamples: 2, StreamLatencyAt: 1700000000000000001,
+				NonStreamLatencyMS: 200, NonStreamLatencySamples: 1, NonStreamLatencyAt: 1700000000000000002,
+				PendingRecovery: true,
+				ObservedAt:      time.Now().UnixNano(), ObservationSeq: 3, WriterID: "writer-a", Version: 2,
+			}
 			outcomes, saveErr := SaveAutoModelScores(context.Background(), db, []AutoModelScore{row})
 			require.NoError(t, saveErr)
 			require.Nil(t, outcomes, "dry-run 只生成 SQL,不回读逐行确认")
@@ -202,7 +233,13 @@ func TestAutoModelScoreSQLDialectsGuardEveryUpdatedField(t *testing.T) {
 			t.Logf("%s SQL: %s; parameter_count=%d", dialect.Name(), sql, len(variables[0]))
 			require.NotContains(t, sql, row.Group)
 			require.NotContains(t, sql, row.Model)
-			require.Equal(t, []any{row.Scope, row.Group, row.Model, row.ChannelID, row.Score, row.LatencyMS, row.Observations, row.ObservedAt, row.ObservationSeq, row.WriterID, row.Version}, variables[0])
+			require.Equal(t, []any{
+				row.Scope, row.Group, row.Model, row.ChannelID, row.Score, row.LatencyMS, row.Observations,
+				row.SuccessCount, row.FailureCount,
+				row.StreamLatencyMS, row.StreamLatencySamples, row.StreamLatencyAt,
+				row.NonStreamLatencyMS, row.NonStreamLatencySamples, row.NonStreamLatencyAt,
+				row.PendingRecovery, row.ObservedAt, row.ObservationSeq, row.WriterID, row.Version,
+			}, variables[0])
 			if dialect.Name() == "mysql" {
 				guard := "`observed_at` < VALUES(`observed_at`) OR (`observed_at` = VALUES(`observed_at`) AND (COALESCE(`observation_seq`, 0) < COALESCE(VALUES(`observation_seq`), 0) OR (COALESCE(`observation_seq`, 0) = COALESCE(VALUES(`observation_seq`), 0) AND COALESCE(`writer_id`, '') < COALESCE(VALUES(`writer_id`), ''))))"
 				require.Contains(t, sql, "ON DUPLICATE KEY UPDATE")
@@ -331,8 +368,8 @@ func TestAutoModelScoreDeleteSnapshotSQLDialects(t *testing.T) {
 				require.Contains(t, sql, q(field)+" = ", "every identity field must be compared, including zero/empty values")
 			}
 			require.NotContains(t, sql, row.Group)
-			require.Contains(t, sql, "COALESCE("+q("observation_seq")+", 0) = COALESCE(?, 0)")
-			require.Contains(t, sql, "COALESCE("+q("writer_id")+", '') = COALESCE(?, '')")
+			require.Contains(t, sql, "COALESCE("+q("observation_seq")+", 0) = COALESCE(")
+			require.Contains(t, sql, "COALESCE("+q("writer_id")+", '') = COALESCE(")
 			require.Equal(t, []any{row.ChannelID, row.Group, row.Model, row.ObservedAt, row.Scope, row.Version, row.ObservationSeq, row.WriterID}, variables[0], "身份字段与完整排序元数据都必须参与条件删除")
 		})
 	}

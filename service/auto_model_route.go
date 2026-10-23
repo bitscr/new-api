@@ -17,17 +17,37 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// AutoModelRoute pins both halves of an auto dispatch. A retry advances through
-// concrete routes, rather than choosing a model and independently redrawing its
-// channel. Equal-priority routes interleave across channels by model score:
-// a channel's remaining models never form an impenetrable block.
+// AutoModelRoute pins both halves of an auto dispatch. The route key is used by
+// several request-local exclusion sets, so its fields must remain exactly these
+// three values.
 type AutoModelRoute struct {
 	Group     string
 	ModelName string
 	ChannelID int
 }
 
+// AutoModelRoutePlanMeta carries request-scoped routing reasons without changing
+// AutoModelRoute's identity. Categories are used by logs and the status page;
+// Trial marks routes that need the process-local trial admission slot.
+type AutoModelRoutePlanMeta struct {
+	Mode               autoModelRequestMode
+	ExplorationDecided bool
+	Explored           bool
+	ExplorationRatio   float64
+	ExplorationRoute   AutoModelRoute
+	ColdStart          bool
+	Categories         map[AutoModelRoute]string
+	Reasons            map[AutoModelRoute]string
+	Trial              map[AutoModelRoute]bool
+}
+
+type AutoModelRoutePlan struct {
+	Routes []AutoModelRoute
+	Meta   AutoModelRoutePlanMeta
+}
+
 const autoModelRoutePlanContextKey = "auto_model_route_plan"
+const autoModelRoutePlanMetaContextKey = "auto_model_route_plan_meta"
 const autoModelFailedModelsContextKey = "auto_model_failed_models"
 
 func autoModelFailedModelKey(group, modelName string) string {
@@ -35,9 +55,6 @@ func autoModelFailedModelKey(group, modelName string) string {
 }
 
 // MarkAutoModelModelFailed records a model-scoped retry failure for this request.
-// The exclusion is intentionally request-local and group-scoped: persistent
-// cooldowns remain per (group, model, channel), while a model-scoped upstream
-// error must not send this request to the same model on another channel.
 func MarkAutoModelModelFailed(c *gin.Context, group, modelName string) {
 	group = strings.TrimSpace(group)
 	modelName = strings.TrimSpace(modelName)
@@ -49,8 +66,6 @@ func MarkAutoModelModelFailed(c *gin.Context, group, modelName string) {
 	c.Set(autoModelFailedModelsContextKey, excluded)
 }
 
-// IsAutoModelModelFailed reports whether this request has already seen a
-// model-scoped failure for the concrete group/model pair.
 func IsAutoModelModelFailed(c *gin.Context, group, modelName string) bool {
 	group = strings.TrimSpace(group)
 	modelName = strings.TrimSpace(modelName)
@@ -75,26 +90,18 @@ func getAutoModelFailedModels(c *gin.Context) map[string]bool {
 	return result
 }
 
-// This tolerance absorbs floating-point noise only. It applies at the band
-// boundary (so the documented 0.900/0.890 example stays one band despite
-// 0.900-0.890 being 0.0100...9 in float64); whether genuinely different scores
-// share a band is decided by AutoModelScoreBandWidth, not by this constant.
-const autoModelRouteScoreTieEpsilon = 1e-9
-
-// ErrAutoModelNoAuthorizedCandidates distinguishes a token whitelist rejection
-// from exhausted routes. Authorized but cooling candidates never produce it.
 var ErrAutoModelNoAuthorizedCandidates = errors.New("no authorized auto model candidates")
 
 // SetAutoModelRoutePlan owns a copy of the request's plan and activates its first
-// route. The legacy model-name slice deliberately has one entry per route, so
-// names may repeat on different channels. An empty plan invalidates the current
-// route without erasing the original group used in error reporting.
+// route. Metadata is written separately so plan replacement can never silently
+// change route identity.
 func SetAutoModelRoutePlan(c *gin.Context, routes []AutoModelRoute) {
 	if c == nil {
 		return
 	}
 	plan := append([]AutoModelRoute(nil), routes...)
 	c.Set(autoModelRoutePlanContextKey, plan)
+	c.Set(autoModelRoutePlanMetaContextKey, AutoModelRoutePlanMeta{})
 	names := make([]string, len(plan))
 	for i, route := range plan {
 		names[i] = route.ModelName
@@ -104,8 +111,22 @@ func SetAutoModelRoutePlan(c *gin.Context, routes []AutoModelRoute) {
 	ActivateAutoModelRoute(c, 0)
 }
 
-// GetAutoModelRoutePlan returns a copy; callers cannot reorder a live plan by
-// mutating the returned slice.
+func SetAutoModelRoutePlanMeta(c *gin.Context, meta AutoModelRoutePlanMeta) {
+	if c == nil {
+		return
+	}
+	c.Set(autoModelRoutePlanMetaContextKey, meta)
+}
+
+func GetAutoModelRoutePlanMeta(c *gin.Context) AutoModelRoutePlanMeta {
+	if c == nil {
+		return AutoModelRoutePlanMeta{}
+	}
+	value, _ := c.Get(autoModelRoutePlanMetaContextKey)
+	meta, _ := value.(AutoModelRoutePlanMeta)
+	return meta
+}
+
 func GetAutoModelRoutePlan(c *gin.Context) []AutoModelRoute {
 	return append([]AutoModelRoute(nil), autoModelRoutePlan(c)...)
 }
@@ -119,8 +140,6 @@ func autoModelRoutePlan(c *gin.Context) []AutoModelRoute {
 	return plan
 }
 
-// GetAutoModelRouteIndex returns -1 when no route is active. The legacy index is
-// the single source of truth, avoiding separate route/model indices drifting.
 func GetAutoModelRouteIndex(c *gin.Context) int {
 	plan := autoModelRoutePlan(c)
 	if len(plan) == 0 {
@@ -142,9 +161,6 @@ func GetCurrentAutoModelRoute(c *gin.Context) (AutoModelRoute, bool) {
 	return autoModelRoutePlan(c)[index], true
 }
 
-// ActivateAutoModelRoute updates only route/group bookkeeping. Channel setup
-// owns original_model and all channel credentials; planning never fabricates a
-// selected channel or rewrites the token's original group.
 func ActivateAutoModelRoute(c *gin.Context, index int) bool {
 	plan := autoModelRoutePlan(c)
 	if index < 0 || index >= len(plan) {
@@ -164,160 +180,71 @@ type autoModelRouteSnapshot struct {
 	ModelHealth      map[string]autoModelOutcome
 	Cooldowns        map[string]autoModelCooldownState
 	ModelWeights     map[string]map[string]float64
+	Candidates       map[string][]string
 	ExcludedChannels map[int]bool
-	// ExcludedRoutes drops concrete (分组, 模型, 渠道) 三元组,粒度比
-	// ExcludedChannels 细:渠道级排除是"这条渠道整个不能用了",这里排除的是
-	// "本次请求已经打过的那一条路"。重试时用它,让新计划天然从"还没试过的最优路"开头。
-	// nil 表示不额外排除任何路由。
-	ExcludedRoutes map[AutoModelRoute]bool
-	// ExcludedModels drops all routes for a request-scoped model failure in
-	// the concrete group, without changing persistent cooldown granularity.
-	ExcludedModels map[string]bool
-	Now            time.Time
+	ExcludedRoutes   map[AutoModelRoute]bool
+	ExcludedModels   map[string]bool
+	Mode             autoModelRequestMode
+	Now              time.Time
+	Settings         operation_setting.AutoModelRoutingSettings
 }
 
-func newAutoModelRouteSnapshot(excluded map[int]bool) autoModelRouteSnapshot {
+// settingsSnapshot treats an unset Settings field as "use the process
+// snapshot". Hand-built test snapshots predate the field; production snapshot
+// constructors always set it explicitly.
+func (snapshot autoModelRouteSnapshot) settingsSnapshot() operation_setting.AutoModelRoutingSettings {
+	if snapshot.Settings == (operation_setting.AutoModelRoutingSettings{}) {
+		return operation_setting.AutoModelRoutingSettingsSnapshot()
+	}
+	return snapshot.Settings
+}
+
+func newAutoModelRouteSnapshot(excluded map[int]bool, mode autoModelRequestMode) autoModelRouteSnapshot {
 	return autoModelRouteSnapshot{
 		ModelHealth:      autoModelHealth.ReadAll(),
 		Cooldowns:        autoModelCooldownSnapshot(),
 		ModelWeights:     operation_setting.GetAutoModelWeights(),
+		Candidates:       operation_setting.GetAutoModelCandidates(),
 		ExcludedChannels: excluded,
+		Mode:             mode,
 		Now:              time.Now(),
+		Settings:         operation_setting.AutoModelRoutingSettingsSnapshot(),
 	}
 }
 
-// BuildAutoModelRoutesForRequest takes fresh snapshots for every request. The
-// order is group order, then eligibility filters, then channel priority in
-// descending order as a hard boundary, then model effective-score bands
-// (AutoModelScoreBandWidth) inside each priority tier, then within-band weighted
-// sampling that preserves each channel's share. Channel health takes no part in
-// ordering, banding or cold-start handling — that chain has been removed
-// entirely. Cooldown and
-// hard exclusions remove routes before any tier is selected; they never fail open.
-//
-// For an auto token group, existing group authorization determines the ordered
-// concrete groups. With cross-group retry disabled only the first nonempty
-// group's plan is retained. A concrete group has already been authorized by
-// middleware, including a permitted playground group override.
+// BuildAutoModelRoutePlanForRequest builds the initial plan once. Exploration is
+// decided at most once, in the first nonempty group/priority layer.
+func BuildAutoModelRoutePlanForRequest(c *gin.Context, group string, stream bool) (AutoModelRoutePlan, error) {
+	mode := autoModelRequestNonStream
+	if stream {
+		mode = autoModelRequestStream
+	}
+	return buildAutoModelRoutePlanForRequest(c, group, mode, nil, true, rand.Float64)
+}
+
+// BuildAutoModelRoutesForRequest is the model-list compatibility wrapper.
 func BuildAutoModelRoutesForRequest(c *gin.Context, group string) ([]AutoModelRoute, error) {
-	return buildAutoModelRoutesForRequest(c, group, nil)
+	stream := false
+	if c != nil {
+		stream = common.GetContextKeyBool(c, constant.ContextKeyIsStream)
+	}
+	plan, err := BuildAutoModelRoutePlanForRequest(c, group, stream)
+	return plan.Routes, err
 }
 
-// AutoModelRebuildStatus 把"一次重排"从"有没有路由"提升为有明确语义的结果。
-// 调用方据此决定是单调前进、替换计划,还是立刻停止——而不是把"空候选"与
-// "刷新失败"混为一谈、或继续把未经完整复验的旧计划派发出去。
-type AutoModelRebuildStatus int
-
-const (
-	// AutoModelRebuildSkipped:没有已尝试路线,无需重排;调用方应继续现计划单调前进。
-	AutoModelRebuildSkipped AutoModelRebuildStatus = iota
-	// AutoModelRebuildReplaced:重排成功且有候选;调用方应从新队首开始替换计划。
-	AutoModelRebuildReplaced
-	// AutoModelRebuildEmpty:重排成功但候选为空;调用方必须清空计划并结束候选尝试。
-	AutoModelRebuildEmpty
-	// AutoModelRebuildFailed:重排刷新失败;调用方必须停止,并保留真实最后上游错误。
-	AutoModelRebuildFailed
-)
-
-// RebuildAutoModelRoutePlanForRetry re-derives the ordered plan for the same
-// request group from a fresh health snapshot, dropping every route in attempted
-// and every model marked failed by a model-scoped retry decision.
-//
-// 返回的状态消除了旧的"nil 既是空候选又是失败"歧义:
-//   - 空 attempted 直接返回 Skipped,不做"纯重排":没有已试路由时,冻结计划是几
-//     毫秒前刚按同一份健康快照排出来的,重排只会得到同一批候选的另一次随机抽取,
-//     没有信息增量,而且空集也重排会把"渠道在派发前就不可用"这条路径的索引单调
-//     递增上界打掉。
-//   - ErrAutoModelNoAuthorizedCandidates 与"重排后确无候选"都归为 Empty:这是
-//     结束尝试的信号,不是要抛给客户端的错误。
-//   - 其它错误归为 Failed:调用方必须停止继续派发,不得拿失败结果假充"无候选",
-//     也不得继续未经完整复验的旧计划。
-func RebuildAutoModelRoutePlanForRetry(c *gin.Context, group string, attempted map[AutoModelRoute]bool) ([]AutoModelRoute, AutoModelRebuildStatus) {
-	if c == nil || len(attempted) == 0 {
-		return nil, AutoModelRebuildSkipped
-	}
-	routes, err := buildAutoModelRoutesForRequest(c, group, attempted)
-	if err != nil {
-		if errors.Is(err, ErrAutoModelNoAuthorizedCandidates) {
-			return nil, AutoModelRebuildEmpty
-		}
-		common.SysError("failed to rebuild auto model routes for retry: " + err.Error())
-		return nil, AutoModelRebuildFailed
-	}
-	if len(routes) == 0 {
-		return nil, AutoModelRebuildEmpty
-	}
-	return routes, AutoModelRebuildReplaced
-}
-
-// ReplaceAutoModelRoutePlan swaps the plan in place without activating a route.
-//
-// The active index is invalidated so no caller can report the replaced plan's head
-// as "current" before a bind actually committed. Group bookkeeping is deliberately
-// left alone: only a successful bind may move the request to another group, and a
-// rebuild that turns out unusable must not have moved it already.
-func ReplaceAutoModelRoutePlan(c *gin.Context, routes []AutoModelRoute) {
-	if c == nil {
-		return
-	}
-	plan := append([]AutoModelRoute(nil), routes...)
-	c.Set(autoModelRoutePlanContextKey, plan)
-	names := make([]string, len(plan))
-	for i, route := range plan {
-		names[i] = route.ModelName
-	}
-	common.SetContextKey(c, constant.ContextKeyAutoModelCandidates, names)
-	common.SetContextKey(c, constant.ContextKeyAutoModelIndex, -1)
-}
-
-// ValidateAutoModelRouteCandidate 是派发前的最终资格复验,首次绑定与每次重试共用。
-//
-// 它读取**最新**的候选白名单与模型权重(不是规划时的快照),拒绝名单外模型、
-// 显式空名单、零或非法模型权重、或端点不适配聊天的路线。
-// 它不使用历史评分证明可用,也不重新引入独立的随机选渠;快照时点就是本次调用
-// 读取 operation_setting 配置的那一刻,并明确不承诺"网络调用已经开始之后还能撤单"。
-func ValidateAutoModelRouteCandidate(group, modelName string) bool {
+func buildAutoModelRoutePlanForRequest(c *gin.Context, group string, mode autoModelRequestMode, exclude map[AutoModelRoute]bool, allowExploration bool, random func() float64) (AutoModelRoutePlan, error) {
 	group = strings.TrimSpace(group)
-	modelName = strings.TrimSpace(modelName)
-	if group == "" || modelName == "" || operation_setting.IsAutoModelName(modelName) {
-		return false
-	}
-	allowed, configured := operation_setting.GetAutoModelCandidates()[group]
-	if configured {
-		if len(allowed) == 0 {
-			// 分组显式空名单 = 该组禁用 auto 候选。
-			return false
-		}
-		found := false
-		for _, candidate := range allowed {
-			if strings.TrimSpace(candidate) == modelName {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	weights := operation_setting.GetAutoModelWeights()
-	if !positiveAutoModelWeight(autoModelRouteWeight(group, modelName, weights)) {
-		return false
-	}
-	// 计费资格不在这里复验:首次派发前 `Relay()` 会为已绑定的路线定价,每次重试
-	// 也在 `bindAutoModelRoute` 里重新定价,缺计费配置的路线在那里必然失败——
-	// 不靠这一道检查静默拒绝已确认的计划路线,也避免它成为单测里手工拼装的计划
-	// 路线的额外前置条件。端点适配在下面复验(未知模型视为兼容,见
-	// autoModelSupportsChat)。
-	if !autoModelSupportsChat(model.GetModelSupportEndpointTypes(modelName)) {
-		return false
-	}
-	return true
-}
-
-func buildAutoModelRoutesForRequest(c *gin.Context, group string, exclude map[AutoModelRoute]bool) ([]AutoModelRoute, error) {
-	group = strings.TrimSpace(group)
+	plan := AutoModelRoutePlan{Meta: AutoModelRoutePlanMeta{
+		Mode:       mode,
+		Categories: make(map[AutoModelRoute]string),
+		Reasons:    make(map[AutoModelRoute]string),
+		Trial:      make(map[AutoModelRoute]bool),
+	}}
 	if c == nil || !operation_setting.AutoModelEnabled || group == "" {
-		return nil, nil
+		return plan, nil
+	}
+	if random == nil {
+		random = rand.Float64
 	}
 	groups := []string{group}
 	crossGroupRetry := false
@@ -326,10 +253,9 @@ func buildAutoModelRoutesForRequest(c *gin.Context, group string, exclude map[Au
 		groups = GetRequestGroupCandidates(c, userGroup, group)
 		crossGroupRetry = common.GetContextKeyBool(c, constant.ContextKeyTokenCrossGroupRetry)
 	}
-	snapshot := newAutoModelRouteSnapshot(GetAutoModelHardExcludedChannelIDs(c))
+	snapshot := newAutoModelRouteSnapshot(GetAutoModelHardExcludedChannelIDs(c), mode)
 	snapshot.ExcludedRoutes = exclude
 	snapshot.ExcludedModels = getAutoModelFailedModels(c)
-	var routes []AutoModelRoute
 	hasCandidates, hasAuthorizedCandidates := false, false
 	seenGroups := make(map[string]bool, len(groups))
 	for _, candidateGroup := range groups {
@@ -338,36 +264,64 @@ func buildAutoModelRoutesForRequest(c *gin.Context, group string, exclude map[Au
 			continue
 		}
 		seenGroups[candidateGroup] = true
-		result, err := buildAutoModelRoutesForGroup(candidateGroup, func(name string) bool {
+		result, err := buildAutoModelGroupPlan(candidateGroup, func(name string) bool {
 			return IsAutoModelCandidateAuthorized(c, name)
-		}, snapshot)
+		}, snapshot, allowExploration && !plan.Meta.ExplorationDecided, random)
 		if err != nil {
-			return nil, err
+			return plan, err
 		}
 		hasCandidates = hasCandidates || result.HasCandidates
 		hasAuthorizedCandidates = hasAuthorizedCandidates || result.HasAuthorizedCandidates
-		routes = append(routes, result.Routes...)
-		if len(routes) > 0 && !crossGroupRetry {
+		plan.Routes = append(plan.Routes, result.Routes...)
+		for route, category := range result.Meta.Categories {
+			plan.Meta.Categories[route] = category
+		}
+		for route, reason := range result.Meta.Reasons {
+			plan.Meta.Reasons[route] = reason
+		}
+		for route, trial := range result.Meta.Trial {
+			plan.Meta.Trial[route] = trial
+		}
+		if result.Meta.ExplorationDecided && !plan.Meta.ExplorationDecided {
+			plan.Meta.ExplorationDecided = true
+			plan.Meta.Explored = result.Meta.Explored
+			plan.Meta.ExplorationRatio = result.Meta.ExplorationRatio
+			plan.Meta.ExplorationRoute = result.Meta.ExplorationRoute
+			plan.Meta.ColdStart = result.Meta.ColdStart
+		}
+		if len(plan.Routes) > 0 && !crossGroupRetry {
 			break
 		}
 	}
 	if !hasAuthorizedCandidates && hasCandidates {
-		return nil, ErrAutoModelNoAuthorizedCandidates
+		return plan, ErrAutoModelNoAuthorizedCandidates
 	}
-	return routes, nil
+	return plan, nil
 }
 
 type autoModelGroupRouteResult struct {
 	Routes                  []AutoModelRoute
+	Meta                    AutoModelRoutePlanMeta
 	HasCandidates           bool
 	HasAuthorizedCandidates bool
 }
 
-func buildAutoModelRoutesForGroup(group string, authorized func(string) bool, snapshot autoModelRouteSnapshot) (autoModelGroupRouteResult, error) {
-	result := autoModelGroupRouteResult{}
-	targets, err := model.GetAutoModelRoutingTargets(group)
-	if err != nil {
-		return result, err
+func buildAutoModelGroupPlan(group string, authorized func(string) bool, snapshot autoModelRouteSnapshot, allowExploration bool, random func() float64) (autoModelGroupRouteResult, error) {
+	result := autoModelGroupRouteResult{Meta: AutoModelRoutePlanMeta{
+		Mode:       snapshot.Mode,
+		Categories: make(map[AutoModelRoute]string),
+		Reasons:    make(map[AutoModelRoute]string),
+		Trial:      make(map[AutoModelRoute]bool),
+	}}
+	// A caller that already snapshotted this group's targets (the status page)
+	// must get the same targets for classification and display.
+	targets := snapshot.Targets
+	if targets == nil {
+		var err error
+		targets, err = model.GetAutoModelRoutingTargets(group)
+		if err != nil {
+			return result, err
+		}
 	}
 	snapshot.Targets = targets
 	candidates := eligibleAutoModelCandidates(group, snapshot)
@@ -382,15 +336,20 @@ func buildAutoModelRoutesForGroup(group string, authorized func(string) bool, sn
 		candidates = allowed
 	}
 	result.HasAuthorizedCandidates = len(candidates) > 0
-	result.Routes = buildAutoModelRoutesFromSnapshot(group, candidates, snapshot, rand.Float64)
+	result.Routes, result.Meta = buildAutoModelRoutesFromSnapshot(group, candidates, snapshot, allowExploration, random)
+	result.Meta.Mode = snapshot.Mode
 	return result, nil
 }
 
 // Eligibility comes from the same enabled channel/ability snapshot used by the
-// planner, not a second model query or historical evidence. Empty allowlists and
-// explicit zero weights intentionally disable every affected route.
+// planner. Empty allowlists and explicit zero weights intentionally disable all
+// affected routes.
 func eligibleAutoModelCandidates(group string, snapshot autoModelRouteSnapshot) []string {
-	allowed, configured := operation_setting.GetAutoModelCandidates()[group]
+	candidatesConfig := snapshot.Candidates
+	if candidatesConfig == nil {
+		candidatesConfig = operation_setting.GetAutoModelCandidates()
+	}
+	allowed, configured := candidatesConfig[group]
 	if !configured {
 		allowed = make([]string, 0, len(snapshot.Targets))
 		for name := range snapshot.Targets {
@@ -419,7 +378,7 @@ func eligibleAutoModelCandidates(group string, snapshot autoModelRouteSnapshot) 
 
 func autoModelSupportsChat(endpoints []constant.EndpointType) bool {
 	if len(endpoints) == 0 {
-		return true // preserve compatibility with models lacking endpoint metadata
+		return true
 	}
 	for _, endpoint := range endpoints {
 		if endpoint == constant.EndpointTypeOpenAI || endpoint == constant.EndpointTypeOpenAIResponse {
@@ -429,22 +388,19 @@ func autoModelSupportsChat(endpoints []constant.EndpointType) bool {
 	return false
 }
 
-// autoModelRouteCandidate 是参与排序的一条具体路线 (分组, 渠道, 模型)。
-// 比较单元是路线而不是渠道:同名模型在不同渠道的得分独立,同优先级的模型分
-// 可以跨渠道交错比较。
+// autoModelRouteCandidate is one concrete (group, model, channel) route with its
+// independent reliability and mode-specific success latency evidence.
 type autoModelRouteCandidate struct {
 	ModelName     string
 	ChannelID     int
 	Priority      int64
 	ChannelWeight float64
 	ModelWeight   float64
-	Score         float64 // effectiveScore:成功、延迟、观测置信度与时间衰减的有效分
+	View          autoModelEvidenceView
 }
 
-// collectAutoModelRouteCandidates 收集参与竞争的路线。候选配置、模型权重、
-// 计费资格与启用状态已在 eligibleAutoModelCandidates 过滤;这里再执行请求级
-// 排除(已试路线、模型级失败)与严格冷却,被拒绝的路线不会进入任何档。
 func collectAutoModelRouteCandidates(group string, candidates []string, snapshot autoModelRouteSnapshot) []autoModelRouteCandidate {
+	settings := snapshot.settingsSnapshot()
 	var routes []autoModelRouteCandidate
 	seenModels := make(map[string]bool, len(candidates))
 	for _, name := range candidates {
@@ -465,8 +421,6 @@ func collectAutoModelRouteCandidates(group string, candidates []string, snapshot
 				continue
 			}
 			seenTargets[target.ChannelID] = true
-			// 本次请求已经打过的那条路不再进计划。放在去重之后:重复的 ability 行
-			// 仍按一次计,不会被这里改变语义。
 			if snapshot.ExcludedRoutes[AutoModelRoute{Group: group, ModelName: name, ChannelID: target.ChannelID}] {
 				continue
 			}
@@ -475,120 +429,288 @@ func collectAutoModelRouteCandidates(group string, candidates []string, snapshot
 				continue
 			}
 			routes = append(routes, autoModelRouteCandidate{
-				ModelName:     name,
-				ChannelID:     target.ChannelID,
-				Priority:      target.Priority,
-				ChannelWeight: target.Weight,
-				ModelWeight:   modelWeight,
-				Score:         effectiveScore(snapshot.ModelHealth[key], snapshot.Now),
+				ModelName: name, ChannelID: target.ChannelID,
+				Priority: target.Priority, ChannelWeight: target.Weight, ModelWeight: modelWeight,
+				View: autoModelEvidenceViewForSettings(snapshot.ModelHealth[key], snapshot.Mode, snapshot.Now, settings),
 			})
 		}
 	}
 	return routes
 }
 
-// buildAutoModelRoutesFromSnapshot 把全部可用路线展平后按新规则排序:
-//
-//	渠道 priority 降序(硬边界) → 每个优先级内按模型有效得分分档 → 档内保留渠道份额的两级加权随机
-//
-// 渠道聚合健康分的整条链路(状态、更新、持久化、快照、展示)已随本方案整体
-// 移除。没有模型观测的路线按中立有效分 0.5 参与分档,不再有"未观测渠道强制进
-// 最好档"的例外。
-// 冷却与请求级排除在收集阶段完成;它们不会因为高优先级或候选全部不可用而放行。
-func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapshot autoModelRouteSnapshot, random func() float64) []AutoModelRoute {
-	if random == nil {
-		random = rand.Float64
+// buildAutoModelRoutesFromSnapshot keeps group/priority as hard boundaries. In
+// each priority tier it classifies main candidates, orders latency pools, then
+// appends trial routes. Exploration may prepend one route from outside the main
+// pool, but never from another group or priority tier.
+func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapshot autoModelRouteSnapshot, allowExploration bool, random func() float64) ([]AutoModelRoute, AutoModelRoutePlanMeta) {
+	meta := AutoModelRoutePlanMeta{
+		Mode:       snapshot.Mode,
+		Categories: make(map[AutoModelRoute]string),
+		Reasons:    make(map[AutoModelRoute]string),
+		Trial:      make(map[AutoModelRoute]bool),
 	}
 	routes := collectAutoModelRouteCandidates(group, candidates, snapshot)
-	// priority 是硬边界:降序排列后逐层处理。低优先级候选即使得分更高,也只能
-	// 排在仍有候选的高优先级层之后。
-	sort.SliceStable(routes, func(i, j int) bool { return routes[i].Priority > routes[j].Priority })
-	width := operation_setting.AutoModelScoreBandWidth()
-	var plan []AutoModelRoute
-	var debugAnchor float64
-	for start := 0; start < len(routes); {
-		end := start + 1
-		for end < len(routes) && routes[end].Priority == routes[start].Priority {
-			end++
+	byPriority := make(map[int64][]autoModelRouteCandidate)
+	var priorities []int64
+	for _, route := range routes {
+		if _, ok := byPriority[route.Priority]; !ok {
+			priorities = append(priorities, route.Priority)
 		}
-		tier := routes[start:end]
-		plan = append(plan, orderAutoModelScoreBandRoutes(group, tier, width, random)...)
-		if start == 0 {
-			// 队首所在档的锚点 = 首层最高分(band 0 锚定在层内最高分)。
-			debugAnchor = tier[0].Score
-			for _, route := range tier {
-				if route.Score > debugAnchor {
-					debugAnchor = route.Score
+		byPriority[route.Priority] = append(byPriority[route.Priority], route)
+	}
+	sort.Slice(priorities, func(i, j int) bool { return priorities[i] > priorities[j] })
+	var plan []AutoModelRoute
+	decided := false
+	for _, priority := range priorities {
+		tierRoutes, tierMeta, tierDecided := buildAutoModelPriorityTier(group, byPriority[priority], snapshot, allowExploration && !decided, random)
+		plan = append(plan, tierRoutes...)
+		for route, category := range tierMeta.Categories {
+			meta.Categories[route] = category
+		}
+		for route, reason := range tierMeta.Reasons {
+			meta.Reasons[route] = reason
+		}
+		for route, trial := range tierMeta.Trial {
+			meta.Trial[route] = trial
+		}
+		if tierDecided && !decided {
+			decided = true
+			meta.ExplorationDecided = tierMeta.ExplorationDecided
+			meta.Explored = tierMeta.Explored
+			meta.ExplorationRatio = tierMeta.ExplorationRatio
+			meta.ExplorationRoute = tierMeta.ExplorationRoute
+			meta.ColdStart = tierMeta.ColdStart
+		}
+	}
+	return plan, meta
+}
+
+func buildAutoModelPriorityTier(group string, tier []autoModelRouteCandidate, snapshot autoModelRouteSnapshot, allowExploration bool, random func() float64) ([]AutoModelRoute, AutoModelRoutePlanMeta, bool) {
+	meta := AutoModelRoutePlanMeta{
+		Mode:       snapshot.Mode,
+		Categories: make(map[AutoModelRoute]string),
+		Reasons:    make(map[AutoModelRoute]string),
+		Trial:      make(map[AutoModelRoute]bool),
+	}
+	settings := snapshot.settingsSnapshot()
+	mainCandidates := make([]autoModelRouteCandidate, 0, len(tier))
+	var trialCandidates []autoModelRouteCandidate
+	for _, candidate := range tier {
+		if autoModelIsMainCandidate(candidate.View, settings) {
+			mainCandidates = append(mainCandidates, candidate)
+		} else {
+			trialCandidates = append(trialCandidates, candidate)
+		}
+	}
+
+	pools := autoModelOrderLatencyPools(mainCandidates, settings)
+	mainRoutes := make([]AutoModelRoute, 0, len(tier))
+	for poolIndex, pool := range pools {
+		category := "main"
+		reason := fmt.Sprintf("主流量候选：成功延迟 %.0fms", pool[0].View.LatencyMS)
+		if poolIndex > 0 {
+			category = "backup"
+			reason = fmt.Sprintf("可靠慢后备：成功延迟 %.0fms", pool[0].View.LatencyMS)
+		}
+		for _, route := range sampleAutoModelCandidateRoutes(group, pool, random, func(candidate autoModelRouteCandidate) float64 {
+			return candidate.ModelWeight
+		}) {
+			mainRoutes = append(mainRoutes, route)
+			meta.Categories[route] = category
+			meta.Reasons[route] = reason
+		}
+	}
+
+	trialByRoute := make(map[AutoModelRoute]autoModelRouteCandidate, len(trialCandidates))
+	for _, candidate := range trialCandidates {
+		trialByRoute[AutoModelRoute{Group: group, ModelName: candidate.ModelName, ChannelID: candidate.ChannelID}] = candidate
+	}
+	trialRoutes := sampleAutoModelCandidateRoutes(group, trialCandidates, random, func(candidate autoModelRouteCandidate) float64 {
+		return candidate.ModelWeight * autoModelExplorationTendency(candidate, snapshot.Now, settings)
+	})
+	for _, route := range trialRoutes {
+		category, reason := autoModelTrialCategory(trialByRoute[route], settings)
+		meta.Categories[route] = category
+		meta.Reasons[route] = reason
+		meta.Trial[route] = true
+	}
+
+	layer := append(append([]AutoModelRoute(nil), mainRoutes...), trialRoutes...)
+	if allowExploration && len(layer) > 0 {
+		meta.ExplorationDecided = true
+		mainPoolSize := 0
+		if len(pools) > 0 {
+			mainPoolSize = len(pools[0])
+		}
+		if mainPoolSize == 0 {
+			meta.ColdStart = true
+			return layer, meta, true
+		}
+		exploreCandidates := append([]autoModelRouteCandidate(nil), trialCandidates...)
+		for _, pool := range pools[1:] {
+			exploreCandidates = append(exploreCandidates, pool...)
+		}
+		if len(exploreCandidates) > 0 {
+			trialRatio := float64(len(trialCandidates)) / float64(len(tier))
+			base := settings.ExploreRatio
+			maximum := settings.ExploreMaxRatio
+			meta.ExplorationRatio = base + (maximum-base)*trialRatio
+			if meta.ExplorationRatio > 0 && random() < meta.ExplorationRatio {
+				chosen, ok := chooseAutoModelExplorationCandidate(exploreCandidates, random, snapshot.Now, settings)
+				if ok {
+					chosenRoute := AutoModelRoute{Group: group, ModelName: chosen.ModelName, ChannelID: chosen.ChannelID}
+					layer = prependUniqueAutoModelRoute(layer, chosenRoute)
+					meta.Explored = true
+					meta.ExplorationRoute = chosenRoute
 				}
 			}
 		}
-		start = end
 	}
-	if common.DebugEnabled && len(plan) > 0 {
-		head := plan[0]
-		for _, route := range routes {
-			if route.ModelName == head.ModelName && route.ChannelID == head.ChannelID {
-				common.SysLog(fmt.Sprintf(
-					"auto route: group %s plan %d routes, band width %.4f, head %s@%d priority %d score %.4f anchor %.4f channel weight %.1f model weight %.1f",
-					group, len(plan), width, route.ModelName, route.ChannelID, route.Priority,
-					route.Score, debugAnchor, route.ChannelWeight, route.ModelWeight))
-				break
-			}
-		}
-	}
-	return plan
+	return layer, meta, meta.ExplorationDecided
 }
 
-// orderAutoModelScoreBandRoutes 把同一渠道优先级内的全部路线按模型有效得分分档,
-// 档内做保留渠道份额的无放回抽样,输出这一层的完整路线顺序。
-//
-// 分档锚定在"尚未分档路线里的最高分",不是相邻项:相邻锚定会把
-// 0.900/0.894/0.888 这样的一串接近分数串成一档。边界包含恰好等于档宽的情况;
-// 浮点比较带 1e-9 容差,否则 0.900-0.890=0.0100…9 的浮点误差会把方案里
-// "0.900/0.895/0.890 同档"的边界例子拆开。档宽 >= 1 时同优先级内所有正常
-// 得分同档;档宽 = 0 时只有同分(含浮点容差)才同档。
-//
-// 同档以后精确分数不再决定先后,也不乘进随机权重:否则流量仍会向微弱领先者
-// 集中,这正是得分分档要解决的问题。
-func orderAutoModelScoreBandRoutes(group string, tier []autoModelRouteCandidate, width float64, random func() float64) []AutoModelRoute {
-	ordered := append([]autoModelRouteCandidate(nil), tier...)
+func autoModelIsMainCandidate(view autoModelEvidenceView, settings operation_setting.AutoModelRoutingSettings) bool {
+	return view.ReliabilityKnown &&
+		view.Reliability >= settings.ReliabilityThreshold &&
+		view.LatencyKnown && !view.PendingRecovery
+}
+
+func autoModelOrderLatencyPools(candidates []autoModelRouteCandidate, settings operation_setting.AutoModelRoutingSettings) [][]autoModelRouteCandidate {
+	ordered := append([]autoModelRouteCandidate(nil), candidates...)
 	sort.SliceStable(ordered, func(i, j int) bool {
-		if ordered[i].Score != ordered[j].Score {
-			return ordered[i].Score > ordered[j].Score
+		if ordered[i].View.LatencyMS != ordered[j].View.LatencyMS {
+			return ordered[i].View.LatencyMS < ordered[j].View.LatencyMS
 		}
 		if ordered[i].ChannelID != ordered[j].ChannelID {
 			return ordered[i].ChannelID < ordered[j].ChannelID
 		}
 		return ordered[i].ModelName < ordered[j].ModelName
 	})
-	var bands [][]autoModelRouteCandidate
-	anchor := 0.0
-	for _, route := range ordered {
-		if len(bands) == 0 || route.Score < anchor-width-autoModelRouteScoreTieEpsilon {
-			bands = append(bands, []autoModelRouteCandidate{route})
-			anchor = route.Score
-			continue
+	var pools [][]autoModelRouteCandidate
+	for start := 0; start < len(ordered); {
+		anchor := ordered[start].View.LatencyMS
+		tolerance := math.Max(float64(settings.LatencyToleranceMs),
+			settings.LatencyToleranceRatio*anchor)
+		end := start + 1
+		for end < len(ordered) && ordered[end].View.LatencyMS <= anchor+tolerance+1e-9 {
+			end++
 		}
-		bands[len(bands)-1] = append(bands[len(bands)-1], route)
+		pools = append(pools, append([]autoModelRouteCandidate(nil), ordered[start:end]...))
+		start = end
 	}
-	var plan []AutoModelRoute
-	for _, band := range bands {
-		plan = append(plan, sampleAutoModelBandRoutes(group, band, random)...)
-	}
-	return plan
+	return pools
 }
 
-// sampleAutoModelBandRoutes 在一个得分档内做无放回的两级抽样:先按渠道权重在
-// 剩余渠道里选渠道,再按模型权重在该渠道的剩余路线里选模型。
-//
-// 每抽走一条路线都更新剩余候选与归一化分母,渠道不会被一次抽中后连续输出其
-// 全部模型。渠道权重相同时,10 个候选模型的渠道与 1 个候选模型的渠道总流量
-// 约各占一半;模型权重为 0 的路线在收集阶段已被排除,渠道权重为 0 的渠道在
-// 正权重渠道耗尽前不参与(保留为该档内的后备),剩余渠道全零权重时等概率。
-// 渠道与模型都按稳定顺序枚举,同一随机源下结果可复现。
-func sampleAutoModelBandRoutes(group string, band []autoModelRouteCandidate, random func() float64) []AutoModelRoute {
-	byChannel := make(map[int][]autoModelRouteCandidate, len(band))
-	for _, route := range band {
+func autoModelTrialCategory(route autoModelRouteCandidate, settings operation_setting.AutoModelRoutingSettings) (string, string) {
+	view := route.View
+	if view.PendingRecovery {
+		return "pending_recovery", "待恢复"
+	}
+	if view.Observations == 0 {
+		return "unobserved", "待观察：未观察"
+	}
+	if !view.ReliabilityKnown {
+		if view.Observations < float64(settings.MinObservations) {
+			return "insufficient", "试用：业务样本不足"
+		}
+		return "stale", "试用：可靠性证据陈旧"
+	}
+	if view.Reliability < settings.ReliabilityThreshold {
+		return "unreliable", "试用：可靠性不足"
+	}
+	if !view.LatencyKnown {
+		if view.LatencySamples < autoModelMinLatencySamples {
+			return "latency_insufficient", "试用：成功延迟样本不足"
+		}
+		return "latency_stale", "试用：成功延迟证据陈旧"
+	}
+	return "trial", "试用"
+}
+
+func autoModelExplorationTendency(candidate autoModelRouteCandidate, now time.Time, settings operation_setting.AutoModelRoutingSettings) float64 {
+	tendency := 1.0
+	minObservations := float64(settings.MinObservations)
+	if minObservations > 0 && candidate.View.Observations < minObservations {
+		tendency += 1 - candidate.View.Observations/minObservations
+	}
+	if candidate.View.LastObservedAt.IsZero() {
+		tendency += 1
+	} else {
+		decay := time.Duration(settings.ScoreDecayMinutes) * time.Minute
+		if decay > 0 {
+			tendency += math.Min(1, math.Max(0, float64(now.Sub(candidate.View.LastObservedAt))/float64(decay)))
+		}
+	}
+	if candidate.View.PendingRecovery {
+		tendency++
+	}
+	return tendency
+}
+
+func chooseAutoModelExplorationCandidate(candidates []autoModelRouteCandidate, random func() float64, now time.Time, settings operation_setting.AutoModelRoutingSettings) (autoModelRouteCandidate, bool) {
+	if len(candidates) == 0 {
+		return autoModelRouteCandidate{}, false
+	}
+	byChannel := make(map[int][]autoModelRouteCandidate)
+	channelWeights := make(map[int]float64)
+	for _, candidate := range candidates {
+		byChannel[candidate.ChannelID] = append(byChannel[candidate.ChannelID], candidate)
+		channelWeights[candidate.ChannelID] = candidate.ChannelWeight
+	}
+	channelIDs := make([]int, 0, len(byChannel))
+	active := make([]int, 0, len(byChannel))
+	positive := make([]int, 0, len(byChannel))
+	for id := range byChannel {
+		channelIDs = append(channelIDs, id)
+	}
+	sort.Ints(channelIDs)
+	for _, id := range channelIDs {
+		active = append(active, id)
+		if positiveAutoModelWeight(channelWeights[id]) {
+			positive = append(positive, id)
+		}
+	}
+	var channelID int
+	if len(positive) > 0 {
+		items := make([]autoModelWeightedItem, 0, len(positive))
+		for _, id := range positive {
+			items = append(items, autoModelWeightedItem{Index: id, Weight: channelWeights[id]})
+		}
+		channelID = positive[chooseAutoModelWeightedItem(items, random)]
+	} else {
+		channelID = active[int(random()*float64(len(active)))%len(active)]
+	}
+	models := byChannel[channelID]
+	items := make([]autoModelWeightedItem, 0, len(models))
+	for i, candidate := range models {
+		items = append(items, autoModelWeightedItem{Index: i, Weight: candidate.ModelWeight * autoModelExplorationTendency(candidate, now, settings)})
+	}
+	return models[chooseAutoModelWeightedItem(items, random)], true
+}
+
+func prependUniqueAutoModelRoute(routes []AutoModelRoute, chosen AutoModelRoute) []AutoModelRoute {
+	result := make([]AutoModelRoute, 0, len(routes)+1)
+	result = append(result, chosen)
+	for _, route := range routes {
+		if route == chosen {
+			continue
+		}
+		result = append(result, route)
+	}
+	return result
+}
+
+// sampleAutoModelCandidateRoutes preserves the existing two-level channel share:
+// choose a channel by channel weight, then a model by its candidate weight.
+func sampleAutoModelCandidateRoutes(group string, candidates []autoModelRouteCandidate, random func() float64, weight func(autoModelRouteCandidate) float64) []AutoModelRoute {
+	if len(candidates) == 0 {
+		return nil
+	}
+	if random == nil {
+		random = rand.Float64
+	}
+	byChannel := make(map[int][]autoModelRouteCandidate, len(candidates))
+	for _, route := range candidates {
 		byChannel[route.ChannelID] = append(byChannel[route.ChannelID], route)
 	}
 	channelIDs := make([]int, 0, len(byChannel))
@@ -633,7 +755,7 @@ func sampleAutoModelBandRoutes(group string, band []autoModelRouteCandidate, ran
 		models := remaining[chosenChannel]
 		items := make([]autoModelWeightedItem, 0, len(models))
 		for i, route := range models {
-			items = append(items, autoModelWeightedItem{Index: i, Weight: route.ModelWeight})
+			items = append(items, autoModelWeightedItem{Index: i, Weight: weight(route)})
 		}
 		idx := chooseAutoModelWeightedItem(items, random)
 		chosen := models[idx]
@@ -647,46 +769,80 @@ func sampleAutoModelBandRoutes(group string, band []autoModelRouteCandidate, ran
 	return plan
 }
 
+type AutoModelRebuildStatus int
 
-// autoModelWeightedItem 是一次加权抽样的候选项:Index 是候选项在其切片中的位置,
-// Weight 是渠道权重或模型权重。分数不参与档内抽样——它只决定分档归属。
-type autoModelWeightedItem struct {
-	Index  int
-	Weight float64
+const (
+	AutoModelRebuildSkipped AutoModelRebuildStatus = iota
+	AutoModelRebuildReplaced
+	AutoModelRebuildEmpty
+	AutoModelRebuildFailed
+)
+
+func RebuildAutoModelRoutePlanForRetry(c *gin.Context, group string, attempted map[AutoModelRoute]bool) (AutoModelRoutePlan, AutoModelRebuildStatus) {
+	if c == nil || len(attempted) == 0 {
+		return AutoModelRoutePlan{}, AutoModelRebuildSkipped
+	}
+	mode := GetAutoModelRoutePlanMeta(c).Mode
+	plan, err := buildAutoModelRoutePlanForRequest(c, group, mode, attempted, false, rand.Float64)
+	if err != nil {
+		if errors.Is(err, ErrAutoModelNoAuthorizedCandidates) {
+			return AutoModelRoutePlan{}, AutoModelRebuildEmpty
+		}
+		common.SysError("failed to rebuild auto model routes for retry: " + err.Error())
+		return AutoModelRoutePlan{}, AutoModelRebuildFailed
+	}
+	if len(plan.Routes) == 0 {
+		return AutoModelRoutePlan{}, AutoModelRebuildEmpty
+	}
+	plan.Meta.ExplorationDecided = true
+	plan.Meta.Explored = false
+	return plan, AutoModelRebuildReplaced
 }
 
-// chooseAutoModelWeightedItem 在全部正权重候选项里按权重抽一个,返回下标。
-// 先按最大权重归一再求和,极大有限权重不会溢出;调用方保证不含零/负权重
-// (零权重渠道的后备与全零等概率语义在抽样调用处处理)。
-func chooseAutoModelWeightedItem(items []autoModelWeightedItem, random func() float64) int {
-	maxWeight := 0.0
-	for _, item := range items {
-		if positiveAutoModelWeight(item.Weight) && item.Weight > maxWeight {
-			maxWeight = item.Weight
+func ReplaceAutoModelRoutePlan(c *gin.Context, routes []AutoModelRoute) {
+	if c == nil {
+		return
+	}
+	plan := append([]AutoModelRoute(nil), routes...)
+	c.Set(autoModelRoutePlanContextKey, plan)
+	names := make([]string, len(plan))
+	for i, route := range plan {
+		names[i] = route.ModelName
+	}
+	common.SetContextKey(c, constant.ContextKeyAutoModelCandidates, names)
+	common.SetContextKey(c, constant.ContextKeyAutoModelIndex, -1)
+}
+
+func ValidateAutoModelRouteCandidate(group, modelName string) bool {
+	group = strings.TrimSpace(group)
+	modelName = strings.TrimSpace(modelName)
+	if group == "" || modelName == "" || operation_setting.IsAutoModelName(modelName) {
+		return false
+	}
+	allowed, configured := operation_setting.GetAutoModelCandidates()[group]
+	if configured {
+		if len(allowed) == 0 {
+			return false
 		}
-	}
-	if maxWeight == 0 {
-		// 理论上不可达:渠道与模型两级调用都只传正权重。保留等概率兜底。
-		return int(random()*float64(len(items))) % len(items)
-	}
-	total := 0.0
-	lastPositive := 0
-	for i, item := range items {
-		if positiveAutoModelWeight(item.Weight) {
-			total += item.Weight / maxWeight // finite even for very large weights
-			lastPositive = i
-		}
-	}
-	draw := random() * total
-	for i, item := range items {
-		if positiveAutoModelWeight(item.Weight) {
-			draw -= item.Weight / maxWeight
-			if draw < 0 {
-				return i
+		found := false
+		for _, candidate := range allowed {
+			if strings.TrimSpace(candidate) == modelName {
+				found = true
+				break
 			}
 		}
+		if !found {
+			return false
+		}
 	}
-	return lastPositive // floating-point rounding at the upper edge
+	weights := operation_setting.GetAutoModelWeights()
+	if !positiveAutoModelWeight(autoModelRouteWeight(group, modelName, weights)) {
+		return false
+	}
+	if !autoModelSupportsChat(model.GetModelSupportEndpointTypes(modelName)) {
+		return false
+	}
+	return true
 }
 
 func autoModelRouteWeight(group, name string, weights map[string]map[string]float64) float64 {
@@ -710,4 +866,59 @@ func autoModelRouteModelNames(routes []AutoModelRoute) []string {
 		}
 	}
 	return names
+}
+
+type autoModelWeightedItem struct {
+	Index  int
+	Weight float64
+}
+
+func chooseAutoModelWeightedItem(items []autoModelWeightedItem, random func() float64) int {
+	maxWeight := 0.0
+	for _, item := range items {
+		if positiveAutoModelWeight(item.Weight) && item.Weight > maxWeight {
+			maxWeight = item.Weight
+		}
+	}
+	if maxWeight == 0 {
+		return int(random()*float64(len(items))) % len(items)
+	}
+	total := 0.0
+	lastPositive := 0
+	for i, item := range items {
+		if positiveAutoModelWeight(item.Weight) {
+			total += item.Weight / maxWeight
+			lastPositive = i
+		}
+	}
+	draw := random() * total
+	for i, item := range items {
+		if positiveAutoModelWeight(item.Weight) {
+			draw -= item.Weight / maxWeight
+			if draw < 0 {
+				return i
+			}
+		}
+	}
+	return lastPositive
+}
+
+func GetAutoModelCandidates(group string) []string {
+	if !operation_setting.AutoModelEnabled || strings.TrimSpace(group) == "" {
+		return nil
+	}
+	result, err := buildAutoModelGroupPlan(strings.TrimSpace(group), nil, newAutoModelRouteSnapshot(nil, autoModelRequestNonStream), false, rand.Float64)
+	if err != nil {
+		common.SysError("failed to load auto model routing targets: " + err.Error())
+		return nil
+	}
+	return autoModelRouteModelNames(result.Routes)
+}
+
+func GetAutoModelCandidatesForRequest(c *gin.Context, group string) []string {
+	routes, err := BuildAutoModelRoutesForRequest(c, group)
+	if err != nil && !errors.Is(err, ErrAutoModelNoAuthorizedCandidates) {
+		common.SysError("failed to build auto model routes: " + err.Error())
+	}
+	return autoModelRouteModelNames(routes)
 }

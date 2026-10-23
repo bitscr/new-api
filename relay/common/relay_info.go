@@ -97,10 +97,12 @@ type RelayInfo struct {
 	isFirstResponse   bool
 	// Attempt timing is independent of request-level StartTime/FirstResponseTime.
 	// Retries must not inherit another upstream attempt's wait or first response.
-	AttemptStartTime         time.Time
-	AttemptFirstResponseTime time.Time
-	AttemptEndTime           time.Time
-	upstreamDispatch         bool
+	AttemptStartTime            time.Time
+	AttemptDispatchTime         time.Time
+	AttemptFirstResponseTime    time.Time
+	AttemptFirstValidOutputTime time.Time
+	AttemptEndTime              time.Time
+	upstreamDispatch            bool
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool
@@ -736,7 +738,9 @@ func (info *RelayInfo) BeginAttempt() {
 		return
 	}
 	info.AttemptStartTime = time.Now()
+	info.AttemptDispatchTime = time.Time{}
 	info.AttemptFirstResponseTime = time.Time{}
+	info.AttemptFirstValidOutputTime = time.Time{}
 	info.AttemptEndTime = time.Time{}
 	info.upstreamDispatch = false
 	if info.answer != nil {
@@ -748,8 +752,12 @@ func (info *RelayInfo) BeginAttempt() {
 // local validation and admission guards. It does not imply bytes were sent:
 // a failed connection attempt is still evidence about the selected upstream.
 func (info *RelayInfo) MarkUpstreamDispatch() {
-	if info != nil {
-		info.upstreamDispatch = true
+	if info == nil {
+		return
+	}
+	info.upstreamDispatch = true
+	if info.AttemptDispatchTime.IsZero() && info.AttemptEndTime.IsZero() {
+		info.AttemptDispatchTime = time.Now()
 	}
 }
 
@@ -780,6 +788,40 @@ func (info *RelayInfo) AttemptElapsed() time.Duration {
 	return end.Sub(info.AttemptStartTime)
 }
 
+// attemptLatencyStart is the real dispatch time when known. Fall back to the
+// attempt start only for hand-built RelayInfo values that never entered a
+// dispatch guard; a dispatched attempt always records the guard's timestamp.
+func (info *RelayInfo) attemptLatencyStart() time.Time {
+	if info == nil {
+		return time.Time{}
+	}
+	if !info.AttemptDispatchTime.IsZero() {
+		return info.AttemptDispatchTime
+	}
+	return info.AttemptStartTime
+}
+
+// AttemptDispatchElapsed measures from the unified upstream dispatch guard to
+// the end of this attempt. It excludes local conversion, image download and
+// encoding; AttemptElapsed remains the full processing time for logs.
+func (info *RelayInfo) AttemptDispatchElapsed() time.Duration {
+	if info == nil {
+		return 0
+	}
+	start := info.attemptLatencyStart()
+	if start.IsZero() {
+		return 0
+	}
+	end := info.AttemptEndTime
+	if end.IsZero() {
+		end = time.Now()
+	}
+	if end.Before(start) {
+		return 0
+	}
+	return end.Sub(start)
+}
+
 // AttemptFirstResponseLatency accepts only a first response inside this attempt.
 // A few legacy adaptors write FirstResponseTime directly; retain their signal only
 // when it belongs to this attempt, never when it is left over from a failed one.
@@ -799,6 +841,36 @@ func (info *RelayInfo) AttemptFirstResponseLatency() (time.Duration, bool) {
 		return 0, false
 	}
 	return first.Sub(info.AttemptStartTime), true
+}
+
+// MarkFirstValidOutput records the first actual answer delta in this attempt.
+// Callers must only invoke it for text/reasoning/tool output, never role,
+// heartbeat, usage or metadata frames.
+func (info *RelayInfo) MarkFirstValidOutput() {
+	if info == nil || info.AttemptStartTime.IsZero() || !info.AttemptEndTime.IsZero() {
+		return
+	}
+	if info.AttemptFirstValidOutputTime.IsZero() {
+		info.AttemptFirstValidOutputTime = time.Now()
+	}
+}
+
+// AttemptFirstValidOutputLatency returns a success-speed sample only when a
+// valid output was observed inside this attempt.
+func (info *RelayInfo) AttemptFirstValidOutputLatency() (time.Duration, bool) {
+	start := info.attemptLatencyStart()
+	if start.IsZero() {
+		return 0, false
+	}
+	first := info.AttemptFirstValidOutputTime
+	end := info.AttemptEndTime
+	if end.IsZero() {
+		end = time.Now()
+	}
+	if first.IsZero() || first.Before(start) || first.After(end) {
+		return 0, false
+	}
+	return first.Sub(start), true
 }
 
 func (info *RelayInfo) SetFirstResponseTime() {

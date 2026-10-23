@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -102,6 +103,52 @@ func queryAutoModelRoutingTargets(group string) (map[string][]AutoModelRoutingTa
 			target.Weight = float64(*row.Weight)
 		}
 		result[row.Model] = append(result[row.Model], target)
+	}
+	return result, nil
+}
+
+// GetAllAutoModelRoutingTargets returns every enabled ability joined to an
+// enabled channel, grouped by group. It exists for the status page, which must
+// show candidates that have no stored evidence yet. Order is unspecified.
+func GetAllAutoModelRoutingTargets() (map[string]map[string][]AutoModelRoutingTarget, error) {
+	if DB == nil {
+		return nil, errors.New("routing database is not initialized")
+	}
+	var rows []struct {
+		Group     string `gorm:"column:group_name"`
+		Model     string
+		ChannelID int
+		Priority  *int64
+		Weight    *uint
+	}
+	groupColumn := "`group`"
+	if DB.Dialector.Name() == "postgres" {
+		groupColumn = `"group"`
+	}
+	if err := DB.Table("abilities").
+		Select("abilities."+groupColumn+" AS group_name, abilities.model, channels.id AS channel_id, channels.priority, channels.weight").
+		Joins("INNER JOIN channels ON channels.id = abilities.channel_id").
+		Where("abilities.enabled = ? AND channels.status = ?", true, common.ChannelStatusEnabled).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	result := make(map[string]map[string][]AutoModelRoutingTarget)
+	for _, row := range rows {
+		group := strings.TrimSpace(row.Group)
+		if group == "" {
+			continue
+		}
+		target := AutoModelRoutingTarget{ChannelID: row.ChannelID}
+		if row.Priority != nil {
+			target.Priority = *row.Priority
+		}
+		if row.Weight != nil {
+			target.Weight = float64(*row.Weight)
+		}
+		if result[group] == nil {
+			result[group] = make(map[string][]AutoModelRoutingTarget)
+		}
+		result[group][row.Model] = append(result[group][row.Model], target)
 	}
 	return result, nil
 }

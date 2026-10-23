@@ -27,8 +27,9 @@ import (
 )
 
 type ModelRequest struct {
-	Model string `json:"model"`
-	Group string `json:"group,omitempty"`
+	Model  string `json:"model"`
+	Group  string `json:"group,omitempty"`
+	Stream bool   `json:"stream,omitempty"`
 }
 
 func Distribute() func(c *gin.Context) {
@@ -78,7 +79,8 @@ func Distribute() func(c *gin.Context) {
 				// 记住这次解析出的请求分组。重试要按同一批候选重排,而
 				// ContextKeyUsingGroup 会被每次绑定的具体路由改写,不能拿它当依据。
 				common.SetContextKey(c, constant.ContextKeyAutoModelRequestGroup, autoGroup)
-				routes, routeErr := service.BuildAutoModelRoutesForRequest(c, autoGroup)
+				common.SetContextKey(c, constant.ContextKeyIsStream, modelRequest.Stream)
+				plan, routeErr := service.BuildAutoModelRoutePlanForRequest(c, autoGroup, modelRequest.Stream)
 				if routeErr != nil {
 					if errors.Is(routeErr, service.ErrAutoModelNoAuthorizedCandidates) {
 						abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenNoModelAccess))
@@ -89,7 +91,7 @@ func Distribute() func(c *gin.Context) {
 						types.ErrorCodeModelNotFound)
 					return
 				}
-				if len(routes) == 0 {
+				if len(plan.Routes) == 0 {
 					// Never reopen cooling routes, even when the token has no usable
 					// alternative. No route is preferable to dispatching a blocked one.
 					abortWithOpenAiMessage(c, http.StatusServiceUnavailable,
@@ -98,8 +100,9 @@ func Distribute() func(c *gin.Context) {
 					return
 				}
 				common.SetContextKey(c, constant.ContextKeyAutoModelClientName, modelRequest.Model)
-				service.SetAutoModelRoutePlan(c, routes)
-				modelRequest.Model = routes[0].ModelName
+				service.SetAutoModelRoutePlan(c, plan.Routes)
+				service.SetAutoModelRoutePlanMeta(c, plan.Meta)
+				modelRequest.Model = plan.Routes[0].ModelName
 			}
 
 			// Select a channel for the user
@@ -453,10 +456,16 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 			return nil, false, err
 		}
 		modelRequest.Model = req.Model
+		modelRequest.Stream = req.Stream
 	}
 	if strings.HasPrefix(c.Request.URL.Path, "/v1/realtime") {
 		//wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01
 		modelRequest.Model = c.Query("model")
+		modelRequest.Stream = true
+	}
+	// Gemini streaming is encoded in the path, not only in the JSON body.
+	if strings.Contains(c.Request.URL.Path, ":streamGenerateContent") {
+		modelRequest.Stream = true
 	}
 	if strings.HasPrefix(c.Request.URL.Path, "/v1/moderations") {
 		if modelRequest.Model == "" {
@@ -511,6 +520,7 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 		}
 		modelRequest.Model = req.Model
 		modelRequest.Group = req.Group
+		modelRequest.Stream = req.Stream
 		common.SetContextKey(c, constant.ContextKeyTokenGroup, modelRequest.Group)
 	}
 

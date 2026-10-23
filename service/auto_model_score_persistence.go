@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -110,8 +111,11 @@ func startAutoModelScorePersistence(db *gorm.DB, period, ioTimeout time.Duration
 }
 
 func (p *autoModelScorePersistence) flush(ctx context.Context) error {
+	// Clear markers go first: every snapshot captured before a clear must lose
+	// against them, whether it arrives from this instance or another one.
+	tombstoneErr := errors.Join(savePendingAutoModelClearTombstones(ctx, p.db), RetryPendingAutoModelCooldownWrites(ctx, p.db))
 	var changed []model.AutoModelScore
-	rows := snapshotAutoModelScores()
+	rows := staleAutoModelScoreRows(snapshotAutoModelScores())
 	now := time.Now()
 	for _, row := range rows {
 		if !validAutoModelScore(row, now) {
@@ -129,13 +133,13 @@ func (p *autoModelScorePersistence) flush(ctx context.Context) error {
 		changed = append(changed, row)
 	}
 	if len(changed) == 0 {
-		return nil
+		return tombstoneErr
 	}
 	// Keep failed observations dirty; later feedback stays in the online maps
 	// while SQL runs, and comparing against this captured batch retains it.
 	outcomes, err := model.SaveAutoModelScores(ctx, p.db, changed)
 	if err != nil {
-		return err
+		return errors.Join(tombstoneErr, err)
 	}
 	if p.saved == nil {
 		p.saved = make(map[autoModelScoreKey]model.AutoModelScore)
@@ -158,7 +162,7 @@ func (p *autoModelScorePersistence) flush(ctx context.Context) error {
 			p.nextPrune = expires
 		}
 	}
-	return nil
+	return tombstoneErr
 }
 
 func (p *autoModelScorePersistence) restore(ctx context.Context) error {
@@ -182,22 +186,64 @@ func (p *autoModelScorePersistence) restore(ctx context.Context) error {
 	// timestamp-rejected batch whose blocking row another instance removed.
 	p.saved = make(map[autoModelScoreKey]model.AutoModelScore, len(rows))
 	p.superseded = make(map[autoModelScoreKey]model.AutoModelScore)
+	loadedTombstones := make(map[string]model.AutoModelScore)
+	for _, row := range rows {
+		if row.Version != model.AutoModelScoreTombstoneVersion || !validAutoModelTombstone(row, now) {
+			continue
+		}
+		key := autoModelHealthKey(row.Group, row.Model, row.ChannelID)
+		if previous, ok := loadedTombstones[key]; !ok || model.AutoModelScoreIsNewer(row, previous) {
+			loadedTombstones[key] = row
+		}
+	}
 	autoModelScoreMutex.Lock()
+	for key, row := range loadedTombstones {
+		// A clear accepted in this process after the query started must not be
+		// replaced by the older stored marker.
+		if current, ok := autoModelClearTombstones[key]; ok {
+			if !time.Unix(0, row.ObservedAt).After(current.ClearedAt) {
+				continue
+			}
+		}
+		autoModelClearTombstones[key] = autoModelClearTombstone{
+			ClearedAt:      time.Unix(0, row.ObservedAt),
+			ObservationSeq: row.ObservationSeq,
+			WriterID:       row.WriterID,
+		}
+	}
 	for _, row := range rows {
 		if !validAutoModelScore(row, now) {
 			continue
+		}
+		key := autoModelHealthKey(row.Group, row.Model, row.ChannelID)
+		// A tombstone older than this evidence is legitimate post-clear learning;
+		// an older evidence row must not resurrect what the administrator cleared.
+		if tombstone, cleared := autoModelClearTombstones[key]; cleared {
+			tombstoneRow, ok := autoModelClearTombstoneRow(key, tombstone)
+			if ok && !model.AutoModelScoreIsNewer(row, tombstoneRow) {
+				continue
+			}
 		}
 		p.saved[autoModelScoreKeyFor(row)] = row
 		// 旧行可能没有排序元数据(NULL/零值),恢复时按零值兼容:下一次本地
 		// 观测会从它继续递增,而不是回退。
 		outcome := autoModelOutcome{
-			Score: row.Score, LatencyMS: row.LatencyMS, Observations: row.Observations,
-			UpdatedAt: time.Unix(0, row.ObservedAt), ObservationSeq: row.ObservationSeq, WriterID: row.WriterID,
+			SuccessCount:              row.SuccessCount,
+			FailureCount:              row.FailureCount,
+			LastObservedAt:            time.Unix(0, row.ObservedAt),
+			StreamLatencyMS:           row.StreamLatencyMS,
+			StreamLatencySamples:      row.StreamLatencySamples,
+			StreamLatencyUpdatedAt:    unixOrZero(row.StreamLatencyAt),
+			NonStreamLatencyMS:        row.NonStreamLatencyMS,
+			NonStreamLatencySamples:   row.NonStreamLatencySamples,
+			NonStreamLatencyUpdatedAt: unixOrZero(row.NonStreamLatencyAt),
+			PendingRecovery:           row.PendingRecovery,
+			ObservationSeq:            row.ObservationSeq,
+			WriterID:                  row.WriterID,
 		}
 		// Restore only missing keys. Any accepted in-process feedback wins,
 		// including feedback saved during an earlier failed-load interval or
 		// accepted while this query ran. Never merge two instances' EWMAs.
-		key := autoModelHealthKey(row.Group, row.Model, row.ChannelID)
 		if _, exists := autoModelHealth.Get(key); !exists {
 			autoModelHealth.Set(key, outcome)
 		}
@@ -205,6 +251,21 @@ func (p *autoModelScorePersistence) restore(ctx context.Context) error {
 	autoModelScoreMutex.Unlock()
 	p.loaded = true // prune failures retry independently without reloading scores
 	return p.prune(ctx, now)
+}
+
+func validAutoModelTombstone(row model.AutoModelScore, now time.Time) bool {
+	if row.Scope != model.AutoModelScoreScopeModel || row.ChannelID <= 0 ||
+		row.Group == "" || strings.TrimSpace(row.Group) != row.Group || strings.ContainsRune(row.Group, '\x00') {
+		return false
+	}
+	if row.Model == "" || strings.TrimSpace(row.Model) != row.Model ||
+		strings.ContainsRune(row.Model, '\x00') || operation_setting.IsAutoModelName(row.Model) {
+		return false
+	}
+	if row.ObservationSeq < 0 {
+		return false
+	}
+	return row.ObservedAt > 0 && row.ObservedAt <= now.UnixNano()
 }
 
 func (p *autoModelScorePersistence) prune(ctx context.Context, now time.Time) error {
@@ -234,7 +295,30 @@ func (p *autoModelScorePersistence) prune(ctx context.Context, now time.Time) er
 			delete(p.superseded, key)
 		}
 	}
+	autoModelScoreMutex.Lock()
+	for key, tombstone := range autoModelClearTombstones {
+		// A pending marker must survive until the database confirms it, even if
+		// the wall clock has passed the retention boundary.
+		if !tombstone.PersistPending && tombstone.ClearedAt.UnixNano() <= cutoff {
+			delete(autoModelClearTombstones, key)
+		}
+	}
+	autoModelScoreMutex.Unlock()
 	return nil
+}
+
+func unixNanoOrZero(value time.Time) int64 {
+	if value.IsZero() {
+		return 0
+	}
+	return value.UnixNano()
+}
+
+func unixOrZero(unixNano int64) time.Time {
+	if unixNano <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, unixNano)
 }
 
 func validAutoModelScore(row model.AutoModelScore, now time.Time) bool {
@@ -249,21 +333,32 @@ func validAutoModelScore(row model.AutoModelScore, now time.Time) bool {
 	if row.Model == "" || strings.TrimSpace(row.Model) != row.Model || strings.ContainsRune(row.Model, '\x00') || operation_setting.IsAutoModelName(row.Model) {
 		return false
 	}
-	for _, value := range []float64{row.Score, row.LatencyMS, row.Observations} {
-		if math.IsNaN(value) || math.IsInf(value, 0) {
+	if row.SuccessCount < 0 || row.FailureCount < 0 ||
+		row.SuccessCount+row.FailureCount <= 0 ||
+		row.SuccessCount+row.FailureCount > autoModelMaxEvidenceCount+1e-9 {
+		return false
+	}
+	for _, value := range []float64{
+		row.SuccessCount, row.FailureCount,
+		row.StreamLatencyMS, row.StreamLatencySamples,
+		row.NonStreamLatencyMS, row.NonStreamLatencySamples,
+	} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return false
 		}
 	}
-	// 排序元数据只做兼容校验:旧行的序号/实例标识是零值,依然有效;负序号不可能
-	// 由本地分配产生,视为损坏行。
+	if row.StreamLatencySamples > 0 && (row.StreamLatencyAt <= 0 || row.StreamLatencyAt > now.UnixNano()) {
+		return false
+	}
+	if row.NonStreamLatencySamples > 0 && (row.NonStreamLatencyAt <= 0 || row.NonStreamLatencyAt > now.UnixNano()) {
+		return false
+	}
 	if row.ObservationSeq < 0 {
 		return false
 	}
 	// Reject future clocks conservatively rather than granting extra freshness.
 	// Validation never rewrites timestamps or applies an extra decay fold.
-	return row.Score >= 0 && row.Score <= 1 && row.LatencyMS >= 0 &&
-		row.Observations > 0 && row.Observations <= autoModelMaxObservations &&
-		row.ObservedAt > 0 && row.ObservedAt <= now.UnixNano() &&
+	return row.ObservedAt > 0 && row.ObservedAt <= now.UnixNano() &&
 		row.ObservedAt > now.Add(-autoModelScoreRetention()).UnixNano()
 }
 
@@ -283,10 +378,20 @@ func snapshotAutoModelScores() []model.AutoModelScore {
 		if err != nil {
 			continue
 		}
+		if outcome.SuccessCount+outcome.FailureCount <= 0 || outcome.LastObservedAt.IsZero() {
+			continue
+		}
 		rows = append(rows, model.AutoModelScore{
 			Scope: model.AutoModelScoreScopeModel, Group: parts[0], Model: parts[1], ChannelID: id,
-			Score: outcome.Score, LatencyMS: outcome.LatencyMS, Observations: outcome.Observations,
-			ObservedAt: outcome.UpdatedAt.UnixNano(), ObservationSeq: outcome.ObservationSeq,
+			// Legacy columns stay neutral; version 2 readers never use them.
+			Score: 0.5, LatencyMS: 0, Observations: 1,
+			SuccessCount: outcome.SuccessCount, FailureCount: outcome.FailureCount,
+			StreamLatencyMS: outcome.StreamLatencyMS, StreamLatencySamples: outcome.StreamLatencySamples,
+			StreamLatencyAt:    unixNanoOrZero(outcome.StreamLatencyUpdatedAt),
+			NonStreamLatencyMS: outcome.NonStreamLatencyMS, NonStreamLatencySamples: outcome.NonStreamLatencySamples,
+			NonStreamLatencyAt: unixNanoOrZero(outcome.NonStreamLatencyUpdatedAt),
+			PendingRecovery:    outcome.PendingRecovery,
+			ObservedAt:         outcome.LastObservedAt.UnixNano(), ObservationSeq: outcome.ObservationSeq,
 			WriterID: outcome.WriterID, Version: model.AutoModelScoreVersion,
 		})
 	}

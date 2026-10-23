@@ -3,7 +3,6 @@ package service
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -11,26 +10,36 @@ import (
 	"sync"
 	"time"
 
-	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
-	"github.com/gin-gonic/gin"
 )
 
 // autoModelOutcome 是一个被动健康摘要,粒度为 (分组, 模型, 渠道) 的模型层证据。
 // 数据仅来自真实请求的成功/失败反馈,绝不发送主动测活请求。
 //
-// ObservationSeq/WriterID 是快照排序元数据,与持久化行一一对应:UpdatedAt 保留
-// 真实观测时间(衰减与恢复都读它),而同一时间刻度上的先后由(序号,实例标识)
-// 给出确定性顺序。两者都只在评分锁内更新,见 nextAutoModelObservationSeq。
+// 新策略不再用综合分决定路由。可靠性以成功/失败有效计数单独估计;流式与非流式
+// 成功延迟各自保存 EWMA、有效样本数和最后成功观测时间。延迟数值本身不随时间
+// 衰减到零,证据陈旧时由样本数和时间判断为"未知",避免长期未调用显得越来越快。
+//
+// ObservationSeq/WriterID 是快照排序元数据,与持久化行一一对应:LastObservedAt
+// 保留真实业务观测时间,而同一时间刻度上的先后由(序号,实例标识)给出确定性顺序。
+// 两者都只在评分锁内更新,见 nextAutoModelObservationSeq。
 type autoModelOutcome struct {
-	Score          float64
-	LatencyMS      float64
-	Observations   float64
-	UpdatedAt      time.Time
-	ObservationSeq int64
-	WriterID       string
+	SuccessCount float64
+	FailureCount float64
+	// LastObservedAt 是最后一次真实业务成功/失败的时间,用于可靠性和新鲜度。
+	LastObservedAt time.Time
+
+	StreamLatencyMS           float64
+	StreamLatencySamples      float64
+	StreamLatencyUpdatedAt    time.Time
+	NonStreamLatencyMS        float64
+	NonStreamLatencySamples   float64
+	NonStreamLatencyUpdatedAt time.Time
+	PendingRecovery           bool
+	ObservationSeq            int64
+	WriterID                  string
 }
 
 // autoModelWriterID 标识"这个进程",按进程生成一次,整个生命周期不变。
@@ -70,21 +79,15 @@ var autoModelHealth = types.NewRWMap[string, autoModelOutcome]()
 // merges. Lock order is this mutex -> RWMap; never hold it during SQL/cooldown I/O.
 var autoModelScoreMutex sync.Mutex
 
-// autoModelHalfLifeMs 用于读取时的评分时间衰减。
-//
-// 它必须长于抖动冷却窗口(15 分钟),否则冷却到期时评分已经归零回到中立 0.5,
-// 组合带着"零记忆"重回候选池,惩罚与教训脱节;评分持久化也只剩"重启很快"这一种
-// 场景有意义。默认 30 分钟,可在面板调整(AutoModelScoreDecayMinutes)。
+// autoModelHalfLifeMs 是可靠性计数和成功延迟样本的时间衰减窗口。
+// 它必须长于抖动冷却阶梯的前几档,否则冷却到期时证据已经失效,组合会带着
+// “零记忆”重回候选池。默认 360 分钟,可在面板调整(AutoModelScoreDecayMinutes)。
 func autoModelHalfLifeMs() int64 {
 	return int64(operation_setting.AutoModelScoreDecayMinutes()) * 60 * 1000
 }
 
-// autoModelLatencyAlpha 是延迟 EWMA 平滑系数，沿用现有的 0.2 / 0.8。
+// autoModelLatencyAlpha 是成功延迟 EWMA 平滑系数。
 const autoModelLatencyAlpha = 0.2
-
-// autoModelScoreAlpha 是成功率的指数加权移动平均系数：新样本权重 30%，
-// 让一条渠道变坏时分数快速下跌，而不是被历史大量成功拖住。
-const autoModelScoreAlpha = 0.30
 
 func autoModelHealthKey(group, name string, channelID int) string {
 	return group + "\x00" + name + "\x00" + strconv.Itoa(channelID)
@@ -95,16 +98,28 @@ func autoModelHealthPrefix(group, name string) string {
 }
 
 // RecordAutoModelOutcome 记录一次已观察到的请求结果（被动反馈），粒度是
-// (分组, 模型, 渠道)。latencyMs <= 0 表示未采集到延迟。
-// elapsedMs 是本次尝试的冷却信号：成功流式请求用首包延迟，非流式或失败用本次尝试耗时。
+// (分组, 模型, 渠道)。默认按非流式处理；latencyMs <= 0 表示未采集到延迟。
 func RecordAutoModelOutcome(group, name string, channelID int, success bool, latencyMs int64, elapsedMs int64) {
-	recordAutoModelOutcome(group, name, channelID, success, latencyMs, elapsedMs, false, "")
+	RecordAutoModelOutcomeWithMode(group, name, channelID, success, false, latencyMs > 0, latencyMs, elapsedMs, "")
 }
 
-// RecordAutoModelOutcomeWithReason 与 RecordAutoModelOutcome 相同，但把本次失败
-// 的短摘要带进冷却记录。摘要只应包含错误码/HTTP 状态等可公开信息，不能放上游正文。
+// RecordAutoModelOutcomeWithReason 是 RecordAutoModelOutcome 的带原因版本。
 func RecordAutoModelOutcomeWithReason(group, name string, channelID int, success bool, latencyMs int64, elapsedMs int64, reason string) {
-	recordAutoModelOutcome(group, name, channelID, success, latencyMs, elapsedMs, false, reason)
+	RecordAutoModelOutcomeWithMode(group, name, channelID, success, false, latencyMs > 0, latencyMs, elapsedMs, reason)
+}
+
+// RecordAutoModelOutcomeWithMode 是真实业务反馈的入口。stream 决定写入哪一类
+// 成功延迟证据；latencyKnown=false 时不写入任何速度样本，但仍更新可靠性。
+func RecordAutoModelOutcomeWithMode(group, name string, channelID int, success, stream, latencyKnown bool, latencyMs int64, elapsedMs int64, reason string) {
+	RecordAutoModelOutcomeWithModeAt(group, name, channelID, success, stream, latencyKnown,
+		latencyMs, elapsedMs, reason, time.Now())
+}
+
+// RecordAutoModelOutcomeWithModeAt 与上面的入口相同，但由调用方固定真实观测时间。
+// 反馈可以在请求结束后的 flush 里发布，若使用发布时间，早先尝试的新鲜度会被
+// 后续长请求“刷新”，冷却也会从错误的时间起算。
+func RecordAutoModelOutcomeWithModeAt(group, name string, channelID int, success, stream, latencyKnown bool, latencyMs int64, elapsedMs int64, reason string, observedAt time.Time) {
+	recordAutoModelOutcome(group, name, channelID, success, stream, latencyKnown, latencyMs, elapsedMs, false, reason, observedAt)
 }
 
 // RecordAutoModelUnusableAnswer 记录一次"HTTP 200 但没有有效回答"：
@@ -112,58 +127,66 @@ func RecordAutoModelOutcomeWithReason(group, name string, channelID int, success
 //
 // 冷却只覆盖该 (分组, 模型, 渠道)，不会把该渠道上的其它模型也标为冷却。
 func RecordAutoModelUnusableAnswer(group, name string, channelID int, reason string) {
-	recordAutoModelOutcome(group, name, channelID, false, 0, 0, true, reason)
+	RecordAutoModelUnusableAnswerAt(group, name, channelID, reason, time.Now())
 }
 
-// RecordAutoModelTestOutcome 把「渠道手动测试(单个/批量测试)」的结果并入 auto
-// 健康体系:成功提分并清除既有冷却;失败按与真实流量相同的判据分档——命中
-// 管理员配置的确定性关键词的组合被直接摘除(从渠道模型列表删除,不再有冷却),
-// 其余按抖动阶梯冷却并扣分。
-//
-// 与真实流量反馈共用同一套评分与冷却存储,一点差异:对渠道声明的每一个分组
-// 各记一条(打分键是 分组+模型+渠道)。
-//
-// 真实流量路径不经过这里,原有逻辑不变。定时渠道测试(若管理员开启)同样汇入。
+// RecordAutoModelUnusableAnswerAt 与 RecordAutoModelUnusableAnswer 相同，观测时间
+// 由入队时固定，避免请求结束时的 flush 改写新鲜度。
+func RecordAutoModelUnusableAnswerAt(group, name string, channelID int, reason string, observedAt time.Time) {
+	recordAutoModelOutcome(group, name, channelID, false, false, false, 0, 0, true, reason, observedAt)
+}
+
+// RecordAutoModelTestOutcome 只保留手动测试的确定性失败处理。测试请求的
+// 成功/延迟不是真实业务证据，不能写入新路由的可靠性或速度摘要，也不能清除
+// 冷却或证明路线恢复。命中确定性关键词仍按既有策略摘除组合。
 func RecordAutoModelTestOutcome(channel *model.Channel, modelName string, success bool, elapsedMs int64, testErr *types.NewAPIError) {
-	if channel == nil || !operation_setting.AutoModelEnabled {
+	if channel == nil || !operation_setting.AutoModelEnabled || success || testErr == nil {
 		return
 	}
 	name := strings.TrimSpace(modelName)
 	if name == "" || operation_setting.IsAutoModelName(name) {
 		return
 	}
+	if !AutoModelPermanentFailure(testErr) {
+		return
+	}
+	reason := testErr.Error()
+	if runes := []rune(reason); len(runes) > 200 {
+		reason = string(runes[:200])
+	}
 	for _, group := range strings.Split(channel.Group, ",") {
 		group = strings.TrimSpace(group)
-		if group == "" {
-			continue
-		}
-		if !success && testErr != nil && AutoModelPermanentFailure(testErr) {
-			reason := testErr.Error()
-			if runes := []rune(reason); len(runes) > 200 {
-				reason = string(runes[:200])
-			}
+		if group != "" {
 			RecordAutoModelPermanentFailure(group, name, channel.Id, "手动测试失败: "+reason)
-			continue
 		}
-		reason := ""
-		if !success && testErr != nil {
-			reason = AutoModelFailureReason(testErr)
-		}
-		RecordAutoModelOutcomeWithReason(group, name, channel.Id, success, elapsedMs, elapsedMs, reason)
 	}
 }
 
-func recordAutoModelOutcome(group, name string, channelID int, success bool, latencyMs int64, elapsedMs int64, modelOnlyCooldown bool, cooldownReason string) {
+func recordAutoModelOutcome(group, name string, channelID int, success, stream, latencyKnown bool, latencyMs int64, elapsedMs int64, modelOnlyCooldown bool, cooldownReason string, observedAt time.Time) {
 	group = strings.TrimSpace(group)
 	name = strings.TrimSpace(name)
 	if group == "" || name == "" || channelID <= 0 || operation_setting.IsAutoModelName(name) {
 		return
 	}
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
 	key := autoModelHealthKey(group, name, channelID)
+	// Feedback publication is a whole-route action: it must not interleave with
+	// a deterministic retirement or an administrator clear for the same route.
+	unlock := lockAutoModelRoute(key)
+	defer unlock()
 	autoModelScoreMutex.Lock()
-	now := time.Now()
+	if tombstone, cleared := autoModelClearTombstones[key]; cleared && !observedAt.After(tombstone.ClearedAt) {
+		// A feedback queued before an administrator clear must not recreate
+		// evidence in memory after that clear. Only a genuinely later observation
+		// may start learning again. This check and the update share one lock so a
+		// clear cannot slip between them.
+		autoModelScoreMutex.Unlock()
+		return
+	}
 	autoModelHealth.Update(key, func(current autoModelOutcome, exists bool) autoModelOutcome {
-		return updateAutoModelOutcome(current, exists, success, latencyMs, now)
+		return updateAutoModelOutcome(current, exists, success, stream, latencyKnown, latencyMs, observedAt)
 	})
 	autoModelScoreMutex.Unlock()
 	if modelOnlyCooldown {
@@ -171,88 +194,221 @@ func recordAutoModelOutcome(group, name string, channelID int, success bool, lat
 		if reason == "" {
 			reason = "响应无有效内容"
 		}
-		tripAutoModelCooldown(group, name, channelID, reason, time.Now())
+		tripAutoModelCooldown(group, name, channelID, reason, observedAt)
 		return
 	}
 	// 慢或者失败进入冷却（落库，跨重启生效），正常速度的成功清除冷却。
-	applyAutoModelCooldownWithReason(group, name, channelID, success, elapsedMs, cooldownReason)
+	applyAutoModelCooldownWithReasonAt(group, name, channelID, success, elapsedMs, cooldownReason, observedAt)
 }
 
-const autoModelMaxObservations = 20.0
+const (
+	autoModelMaxEvidenceCount  = 100.0
+	autoModelMinLatencySamples = 3.0
+)
 
-// decayAutoModelOutcome folds all stale evidence toward a neutral cold start.
-// Applying this before both reads and writes prevents fresh feedback from
-// reviving an expired latency or an unbounded historical confidence count.
-func decayAutoModelOutcome(outcome autoModelOutcome, now time.Time) autoModelOutcome {
-	ageFactor := 1.0 - math.Max(0, float64(now.Sub(outcome.UpdatedAt).Milliseconds()))/float64(autoModelHalfLifeMs())
-	ageFactor = math.Max(0, ageFactor)
-	outcome.Observations = math.Min(autoModelMaxObservations, math.Max(0, outcome.Observations)) * ageFactor
-	outcome.Score = 0.5 + (outcome.Score-0.5)*ageFactor
-	outcome.LatencyMS *= ageFactor
-	if outcome.Observations == 0 {
-		outcome.Score = 0.5
-		outcome.LatencyMS = 0
+type autoModelRequestMode int
+
+const (
+	autoModelRequestNonStream autoModelRequestMode = iota
+	autoModelRequestStream
+)
+
+// autoModelEvidenceView 是规划器读取的只读证据视图。证据陈旧、样本不足或
+// 未观测时 Known 为 false；不能把未知值当成 0.5 分或 0ms。
+type autoModelEvidenceView struct {
+	Reliability      float64
+	ReliabilityKnown bool
+	Observations     float64
+	LastObservedAt   time.Time
+	LatencyMS        float64
+	LatencySamples   float64
+	LatencyKnown     bool
+	LatencyUpdatedAt time.Time
+	PendingRecovery  bool
+}
+
+// autoModelObservationCleared reports whether an observation predates the
+// administrator's latest clear. It is shared by evidence and cooldown/retire
+// publication so a delayed pre-clear failure cannot take either effect.
+func autoModelObservationCleared(key string, observedAt time.Time) bool {
+	autoModelScoreMutex.Lock()
+	defer autoModelScoreMutex.Unlock()
+	tombstone, cleared := autoModelClearTombstones[key]
+	return cleared && !observedAt.After(tombstone.ClearedAt)
+}
+
+func autoModelHalfLifeMsFor(decayMinutes int) int64 {
+	if decayMinutes < 1 {
+		decayMinutes = 1
 	}
-	outcome.UpdatedAt = now
+	return int64(decayMinutes) * 60 * 1000
+}
+
+func autoModelEvidenceFreshFor(updatedAt, now time.Time, decayMinutes int) bool {
+	if updatedAt.IsZero() {
+		return false
+	}
+	window := time.Duration(decayMinutes) * time.Minute / 4
+	if window <= 0 {
+		window = time.Minute
+	}
+	return now.Sub(updatedAt) <= window
+}
+
+func autoModelEvidenceFresh(updatedAt, now time.Time) bool {
+	return autoModelEvidenceFreshFor(updatedAt, now, operation_setting.AutoModelScoreDecayMinutes())
+}
+
+func autoModelDecayFactorFor(updatedAt, now time.Time, halfLifeMs int64) float64 {
+	if updatedAt.IsZero() {
+		return 0
+	}
+	age := now.Sub(updatedAt)
+	if age <= 0 {
+		return 1
+	}
+	factor := 1 - float64(age.Milliseconds())/float64(halfLifeMs)
+	return math.Max(0, factor)
+}
+
+func autoModelDecayFactor(updatedAt, now time.Time) float64 {
+	return autoModelDecayFactorFor(updatedAt, now, autoModelHalfLifeMs())
+}
+
+// decayAutoModelOutcome 衰减证据的“有效数量”，但不衰减延迟数值本身。
+// 延迟值保持最后一次成功观测，证据是否可用由样本数和新鲜度决定。
+func decayAutoModelOutcomeFor(outcome autoModelOutcome, now time.Time, halfLifeMs int64) autoModelOutcome {
+	reliabilityFactor := autoModelDecayFactorFor(outcome.LastObservedAt, now, halfLifeMs)
+	outcome.SuccessCount *= reliabilityFactor
+	outcome.FailureCount *= reliabilityFactor
+	outcome.StreamLatencySamples *= autoModelDecayFactorFor(outcome.StreamLatencyUpdatedAt, now, halfLifeMs)
+	outcome.NonStreamLatencySamples *= autoModelDecayFactorFor(outcome.NonStreamLatencyUpdatedAt, now, halfLifeMs)
+	if outcome.SuccessCount+outcome.FailureCount < 1e-9 {
+		outcome.SuccessCount, outcome.FailureCount = 0, 0
+	}
+	if outcome.StreamLatencySamples < 1e-9 {
+		outcome.StreamLatencySamples = 0
+	}
+	if outcome.NonStreamLatencySamples < 1e-9 {
+		outcome.NonStreamLatencySamples = 0
+	}
 	return outcome
 }
 
-func updateAutoModelOutcome(current autoModelOutcome, exists, success bool, latencyMs int64, now time.Time) autoModelOutcome {
+func decayAutoModelOutcome(outcome autoModelOutcome, now time.Time) autoModelOutcome {
+	return decayAutoModelOutcomeFor(outcome, now, autoModelHalfLifeMs())
+}
+
+func capAutoModelEvidence(outcome *autoModelOutcome) {
+	total := outcome.SuccessCount + outcome.FailureCount
+	if total > autoModelMaxEvidenceCount {
+		scale := autoModelMaxEvidenceCount / total
+		outcome.SuccessCount *= scale
+		outcome.FailureCount *= scale
+	}
+}
+
+func autoModelEvidenceViewFor(outcome autoModelOutcome, mode autoModelRequestMode, now time.Time) autoModelEvidenceView {
+	return autoModelEvidenceViewForSettings(outcome, mode, now, operation_setting.AutoModelRoutingSettingsSnapshot())
+}
+
+// autoModelEvidenceViewForSettings evaluates one evidence snapshot with one
+// configuration snapshot. The planner and the status page must use this same
+// function so "sample sufficient" and "entered the main pool" cannot disagree.
+func autoModelEvidenceViewForSettings(outcome autoModelOutcome, mode autoModelRequestMode, now time.Time, settings operation_setting.AutoModelRoutingSettings) autoModelEvidenceView {
+	outcome = decayAutoModelOutcomeFor(outcome, now, autoModelHalfLifeMsFor(settings.ScoreDecayMinutes))
+	view := autoModelEvidenceView{
+		Observations:    outcome.SuccessCount + outcome.FailureCount,
+		LastObservedAt:  outcome.LastObservedAt,
+		PendingRecovery: outcome.PendingRecovery,
+	}
+	if view.Observations > 0 {
+		view.Reliability = outcome.SuccessCount / view.Observations
+	}
+	view.ReliabilityKnown = view.Observations >= float64(settings.MinObservations) &&
+		autoModelEvidenceFreshFor(outcome.LastObservedAt, now, settings.ScoreDecayMinutes)
+	switch mode {
+	case autoModelRequestStream:
+		view.LatencyMS = outcome.StreamLatencyMS
+		view.LatencySamples = outcome.StreamLatencySamples
+		view.LatencyUpdatedAt = outcome.StreamLatencyUpdatedAt
+	default:
+		view.LatencyMS = outcome.NonStreamLatencyMS
+		view.LatencySamples = outcome.NonStreamLatencySamples
+		view.LatencyUpdatedAt = outcome.NonStreamLatencyUpdatedAt
+	}
+	view.LatencyKnown = view.LatencySamples >= autoModelMinLatencySamples &&
+		view.LatencyMS > 0 && autoModelEvidenceFreshFor(view.LatencyUpdatedAt, now, settings.ScoreDecayMinutes)
+	return view
+}
+
+func updateAutoModelOutcome(current autoModelOutcome, exists, success, stream, latencyKnown bool, latencyMs int64, observedAt time.Time) autoModelOutcome {
 	if !exists {
-		current = autoModelOutcome{Score: 0.5, UpdatedAt: now}
+		current = autoModelOutcome{}
 	}
-	current = decayAutoModelOutcome(current, now)
-	value := 0.0
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+	previousObservedAt := current.LastObservedAt
+	// 并发请求的 flush 可能乱序发布:较早观测晚到,不得把证据时间拨回过去。
+	effectiveAt := observedAt
+	if effectiveAt.Before(previousObservedAt) {
+		effectiveAt = previousObservedAt
+	}
+	// 可靠性计数每次新观测都折叠历史。两类延迟样本只在各自取得新成功延迟时
+	// 折叠:另一模式的样本保持原始计数和真实观测时间,由读取方统一衰减。
+	// 早先在这里同时衰减两种样本,连续非流式反馈会把流式样本按次数重复扣减。
+	reliabilityFactor := autoModelDecayFactor(previousObservedAt, effectiveAt)
+	current.SuccessCount *= reliabilityFactor
+	current.FailureCount *= reliabilityFactor
+	isLatest := !observedAt.Before(previousObservedAt)
 	if success {
-		value = 1
-	}
-	current.Score += autoModelScoreAlpha * (value - current.Score)
-	current.Observations = math.Min(autoModelMaxObservations, current.Observations+1)
-	if latencyMs > 0 {
-		if current.LatencyMS == 0 {
-			current.LatencyMS = float64(latencyMs)
-		} else {
-			current.LatencyMS = current.LatencyMS*(1-autoModelLatencyAlpha) + float64(latencyMs)*autoModelLatencyAlpha
+		current.SuccessCount++
+	} else {
+		current.FailureCount++
+		if isLatest {
+			current.PendingRecovery = true
 		}
 	}
+	if observedAt.After(current.LastObservedAt) {
+		current.LastObservedAt = observedAt
+	}
+	if success && latencyKnown && latencyMs > 0 {
+		latency := float64(latencyMs)
+		if stream {
+			latencyAt := observedAt
+			if latencyAt.Before(current.StreamLatencyUpdatedAt) {
+				latencyAt = current.StreamLatencyUpdatedAt
+			}
+			current.StreamLatencySamples *= autoModelDecayFactor(current.StreamLatencyUpdatedAt, latencyAt)
+			if current.StreamLatencySamples < 1e-9 || current.StreamLatencyMS == 0 {
+				current.StreamLatencyMS = latency
+			} else {
+				current.StreamLatencyMS = current.StreamLatencyMS*(1-autoModelLatencyAlpha) + latency*autoModelLatencyAlpha
+			}
+			current.StreamLatencySamples++
+			current.StreamLatencyUpdatedAt = latencyAt
+		} else {
+			latencyAt := observedAt
+			if latencyAt.Before(current.NonStreamLatencyUpdatedAt) {
+				latencyAt = current.NonStreamLatencyUpdatedAt
+			}
+			current.NonStreamLatencySamples *= autoModelDecayFactor(current.NonStreamLatencyUpdatedAt, latencyAt)
+			if current.NonStreamLatencySamples < 1e-9 || current.NonStreamLatencyMS == 0 {
+				current.NonStreamLatencyMS = latency
+			} else {
+				current.NonStreamLatencyMS = current.NonStreamLatencyMS*(1-autoModelLatencyAlpha) + latency*autoModelLatencyAlpha
+			}
+			current.NonStreamLatencySamples++
+			current.NonStreamLatencyUpdatedAt = latencyAt
+		}
+		if isLatest {
+			current.PendingRecovery = latencyMs > autoModelSlowLatencyMs
+		}
+	}
+	capAutoModelEvidence(&current)
 	// 每次真实观测都产生一个新快照:即使它落在与上一次相同的时间刻度上,序号
-	// 也让"后来者胜"成立。UpdatedAt 仍是真实观测时间,不在保存时刷新。
+	// 也让"后来者胜"成立。LastObservedAt 仍是真实观测时间,不在保存时刷新。
 	current.ObservationSeq, current.WriterID = nextAutoModelObservationSeq(current)
 	return current
-}
-
-// effectiveScore applies synchronous evidence decay, confidence and latency.
-// Fully expired or unobserved outcomes are exactly neutral, including latency.
-func effectiveScore(outcome autoModelOutcome, now time.Time) float64 {
-	outcome = decayAutoModelOutcome(outcome, now)
-	confidence := outcome.Observations / (outcome.Observations + 3.0)
-	score := 0.5*(1-confidence) + outcome.Score*confidence
-	return score / (1.0 + outcome.LatencyMS/15000.0)
-}
-
-// GetAutoModelCandidates exposes the unique models in a fresh priority →
-// model-score-band plan for one concrete group. Models with no enabled,
-// non-cooling route (or an explicit zero model weight) are absent, including
-// when every model is cooling.
-func GetAutoModelCandidates(group string) []string {
-	if !operation_setting.AutoModelEnabled || strings.TrimSpace(group) == "" {
-		return nil
-	}
-	result, err := buildAutoModelRoutesForGroup(strings.TrimSpace(group), nil, newAutoModelRouteSnapshot(nil))
-	if err != nil {
-		common.SysError("failed to load auto model routing targets: " + err.Error())
-		return nil
-	}
-	return autoModelRouteModelNames(result.Routes)
-}
-
-// GetAutoModelCandidatesForRequest uses the same authorization and strict
-// cooldown filtering as dispatch. It is a model-list view, not a route plan:
-// callers dispatching requests must retain the actual channel/model pairs.
-func GetAutoModelCandidatesForRequest(c *gin.Context, group string) []string {
-	routes, err := BuildAutoModelRoutesForRequest(c, group)
-	if err != nil && !errors.Is(err, ErrAutoModelNoAuthorizedCandidates) {
-		common.SysError("failed to build auto model routes: " + err.Error())
-	}
-	return autoModelRouteModelNames(routes)
 }
