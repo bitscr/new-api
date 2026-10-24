@@ -262,9 +262,50 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	defer flushAutoModelFeedback(c)
 
 	var autoBudget autoModelAttemptBudget
+	autoStopReason := "completed"
+	if autoRequest {
+		// Registered before the staging cleanup so it runs after Restore and sees
+		// the final wire state.
+		defer func() {
+			lastCode := ""
+			if newAPIError != nil {
+				lastCode = string(newAPIError.GetErrorCode())
+			}
+			logger.LogInfo(c, fmt.Sprintf("auto route diag: event=stop reason=%s attempts=%d max=%d real_dispatched=%d remaining=%d written=%t last_error_code=%s elapsed_ms=%d client_model=%s trace=[%s]",
+				autoStopReason, autoBudget.attempts, operation_setting.AutoModelMaxAttempts(),
+				autoBudget.dispatched, autoBudget.remainingRetries(),
+				c.Writer != nil && c.Writer.Written(), lastCode,
+				relayInfo.AttemptElapsed().Milliseconds(), relayInfo.ClientModelName,
+				formatAutoModelAttemptTrace(c)))
+		}()
+	}
+	// Stage one auto candidate until the answer observer confirms real output.
+	// The cleanup defer is registered after feedback flush, so it runs first and
+	// restores c.Writer before any fallback error/feedback path can write.
+	var stagedAutoResponse *relaycommon.AutoAttemptResponseWriter
+	defer func() {
+		if stagedAutoResponse != nil {
+			stagedAutoResponse.Discard()
+			stagedAutoResponse.Restore()
+			stagedAutoResponse = nil
+		}
+	}()
 	for {
+		if stagedAutoResponse != nil {
+			stagedAutoResponse.Discard()
+			stagedAutoResponse.Restore()
+			stagedAutoResponse = nil
+		}
 		if autoRequest {
-			if !autoBudget.canAttempt() || (autoBudget.attempts > 0 && !canRetryAutoModelRequest(c, relayInfo)) {
+			if !autoBudget.canAttempt() {
+				autoStopReason = "budget_exhausted"
+				break
+			}
+			if autoBudget.attempts > 0 && !canRetryAutoModelRequest(c, relayInfo) {
+				autoStopReason = "request_not_retryable"
+				logger.LogInfo(c, fmt.Sprintf("auto route diag: event=no_switch reason=%s attempt=%d max=%d remaining=%d",
+					autoModelRetryBlockedReason(c, relayInfo), autoBudget.attempts,
+					operation_setting.AutoModelMaxAttempts(), autoBudget.remainingRetries()))
 				break
 			}
 			retryParam.SetRetry(autoBudget.attempts)
@@ -272,6 +313,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 		if canceledErr := autoModelCanceledRequestError(c, newAPIError); canceledErr != nil {
+			autoStopReason = "client_canceled"
 			newAPIError = canceledErr
 			break
 		}
@@ -287,19 +329,26 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			}
 			// 派发前就拿不到渠道:当前路线同样进本地跳过集合,重排不会把它放回队首。
 			if current, ok := service.GetCurrentAutoModelRoute(c); ok {
+				if isAutoModelRequest(c) {
+					logger.LogInfo(c, fmt.Sprintf("auto route diag: event=local_reject group=%s model=%s channel=%d attempt=%d max=%d",
+						current.Group, current.ModelName, current.ChannelID, autoBudget.attempts,
+						operation_setting.AutoModelMaxAttempts()))
+				}
 				markAutoModelRouteLocallyRejected(c, current)
 			}
 			// auto 计划按"渠道 priority 降序 → 可靠性准入 → 成功延迟池 → 池内两级加权随机"排好;
 			// 换路 = 对剩余候选重新规划,既不是逐个试完本渠道的剩余模型,也不是随机选渠。
-			if trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
+			if trySwitchAutoModelWithReason(c, relayInfo, retryParam, tokens, meta, "local_route_rejected", autoBudget) {
 				continue
 			}
 			// Keep the real last failure instead of hiding it behind an exhausted plan.
 			if (autoRequest || retryParam.GetRetry() > 0) && relayInfo.LastError != nil {
 				newAPIError = relayInfo.LastError
+				autoStopReason = "no_available_route"
 				break
 			}
 			newAPIError = channelErr
+			autoStopReason = "no_available_route"
 			break
 		}
 
@@ -309,6 +358,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if isChannelDailySuccessLimitError(reserveErr) && shouldSkipDailyLimitedChannel(c, channel) {
 				continue
 			}
+			autoStopReason = "channel_reservation_failed"
 			break
 		}
 
@@ -321,6 +371,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if billingErr := service.PreConsumeBilling(c, relayInfo.PriceData.QuotaToPreConsume, relayInfo); billingErr != nil {
 				newAPIError = billingErr
 				model.ReleaseChannelDailySuccess(reservation)
+				autoStopReason = "billing_failed"
 				break
 			}
 		}
@@ -333,6 +384,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				newAPIError = types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
 			model.ReleaseChannelDailySuccess(reservation)
+			autoStopReason = "body_read_failed"
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
@@ -341,6 +393,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if canceledErr := autoModelCanceledRequestError(c, newAPIError); canceledErr != nil {
 				newAPIError = canceledErr
 				model.ReleaseChannelDailySuccess(reservation)
+				autoStopReason = "client_canceled"
 				break
 			}
 			if currentRoute, ok := service.GetCurrentAutoModelRoute(c); ok && service.IsAutoModelTrialRoute(c, currentRoute) {
@@ -349,9 +402,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 					model.ReleaseChannelDailySuccess(reservation)
 					markAutoModelRouteLocallyRejected(c, currentRoute)
 					newAPIError = newAutoModelRouteError("auto model trial route is busy")
-					if trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
+					if trySwitchAutoModelWithReason(c, relayInfo, retryParam, tokens, meta, "trial_busy", autoBudget) {
+						autoStopReason = "trial_busy_switched"
 						continue
 					}
+					autoStopReason = "trial_busy"
 					break
 				}
 				holdAutoModelTrialSlot(c, currentRoute, release)
@@ -361,12 +416,20 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				if currentRoute, ok := service.GetCurrentAutoModelRoute(c); ok {
 					releaseAutoModelTrialSlot(c, currentRoute)
 				}
+				autoStopReason = "budget_or_request_guard"
 				break
 			}
 			markCurrentAutoModelRouteAttempted(c)
 			addUsedChannel(c, channel.Id)
+			logger.LogInfo(c, fmt.Sprintf("auto route diag: event=attempt stage=selected attempt=%d max=%d prior_dispatched=%d remaining_if_dispatched=%d group=%s model=%s channel=%d client_model=%s",
+				autoBudget.attempts, operation_setting.AutoModelMaxAttempts(), autoBudget.dispatched,
+				max(0, operation_setting.AutoModelMaxAttempts()-autoBudget.dispatched-1),
+				relayInfo.UsingGroup, relayInfo.OriginModelName, channel.Id, relayInfo.ClientModelName))
 		}
 		relayInfo.BeginAttempt()
+		if autoRequest && relayFormat != types.RelayFormatOpenAIRealtime && relayFormat != types.RelayFormatMistralRealtime {
+			stagedAutoResponse = relaycommon.InstallAutoAttemptResponseWriter(c)
+		}
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
 			newAPIError = relay.WssHelper(c, relayInfo)
@@ -380,8 +443,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.EndAttempt()
 		if autoRequest {
 			// 只有真正进入上游派发的尝试才占用 auto 的真实派发预算。
-			autoBudget.confirmAttempt(relayInfo.HasUpstreamDispatch())
-			if !relayInfo.HasUpstreamDispatch() {
+			dispatched := relayInfo.HasUpstreamDispatch()
+			autoBudget.confirmAttempt(dispatched)
+			if dispatched {
+				logger.LogInfo(c, fmt.Sprintf("auto route diag: event=attempt stage=dispatched attempt=%d max=%d real_dispatched=%d remaining=%d group=%s model=%s channel=%d client_model=%s",
+					autoBudget.attempts, operation_setting.AutoModelMaxAttempts(), autoBudget.dispatched,
+					autoBudget.remainingRetries(), relayInfo.UsingGroup, relayInfo.OriginModelName,
+					channel.Id, relayInfo.ClientModelName))
+			}
+			if !dispatched {
 				// 本地拒绝/转换失败没有上游证据，试用名额立即可用；已派发的尝试
 				// 则保留名额，直到 flush 发布它的反馈。
 				if currentRoute, ok := service.GetCurrentAutoModelRoute(c); ok {
@@ -394,56 +464,158 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if autoModelClientAbandoned(c, relayInfo) {
 				// Some stream adaptors return nil on client disconnect. Do not
 				// classify a partial answer as healthy or as an upstream failure.
+				traceAutoModelAttempt(c, relayInfo, "client_abandoned", "")
+				autoStopReason = "client_abandoned"
 				relayInfo.LastError = nil
 				return
 			}
-			// 200 但没有有效回答（正文为空，或正文只是上游网关的告警横幅）不算成功：
-			// 旧逻辑把它当"快速成功"，auto 于是越选越多这个渠道的这个模型，
-			// 而调用方每次都拿到假答案（实测渠道 #5 近 7 天 10 次全部如此）。
-			//
-			// 这个判定与是否 auto 无关：直连模型（无 auto 路由）同样会收到
-			// 200 + 零内容。两类请求都会处理：auto 走模型级评分冷却；具名请求
-			// 也并入同一套模型级评分（见 shouldRecordAutoHealthFeedback），同时
-			// 保留渠道级自动禁用（受 AutomaticDisableChannelEnabled / AutoBan
-			// 控制，关掉这两个开关就维持旧行为）。
-			if unusable, reason := relayInfo.ClientAnswerUnusable(); unusable {
-				if isAutoModelRequest(c) {
-					logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 没有给出有效回答（%s），不计成功", relayInfo.OriginModelName, reason))
-				} else {
-					logger.LogError(c, fmt.Sprintf("渠道 #%d 的 %s 没有给出有效回答（%s），HTTP 200 但响应为空", channel.Id, relayInfo.OriginModelName, reason))
+			// 200 但没有有效回答（正文为空，或正文只是上游网关的告警横幅）不算成功。
+			// auto 请求在响应尚未提交时可以先丢弃这次候选的暂存响应，再按同一请求的
+			// 重排结果切换；具名请求保持原来的 200 交付行为。
+			unusable, reason := relayInfo.ClientAnswerUnusable()
+			if !unusable && isAutoModelRequest(c) && !relayInfo.ClientAnswerHasValidOutput() {
+				// A handler that returns 200 without writing a single body byte is
+				// the non-stream empty-response case; the observation layer has no
+				// payload to classify in that situation. Realtime formats deliver
+				// over the websocket and never touch this writer.
+				stagedEmpty := stagedAutoResponse != nil && !stagedAutoResponse.Committed() &&
+					stagedAutoResponse.StagedBytes() == 0
+				unstagedEmpty := stagedAutoResponse == nil &&
+					relayFormat != types.RelayFormatOpenAIRealtime && relayFormat != types.RelayFormatMistralRealtime &&
+					(c.Writer == nil || !c.Writer.Written())
+				if stagedEmpty || unstagedEmpty {
+					unusable = true
+					reason = "200 但响应正文为空（无正文/思考内容/工具调用）"
 				}
-				recordAutoModelUnusableAnswer(c, relayInfo, reason)
+			}
+			if unusable {
+				model.ReleaseChannelDailySuccess(reservation)
+				failureClass := autoModelUnusableFailureClass(reason)
+				if isAutoModelRequest(c) {
+					logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 没有给出有效回答（%s），不计成功", relayInfo.OriginModelName, failureClass))
+				} else {
+					logger.LogError(c, fmt.Sprintf("渠道 #%d 的 %s 没有给出有效回答（%s），HTTP 200 但响应为空", channel.Id, relayInfo.OriginModelName, failureClass))
+				}
+				if isAutoModelRequest(c) {
+					traceAutoModelAttempt(c, relayInfo, "invalid_answer", failureClass)
+					recordAutoModelUnusableAnswer(c, relayInfo, failureClass)
+				} else {
+					recordAutoModelUnusableAnswer(c, relayInfo, reason)
+				}
 				if !isAutoModelRequest(c) {
-					// 非 auto 没有"候选组合"可冷却，只能按渠道整体处置。
-					// 错误日志由 processChannelError 内部负责写(它末尾会调 recordRelayErrorLog)，
-					// 这里不能再写一次:早先两处都写,同一次失败在「错误日志」里会出现
-					// 两条一模一样、连 request_id 都相同的记录。
+					// 非 auto 保持现有行为：先把原 200 交付给客户端，再按渠道级错误处理。
+					if stagedAutoResponse != nil {
+						if err := stagedAutoResponse.Commit(); err != nil {
+							relayInfo.MarkClientDeliveryBroken()
+						}
+					}
 					unusableErr := types.NewErrorWithStatusCode(errors.New(reason), types.ErrorCodeBadResponse, http.StatusOK, types.ErrOptionWithSkipRetry())
 					processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), unusableErr)
-				} else {
-					// auto 不走 processChannelError(它会把整条渠道判死),所以这里自己记。
-					recordRelayErrorLog(c, types.NewErrorWithStatusCode(errors.New(reason), types.ErrorCodeBadResponse, http.StatusOK, types.ErrOptionWithSkipRetry()))
+					autoStopReason = "invalid_answer_named_model"
+					relayInfo.LastError = nil
+					return
 				}
-			} else if relayInfo.StreamStatus != nil && relayInfo.StreamStatus.IsUpstreamFailure() {
-				// 上游流已经交付了一部分内容，不能再换路重试；但截断/超时不是成功，
-				// 必须留下失败证据，否则坏组合的冷却会被"成功"清掉、分数还会被抬高。
+				recordRelayErrorLog(c, types.NewErrorWithStatusCode(errors.New("HTTP 200 unusable answer: "+failureClass), types.ErrorCodeBadResponse, http.StatusOK, types.ErrOptionWithSkipRetry()))
+				blocked := autoModelInvalidSwitchBlockedReason(c, relayInfo, autoBudget, stagedAutoResponse)
+				if blocked == "" && stagedAutoResponse != nil {
+					stagedAutoResponse.Discard()
+				}
+				// Publish the completed failure even when no switch is possible:
+				// the next request in this process must see the route cooling now.
+				flushAutoModelFeedback(c)
+				if blocked == "" {
+					if trySwitchAutoModelWithReason(c, relayInfo, retryParam, tokens, meta, "invalid_answer_"+failureClass, autoBudget) {
+						autoStopReason = "invalid_answer_switched"
+						relayInfo.LastError = nil
+						continue
+					}
+					blocked = "no_next_route"
+				}
+				logger.LogInfo(c, fmt.Sprintf("auto route diag: event=no_switch reason=%s failure=%s attempt=%d max=%d remaining=%d written=%t",
+					blocked, failureClass, autoBudget.attempts, operation_setting.AutoModelMaxAttempts(),
+					autoBudget.remainingRetries(), c.Writer != nil && c.Writer.Written()))
+				autoStopReason = "invalid_answer_unretryable"
+				if !autoModelResponseDelivered(c, stagedAutoResponse) {
+					newAPIError = newAutoModelUnusableAnswerError()
+					break
+				}
+				relayInfo.LastError = nil
+				return
+			}
+			if relayInfo.StreamStatus != nil && relayInfo.StreamStatus.IsUpstreamFailure() {
+				// 上游流异常结束不是成功。已经交付过有效内容时只记录失败；尚未提交
+				// 任何内容时，仍可在预算内安全换路。
 				reason := relayInfo.StreamStatus.Summary()
-				if isAutoModelRequest(c) {
-					logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 的流异常结束（%s），不计成功", relayInfo.OriginModelName, reason))
-				} else {
-					logger.LogError(c, fmt.Sprintf("渠道 #%d 的 %s 流异常结束（%s）", channel.Id, relayInfo.OriginModelName, reason))
-				}
+				model.ReleaseChannelDailySuccess(reservation)
 				recordAutoModelStreamFailure(c, relayInfo, reason)
 				streamErr := types.NewErrorWithStatusCode(errors.New("upstream stream ended abnormally: "+reason),
 					types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 				if isAutoModelRequest(c) {
+					traceAutoModelAttempt(c, relayInfo, "stream_failed", reason)
+					logger.LogInfo(c, fmt.Sprintf("auto model: 候选 %s 的流异常结束，不计成功", relayInfo.OriginModelName))
 					recordRelayErrorLog(c, streamErr)
 				} else {
+					logger.LogError(c, fmt.Sprintf("渠道 #%d 的 %s 流异常结束（%s）", channel.Id, relayInfo.OriginModelName, reason))
+					if stagedAutoResponse != nil {
+						if err := stagedAutoResponse.Commit(); err != nil {
+							relayInfo.MarkClientDeliveryBroken()
+						}
+					}
 					processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), streamErr)
+					autoStopReason = "stream_failed_named_model"
+					relayInfo.LastError = nil
+					return
 				}
-			} else {
-				recordAutoModelFeedback(c, relayInfo, true)
+				blocked := autoModelInvalidSwitchBlockedReason(c, relayInfo, autoBudget, stagedAutoResponse)
+				if blocked == "" && stagedAutoResponse != nil {
+					stagedAutoResponse.Discard()
+				}
+				// A completed stream failure is published before any switch decision,
+				// so an exhausted budget does not delay this process's cooldown.
+				flushAutoModelFeedback(c)
+				if blocked == "" {
+					if trySwitchAutoModelWithReason(c, relayInfo, retryParam, tokens, meta, "stream_failed", autoBudget) {
+						autoStopReason = "stream_failed_switched"
+						relayInfo.LastError = nil
+						continue
+					}
+					blocked = "no_next_route"
+				}
+				logger.LogInfo(c, fmt.Sprintf("auto route diag: event=no_switch reason=%s failure=stream_interrupted attempt=%d max=%d remaining=%d written=%t",
+					blocked, autoBudget.attempts, operation_setting.AutoModelMaxAttempts(),
+					autoBudget.remainingRetries(), c.Writer != nil && c.Writer.Written()))
+				autoStopReason = "stream_failed_unretryable"
+				if !autoModelResponseDelivered(c, stagedAutoResponse) {
+					newAPIError = streamErr
+					break
+				}
+				relayInfo.LastError = nil
+				return
 			}
+			if stagedAutoResponse != nil {
+				if err := stagedAutoResponse.Commit(); err != nil {
+					relayInfo.MarkClientDeliveryBroken()
+					traceAutoModelAttempt(c, relayInfo, "commit_failed", err.Error())
+					autoStopReason = "response_commit_failed"
+					relayInfo.LastError = nil
+					return
+				}
+			}
+			if autoModelAnswerOutcomeUnknown(c, relayInfo, stagedAutoResponse) {
+				// The response was delivered, but the observer could not judge it
+				// (unknown shape, truncated/ambiguous choices or a staging size cap).
+				// Neutral evidence: neither success nor failure may be recorded.
+				traceAutoModelAttempt(c, relayInfo, "unknown_answer", "")
+				logger.LogInfo(c, fmt.Sprintf("auto route diag: event=unknown_answer attempt=%d max=%d remaining=%d overflow=%t",
+					autoBudget.attempts, operation_setting.AutoModelMaxAttempts(), autoBudget.remainingRetries(),
+					stagedAutoResponse.Overflow()))
+				autoStopReason = "answer_undetermined"
+				relayInfo.LastError = nil
+				return
+			}
+			traceAutoModelAttempt(c, relayInfo, "ok", "")
+			recordAutoModelFeedback(c, relayInfo, true)
+			autoStopReason = "success"
 			relayInfo.LastError = nil
 			return
 		}
@@ -457,10 +629,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				service.RecordAutoModelAbandonedAttempt(relayInfo.UsingGroup, relayInfo.OriginModelName,
 					relayInfo.ChannelMeta.ChannelId, relayInfo.AttemptElapsed().Milliseconds())
 			}
+			traceAutoModelAttempt(c, relayInfo, "client_gone", "")
 			newAPIError = canceledErr
 			break
 		}
 		if service.IsChannelRPMLimitError(newAPIError) {
+			traceAutoModelAttempt(c, relayInfo, "rpm_limit", string(newAPIError.GetErrorCode()))
 			relayInfo.LastError = newAPIError
 			if shouldSkipRPMLimitedChannel(c, channel) {
 				continue
@@ -479,14 +653,33 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		// 早先请求体错误有豁免(不记冷却),已按使用者决策移除:工具负载被拒也是证据,
 		// 豁免会让这类组合永远留在候选池里反复被选中。
 		recordAutoModelUpstreamFailure(c, relayInfo, newAPIError)
+		traceAutoModelAttempt(c, relayInfo, "error",
+			fmt.Sprintf("code=%s status=%d", newAPIError.GetErrorCode(), newAPIError.StatusCode))
 
 		if autoRequest {
 			// Model-specific failures retain sibling-model fallback. Channel-scoped
 			// failures skip its remaining models for this request only. Both spend
 			// the same frozen budget and retain pair-only persistent feedback.
-			if prepareAutoModelRetry(c, relayInfo, newAPIError, autoBudget.remainingRetries()) &&
-				trySwitchAutoModel(c, relayInfo, retryParam, tokens, meta) {
-				continue
+			retryable := prepareAutoModelRetry(c, relayInfo, newAPIError, autoBudget.remainingRetries())
+			// Publish this completed failure before the replacement plan is built
+			// and regardless of whether another route exists: the next request must
+			// see this route cooling immediately.
+			flushAutoModelFeedback(c)
+			if retryable {
+				if trySwitchAutoModelWithReason(c, relayInfo, retryParam, tokens, meta, "upstream_error_"+string(newAPIError.GetErrorCode()), autoBudget) {
+					autoStopReason = "upstream_error_switched"
+					continue
+				}
+				autoStopReason = "no_next_route"
+			} else {
+				autoStopReason = "upstream_error_unretryable"
+				blocked := autoModelRetryBlockedReason(c, relayInfo)
+				if blocked == "" {
+					blocked = "retry_classification"
+				}
+				logger.LogInfo(c, fmt.Sprintf("auto route diag: event=no_switch reason=%s failure=upstream_error code=%s status=%d attempt=%d max=%d remaining=%d",
+					blocked, newAPIError.GetErrorCode(), newAPIError.StatusCode, autoBudget.attempts,
+					operation_setting.AutoModelMaxAttempts(), autoBudget.remainingRetries()))
 			}
 			break
 		}
@@ -869,6 +1062,84 @@ func markAutoModelRouteLocallyRejected(c *gin.Context, route service.AutoModelRo
 	return true
 }
 
+func autoModelRetryBlockedReason(c *gin.Context, info *relaycommon.RelayInfo) string {
+	if !operation_setting.AutoModelEnabled {
+		return "auto_disabled"
+	}
+	if !isAutoModelRequest(c) {
+		return "not_auto_request"
+	}
+	if autoModelRequestContextError(c) != nil {
+		return "client_canceled"
+	}
+	if c.IsAborted() {
+		return "request_aborted"
+	}
+	if isSpecificChannelRequest(c) {
+		return "specific_channel_locked"
+	}
+	if c.Writer != nil && c.Writer.Written() {
+		return "response_committed"
+	}
+	if info != nil && info.ClientDeliveryBroken() {
+		return "delivery_broken"
+	}
+	return ""
+}
+
+// autoModelResponseDelivered reports whether this candidate already put a
+// response on the wire. A failure after that point must never be replaced by a
+// second HTTP response, and must never end silently without one.
+func autoModelResponseDelivered(c *gin.Context, staged *relaycommon.AutoAttemptResponseWriter) bool {
+	if staged != nil {
+		return staged.Committed()
+	}
+	return c != nil && c.Writer != nil && c.Writer.Written()
+}
+
+// autoModelAnswerOutcomeUnknown reports a delivered auto answer that the
+// observation layer could not classify. It must stay neutral: recording it as a
+// success would keep routing traffic to a route whose answer nobody verified.
+func autoModelAnswerOutcomeUnknown(c *gin.Context, info *relaycommon.RelayInfo, staged *relaycommon.AutoAttemptResponseWriter) bool {
+	if !isAutoModelRequest(c) || info == nil || staged == nil {
+		return false
+	}
+	return !info.ClientAnswerHasValidOutput() && info.ClientAnswerUndetermined()
+}
+
+func autoModelInvalidSwitchBlockedReason(c *gin.Context, info *relaycommon.RelayInfo, budget autoModelAttemptBudget, staged *relaycommon.AutoAttemptResponseWriter) string {
+	if staged == nil {
+		return "staging_unavailable"
+	}
+	if staged.Committed() {
+		return "response_committed"
+	}
+	if !budget.canAttempt() {
+		return "budget_exhausted"
+	}
+	return autoModelRetryBlockedReason(c, info)
+}
+
+func autoModelUnusableFailureClass(reason string) string {
+	switch {
+	case strings.Contains(reason, "告警横幅"):
+		return "banner_only"
+	case strings.Contains(reason, "显式协议错误"):
+		return "protocol_error"
+	case strings.Contains(reason, "未返回任何响应内容"):
+		return "empty_stream"
+	case strings.Contains(reason, "响应正文为空"):
+		return "empty_body"
+	default:
+		return "unusable"
+	}
+}
+
+func newAutoModelUnusableAnswerError() *types.NewAPIError {
+	return types.NewErrorWithStatusCode(errors.New("auto model candidates returned HTTP 200 without a usable answer"),
+		types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+}
+
 func newAutoModelRouteError(message string) *types.NewAPIError {
 	return types.NewErrorWithStatusCode(errors.New(message), types.ErrorCodeGetChannelFailed,
 		http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
@@ -976,12 +1247,23 @@ func getFixedAutoModelChannel(c *gin.Context, info *relaycommon.RelayInfo, route
 // 固定的(每个可用的 模型×渠道 各出现一次),重排只改变顺序,不会丢路。于是
 // "还没试过的最优路"会自然落到队首;而冻结计划可能把它排在这 4 次预算之外,
 // 让 auto 一路撞着已知很差的组合把预算用光。
+// trySwitchAutoModel is the compatibility entry used by older tests and callers
+// that do not need switch diagnostics.
 func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam, tokens int, meta *types.TokenCountMeta) bool {
+	return trySwitchAutoModelWithReason(c, info, retryParam, tokens, meta, "retry", autoModelAttemptBudget{})
+}
+
+func trySwitchAutoModelWithReason(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam, tokens int, meta *types.TokenCountMeta, switchReason string, budget autoModelAttemptBudget) bool {
 	if !canRetryAutoModelRequest(c, info) || info == nil || meta == nil {
+		logger.LogInfo(c, fmt.Sprintf("auto route diag: event=no_switch reason=%s failure=%s attempt=%d max=%d remaining=%d",
+			autoModelRetryBlockedReason(c, info), switchReason, budget.attempts,
+			operation_setting.AutoModelMaxAttempts(), budget.remainingRetries()))
 		return false
 	}
 	current, ok := service.GetCurrentAutoModelRoute(c)
 	if !ok {
+		logger.LogInfo(c, fmt.Sprintf("auto route diag: event=no_switch reason=no_current_route failure=%s attempt=%d max=%d",
+			switchReason, budget.attempts, operation_setting.AutoModelMaxAttempts()))
 		return false
 	}
 	next := common.GetContextKeyInt(c, constant.ContextKeyAutoModelIndex) + 1
@@ -1011,21 +1293,46 @@ func trySwitchAutoModel(c *gin.Context, info *relaycommon.RelayInfo, retryParam 
 		next = 0
 	case service.AutoModelRebuildEmpty:
 		// 重排后确无候选:清空计划并结束,绝不回退旧路线。
+		d := routes.Meta.Diagnostics
 		service.ReplaceAutoModelRoutePlan(c, nil)
 		service.SetAutoModelRoutePlanMeta(c, service.AutoModelRoutePlanMeta{})
+		logger.LogInfo(c, fmt.Sprintf("auto route diag: event=no_switch reason=plan_empty failure=%s attempt=%d max=%d remaining=%d cooling=%d route_excluded=%d channel=%d model=%d unauthorized=%d whitelist=%d no_targets=%d zero_weight=%d billing_endpoint=%d",
+			switchReason, budget.attempts, operation_setting.AutoModelMaxAttempts(), budget.remainingRetries(),
+			d.Cooling, d.RouteExcluded, d.ChannelExcluded, d.ModelExcluded, d.Unauthorized,
+			d.WhitelistExcluded, d.NoTargets, d.ZeroWeight, d.BillingOrEndpoint))
 		return false
 	case service.AutoModelRebuildFailed:
 		// 刷新失败:停止继续派发,让调用方保留真实最后上游错误。
+		logger.LogInfo(c, fmt.Sprintf("auto route diag: event=no_switch reason=rebuild_failed failure=%s attempt=%d max=%d remaining=%d",
+			switchReason, budget.attempts, operation_setting.AutoModelMaxAttempts(), budget.remainingRetries()))
 		return false
 	default:
 		// AutoModelRebuildSkipped:没有已尝试路线,继续现计划单调前进。
 	}
 	channel, err := prepareAutoModelRouteFromIndex(c, info, retryParam, tokens, meta, next, true)
 	if err != nil {
+		logger.LogInfo(c, fmt.Sprintf("auto route diag: event=no_switch reason=prepare_failed failure=%s detail=%s attempt=%d max=%d remaining=%d",
+			switchReason, err.Error(), budget.attempts, operation_setting.AutoModelMaxAttempts(), budget.remainingRetries()))
 		return false
 	}
-	logger.LogInfo(c, fmt.Sprintf("auto model: 路线 %s/%s#%d -> %s/%s#%d",
-		current.Group, current.ModelName, current.ChannelID, info.UsingGroup, info.OriginModelName, channel.Id))
+	planMeta := service.GetAutoModelRoutePlanMeta(c)
+	d := planMeta.Diagnostics
+	attempted := len(attemptedAutoModelRoutes(c))
+	localRejected := len(locallyRejectedAutoModelRoutes(c))
+	logger.LogInfo(c, fmt.Sprintf("auto route diag: event=switch reason=%s from=%s/%s#%d to=%s/%s#%d attempt=%d max=%d remaining=%d attempted=%d local_rejected=%d exclusions(route=%d cooling=%d channel=%d model=%d unauthorized=%d whitelist=%d no_targets=%d zero_weight=%d billing_endpoint=%d) main=%d backup=%d trial=%d group=%s %s",
+		switchReason,
+		current.Group, current.ModelName, current.ChannelID,
+		info.UsingGroup, info.OriginModelName, channel.Id,
+		budget.attempts, operation_setting.AutoModelMaxAttempts(), budget.remainingRetries(),
+		attempted, localRejected,
+		d.RouteExcluded, d.Cooling, d.ChannelExcluded, d.ModelExcluded, d.Unauthorized,
+		d.WhitelistExcluded, d.NoTargets, d.ZeroWeight, d.BillingOrEndpoint,
+		d.Main, d.Backup, d.Trial,
+		rebuildGroup,
+		service.AutoModelPlanDiagnostic(service.AutoModelRoutePlan{
+			Routes: service.GetAutoModelRoutePlan(c),
+			Meta:   planMeta,
+		}, rebuildGroup)))
 	return true
 }
 
@@ -1302,7 +1609,7 @@ func recordAutoModelUnusableAnswer(c *gin.Context, info *relaycommon.RelayInfo, 
 //
 // 不能只看 c.Request.Context().Err()：客户端收完正文后正常关闭连接（curl、SDK、
 // 下位机都是收到完整响应立即断开）时 ctx 同样是 canceled，于是每个正常完成的请求
-// 都会被判成"客户端断开"，全部 auto 反馈被丢弃——分数不更新、慢成功的冷却不触发。
+// 都会被判成"客户端断开"，全部 auto 反馈被丢弃——分数不更新、冷却也无法记录。
 // 所以以"写入没能完成"为主信号（ClientDeliveryBroken），ctx 取消只在一个字节都
 // 没写出去（客户端在等到任何内容前就断了）时才成立。
 func autoModelClientAbandoned(c *gin.Context, info *relaycommon.RelayInfo) bool {
@@ -1945,4 +2252,87 @@ func observedAutoModelCooldownLatency(info *relaycommon.RelayInfo, success bool)
 		return observedAutoLatency(info, true)
 	}
 	return observedAutoModelElapsed(info)
+}
+
+const autoModelAttemptTraceKey = "auto_model_attempt_trace"
+
+// autoModelAttemptTraceEntry is a request-local, log-only record of one dispatched
+// upstream attempt. It never feeds routing decisions; the stop log prints it so a
+// single request shows which routes were tried, how long each took and why it
+// ended.
+type autoModelAttemptTraceEntry struct {
+	Index     int
+	Route     service.AutoModelRoute
+	Category  string
+	Outcome   string
+	ElapsedMS int64
+	TTFTMS    int64
+	Detail    string
+}
+
+func traceAutoModelAttempt(c *gin.Context, info *relaycommon.RelayInfo, outcome, detail string) {
+	if c == nil || info == nil || !info.HasUpstreamDispatch() {
+		return
+	}
+	route, ok := service.GetCurrentAutoModelRoute(c)
+	if !ok {
+		return
+	}
+	category := service.GetAutoModelRoutePlanMeta(c).Categories[route]
+	ttft := int64(-1)
+	if latency, known := info.AttemptFirstValidOutputLatency(); known && latency > 0 {
+		ttft = latency.Milliseconds()
+	}
+	entries := autoModelAttemptTrace(c)
+	entries = append(entries, autoModelAttemptTraceEntry{
+		Index:     len(entries) + 1,
+		Route:     route,
+		Category:  category,
+		Outcome:   outcome,
+		ElapsedMS: info.AttemptElapsed().Milliseconds(),
+		TTFTMS:    ttft,
+		Detail:    autoModelTraceText(detail, 80),
+	})
+	c.Set(autoModelAttemptTraceKey, entries)
+}
+
+func autoModelAttemptTrace(c *gin.Context) []autoModelAttemptTraceEntry {
+	if c == nil {
+		return nil
+	}
+	value, _ := c.Get(autoModelAttemptTraceKey)
+	entries, _ := value.([]autoModelAttemptTraceEntry)
+	return entries
+}
+
+func formatAutoModelAttemptTrace(c *gin.Context) string {
+	entries := autoModelAttemptTrace(c)
+	parts := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		category := entry.Category
+		if category == "" {
+			category = "-"
+		}
+		ttft := "?"
+		if entry.TTFTMS >= 0 {
+			ttft = fmt.Sprintf("%dms", entry.TTFTMS)
+		}
+		part := fmt.Sprintf("#%d %s/%s#%d cat=%s outcome=%s elapsed=%dms ttft=%s",
+			entry.Index, entry.Route.Group, entry.Route.ModelName, entry.Route.ChannelID,
+			category, entry.Outcome, entry.ElapsedMS, ttft)
+		if entry.Detail != "" {
+			part += " detail=" + entry.Detail
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func autoModelTraceText(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	runes := []rune(value)
+	if limit > 0 && len(runes) > limit {
+		return string(runes[:limit]) + "…"
+	}
+	return value
 }

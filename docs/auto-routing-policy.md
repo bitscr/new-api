@@ -36,6 +36,15 @@ planner separates reliability from speed:
 5. Routes in the trial range remain eligible for normal degraded fallback when
    no reliable route exists. Each trial route has at most one in-flight real
    business request per process; planning and page queries never consume it.
+   Within each priority tier, a trial with fresh successful latency in the
+   request's mode, a recent success ratio meeting the reliability threshold,
+   and no pending-recovery flag is preferred over unverified trials. These
+   successful trials are ordered into latency pools after the admitted main
+   and backup pools and remain labeled `successful_trial`, without bypassing
+   the main-pool sample thresholds. When no admitted route exists, normal
+   traffic uses the fastest successful trial pool and the configured small
+   exploration draw applies to candidates outside it. Fully random cold-start
+   fallback is used only while that tier has no qualifying successful trial.
 
 Priority remains a hard boundary: exploration, trial admission or a faster route
 never jumps ahead of a higher-priority tier. Every concrete `(group, model,
@@ -127,6 +136,25 @@ the order they actually occurred within that request. Replacing an older observa
 also moves its position, so unordered map iteration is not a valid application order.
 A batch drains only once.
 
+For auto requests, each attempt's successful response is staged above the normal
+relay writer until the answer observer confirms text, reasoning or a valid tool
+call. A non-stream body is buffered up to a hard cap and committed only after
+validation; a stream's initial frames are buffered and released at the first valid
+output. Crossing the cap commits the buffered prefix and streams the remaining
+bytes directly, so staging never holds more than the cap. If an explicitly invalid
+HTTP 200 (empty body, banner-only, or explicit protocol error) arrives before
+commit and budget/candidates remain, the staged response is discarded, the pair's
+failure is published immediately, and the next replanned route is dispatched. Once
+any bytes are committed, or the staging cap is reached, no second candidate is
+spliced into the response. A committed response whose bytes the observer cannot
+classify (unknown shape, truncated/ambiguous choices, observation limit) is
+delivered but recorded as neutral: it is neither a success nor a failure. A candidate
+that never wrote a response and cannot be replaced ends as a gateway error instead
+of an empty 200. SSE keepalive pings are dropped while a candidate is uncommitted
+and serialized with answer writes once it is; a discarded candidate's headers are
+restored so the next candidate can set SSE headers again. Named-model requests keep
+their previous behavior.
+
 A dispatched trial route keeps its process-local slot until its feedback has been
 published. A long fallback attempt therefore cannot let another request re-enter the
 same trial route before the first outcome is visible. A pre-dispatch local rejection
@@ -160,17 +188,24 @@ rewind the recorded observation time. Latency sample counts and reliability
 counts decay with `AutoModelScoreDecayMinutes`; the latency value itself is not
 decayed toward zero, so an idle route is treated as unknown rather than
 increasingly fast. Evidence is pair-specific and process-local; the database
-keeps the latest snapshot per key, not a globally merged event history.
+keeps the latest snapshot per key, not a globally merged event history. Cooldown
+and evidence caches are process-local as well: feedback is persisted before the
+same process plans the next candidate, but other instances are not notified and
+may retain their previous in-memory cooldown until they reload/restart. No
+cross-instance push, shared Redis dependency or periodic stale-cache overwrite is
+introduced.
 
 ## Persistent cooldown remains pair-scoped
 
-Observed failures, unusable delivered answers and qualifying slow outcomes can cool
-only the observed `(group, model, channel)`. Cooldown is strict and survives a
-restart. Fast successful recovery clears that pair's cooldown and escalation state;
+Observed failures and unusable delivered answers can cool
+only the observed `(group, model, channel)`. A slow but successful answer is latency
+evidence, not a failure: it stays eligible and is ordered into a slower backup pool,
+never cooled. Cooldown is strict and survives a restart. Any successful recovery
+clears that pair's cooldown and escalation state;
 another model succeeding does not clear it. The latest recovery time is kept as an
 ordering barrier even after the cooldown row is deleted, so a failure observed before
 recovery and published after a long backup attempt cannot re-cool the route. The
-barrier is advanced by normal fast successes and by administrator clears, and it
+barrier is advanced by successful observations and by administrator clears, and it
 only moves forward: a delayed older success can never move it backwards. No model-empty channel cooldown rows are
 introduced, and no historical cooldowns are deleted by this change.
 
@@ -256,17 +291,39 @@ A failed target/evidence read returns an explicit error instead of an empty tabl
 The frontend discards late responses when switching between stream and non-stream
 previews.
 
+## Diagnostics
+
+Auto routing emits stable `auto route diag:` events for the initial plan (`plan`),
+candidate selection (`attempt stage=selected`), confirmed upstream dispatch
+(`attempt stage=dispatched`), each successful reroute (`switch`), blocked reroutes
+(`no_switch`: response committed, budget exhausted, client canceled, channel lock,
+staging unavailable, plan empty, rebuild failed, or retry classification), an
+unclassifiable committed answer (`unknown_answer`), and a final `stop` summary.
+Plan, plan-failed and switch events include candidate counts grouped as route
+excluded, cooling, channel excluded, model excluded, unauthorized, whitelist
+excluded, no targets, zero weight and billing/endpoint excluded, plus main/backup/
+trial split. Logs contain route metadata and error codes only, never keys, prompts
+or response bodies.
+
 ## Verification
 
 `service/auto_model_plan_test.go` covers reliability admission, latency pools,
+successful-trial reuse until admission, bounded cold-start exploration, and
+fresh mode-specific success requirements. It also covers
 exploration prepending and the process-local trial slot.
 `service/auto_model_routing_test.go` covers evidence decay, per-mode folding and
 out-of-order observations. `service/auto_model_score_clear_test.go` covers clear
 tombstones, stale-snapshot rejection, restore and persistence retry.
 `service/auto_model_score_status_test.go` covers effective samples and explicit read
 failures. `relay/common/first_valid_output_test.go` covers protocol-aware
-first-valid-output detection and per-attempt reset; controller latency/feedback tests
-cover dispatch-based timing, stream/non-stream evidence and trial-slot release.
+first-valid-output detection and per-attempt reset; `relay/common/auto_attempt_response_test.go`
+covers banner discard, the hard staging cap, keepalive handling and concurrent
+writers; `relay/helper/auto_attempt_headers_test.go` covers SSE header reuse after a
+discarded candidate. `controller/auto_model_relay_chain_test.go` exercises a real
+HTTP upstream through the adaptor, observer, staging writer and feedback store
+(banner-only, oversized unclassifiable and untouched-writer cases); other controller
+latency/feedback tests cover dispatch-based timing, stream/non-stream evidence and
+trial-slot release.
 
 `scripts/test-auto-routing-policy.py` runs a declared synthetic policy matrix against
 a supplied binary. Run both `--cache false` and `--cache true`. It checks exact route

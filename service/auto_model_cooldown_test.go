@@ -121,8 +121,8 @@ func TestAutoModelCooldownIsPerModel(t *testing.T) {
 	setupAutoModelCooldownTestDB(t)
 	group := "default"
 
-	// 慢成功（总耗时 110 秒）→ 只冷却这个模型
-	applyAutoModelCooldown(group, "slow-model", 1, true, 110000)
+	// 慢失败（总耗时 110 秒）→ 只冷却这个模型
+	applyAutoModelCooldown(group, "slow-model", 1, false, 110000)
 	rows := cooldownRows(t)
 	require.Len(t, rows, 1, "只该有一条模型级冷却")
 	require.Equal(t, "slow-model", rows[0].Model)
@@ -130,8 +130,8 @@ func TestAutoModelCooldownIsPerModel(t *testing.T) {
 	require.False(t, autoModelCooldownActive(group, "other-model", []int{1}),
 		"同渠道的其它模型不该被连累——它可能又快又稳")
 
-	// 同渠道的第二个模型也慢 → 各记一条，渠道级依旧不出现
-	applyAutoModelCooldown(group, "second-slow-model", 1, true, 110000)
+	// 同渠道的第二个模型也失败 → 各记一条，渠道级依旧不出现
+	applyAutoModelCooldown(group, "second-slow-model", 1, false, 110000)
 	rows = cooldownRows(t)
 	require.Len(t, rows, 2)
 	for _, row := range rows {
@@ -147,6 +147,36 @@ func TestAutoModelCooldownIsPerModel(t *testing.T) {
 	_, ok := autoModelCooldowns.Get(autoModelHealthKey(group, "slow-model", 1))
 	require.False(t, ok, "模型级冷却应被清除")
 	require.True(t, autoModelCooldownActive(group, "second-slow-model", []int{1}))
+}
+
+// 慢成功只是延迟证据，不是失败：它必须清除冷却，也不能继续标记"待恢复"。
+// 否则唯一能用的上游会因为首 token 慢被停用，请求只能去抽挂死的路由。
+func TestAutoModelSlowSuccessIsRecoveryNotFailure(t *testing.T) {
+	setupAutoModelCooldownTestDB(t)
+	group, modelName, channelID := "slow-success", "slow-model", 7
+	key := autoModelHealthKey(group, modelName, channelID)
+
+	tripAutoModelCooldown(group, modelName, channelID, "seed", time.Now().Add(-time.Minute))
+	require.True(t, autoModelCooldownActive(group, modelName, []int{channelID}))
+
+	autoModelScoreMutex.Lock()
+	autoModelHealth.Delete(key)
+	autoModelScoreMutex.Unlock()
+	t.Cleanup(func() {
+		autoModelScoreMutex.Lock()
+		autoModelHealth.Delete(key)
+		autoModelScoreMutex.Unlock()
+	})
+
+	recordAutoModelOutcome(group, modelName, channelID, true, true, false, 0, 120000, false, "", time.Now())
+
+	require.False(t, autoModelCooldownActive(group, modelName, []int{channelID}),
+		"慢成功必须清除冷却，而不是新建冷却")
+	autoModelScoreMutex.Lock()
+	outcome, ok := autoModelHealth.Get(key)
+	autoModelScoreMutex.Unlock()
+	require.True(t, ok)
+	require.False(t, outcome.PendingRecovery, "慢成功不能把路由留在待恢复状态")
 }
 
 func TestAutoModelCooldownKeepsFailureReason(t *testing.T) {
@@ -203,7 +233,7 @@ func TestAutoModelCooldownSurvivesReload(t *testing.T) {
 	setupAutoModelCooldownTestDB(t)
 	group := "default"
 
-	applyAutoModelCooldown(group, "slow-model", 1, true, 110000)
+	applyAutoModelCooldown(group, "slow-model", 1, false, 110000)
 	require.True(t, autoModelCooldownActive(group, "slow-model", []int{1}))
 
 	// 模拟进程重启：内存全丢，重新从库里载入

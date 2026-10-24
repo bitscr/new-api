@@ -197,7 +197,7 @@ func recordAutoModelOutcome(group, name string, channelID int, success, stream, 
 		tripAutoModelCooldown(group, name, channelID, reason, observedAt)
 		return
 	}
-	// 慢或者失败进入冷却（落库，跨重启生效），正常速度的成功清除冷却。
+	// 失败进入冷却（落库，跨重启生效）；成功清除冷却，慢成功只影响延迟排序。
 	applyAutoModelCooldownWithReasonAt(group, name, channelID, success, elapsedMs, cooldownReason, observedAt)
 }
 
@@ -403,7 +403,10 @@ func updateAutoModelOutcome(current autoModelOutcome, exists, success, stream, l
 			current.NonStreamLatencyUpdatedAt = latencyAt
 		}
 		if isLatest {
-			current.PendingRecovery = latencyMs > autoModelSlowLatencyMs
+			// A success clears the recovery flag regardless of its latency.
+			// Slow is only a latency-pool ordering signal; it must not keep the
+			// route out of the main pool while faster routes fail.
+			current.PendingRecovery = false
 		}
 	}
 	capAutoModelEvidence(&current)

@@ -171,7 +171,9 @@ func streamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				case <-pingTicker.C:
 					// 使用超时机制防止写操作阻塞
 					done := make(chan error, 1)
+					wg.Add(1)
 					gopool.Go(func() {
+						defer wg.Done()
 						writeMutex.Lock()
 						defer writeMutex.Unlock()
 						done <- PingData(c)

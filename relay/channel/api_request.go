@@ -501,10 +501,17 @@ func DoWssRequestWithResponse(a Adaptor, c *gin.Context, info *common.RelayInfo)
 	return dialer.DialContext(c.Request.Context(), fullRequestURL, targetHeader)
 }
 
-func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) context.CancelFunc {
+// startPingKeepAlive starts the SSE keepalive. The returned stop function
+// cancels the ticker and waits for the ping goroutine and any in-flight write,
+// so the caller may safely replace c.Writer after it returns.
+func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) func() {
 	pingerCtx, stopPinger := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	var inFlight sync.WaitGroup
+	var pingMutex sync.Mutex
 
 	gopool.Go(func() {
+		defer close(stopped)
 		defer func() {
 			// 增加panic恢复处理
 			if r := recover(); r != nil {
@@ -530,7 +537,6 @@ func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) context.Canc
 			}
 		}()
 
-		var pingMutex sync.Mutex
 		if common2.DebugEnabled {
 			println("SSE ping goroutine started")
 		}
@@ -544,7 +550,7 @@ func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) context.Canc
 			select {
 			// 发送 ping 数据
 			case <-ticker.C:
-				if err := sendPingData(c, &pingMutex); err != nil {
+				if err := sendPingData(c, pingerCtx, &pingMutex, &inFlight); err != nil {
 					if common2.DebugEnabled {
 						println("SSE ping error, stopping goroutine:", err.Error())
 					}
@@ -566,13 +572,33 @@ func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) context.Canc
 		}
 	})
 
-	return stopPinger
+	return func() {
+		stopPinger()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			return
+		}
+		// A write that already timed out may still be inside the writer. Wait
+		// for it (bounded) so a later writer swap cannot overlap with it.
+		drained := make(chan struct{})
+		gopool.Go(func() {
+			inFlight.Wait()
+			close(drained)
+		})
+		select {
+		case <-drained:
+		case <-time.After(5 * time.Second):
+		}
+	}
 }
 
-func sendPingData(c *gin.Context, mutex *sync.Mutex) error {
+func sendPingData(c *gin.Context, ctx context.Context, mutex *sync.Mutex, inFlight *sync.WaitGroup) error {
 	// 增加超时控制，防止锁死等待
 	done := make(chan error, 1)
+	inFlight.Add(1)
 	go func() {
+		defer inFlight.Done()
 		mutex.Lock()
 		defer mutex.Unlock()
 
@@ -595,6 +621,9 @@ func sendPingData(c *gin.Context, mutex *sync.Mutex) error {
 		return err
 	case <-time.After(10 * time.Second):
 		return errors.New("SSE ping data send timeout")
+	case <-ctx.Done():
+		// Normal shutdown: the loop exits on the next select without logging.
+		return nil
 	case <-c.Request.Context().Done():
 		return errors.New("request context cancelled during ping")
 	}
@@ -615,7 +644,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		client = service.GetHttpClient()
 	}
 
-	var stopPinger context.CancelFunc
+	var stopPinger func()
 	if info.IsStream {
 		helper.SetEventStreamHeaders(c)
 		// 处理流式请求的 ping 保活

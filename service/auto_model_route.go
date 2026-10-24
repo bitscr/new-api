@@ -38,7 +38,26 @@ type AutoModelRoutePlanMeta struct {
 	ColdStart          bool
 	Categories         map[AutoModelRoute]string
 	Reasons            map[AutoModelRoute]string
+	Evidence           map[AutoModelRoute]autoModelEvidenceView
 	Trial              map[AutoModelRoute]bool
+	Diagnostics        AutoModelRouteDiagnostics
+}
+
+// AutoModelRouteDiagnostics counts why candidates were filtered and how the
+// final plan was split. It is request-scoped diagnostics, not route identity.
+type AutoModelRouteDiagnostics struct {
+	WhitelistExcluded int
+	NoTargets         int
+	ZeroWeight        int
+	BillingOrEndpoint int
+	Unauthorized      int
+	ChannelExcluded   int
+	RouteExcluded     int
+	ModelExcluded     int
+	Cooling           int
+	Main              int
+	Backup            int
+	Trial             int
 }
 
 type AutoModelRoutePlan struct {
@@ -187,6 +206,7 @@ type autoModelRouteSnapshot struct {
 	Mode             autoModelRequestMode
 	Now              time.Time
 	Settings         operation_setting.AutoModelRoutingSettings
+	Diagnostics      *AutoModelRouteDiagnostics
 }
 
 // settingsSnapshot treats an unset Settings field as "use the process
@@ -209,6 +229,7 @@ func newAutoModelRouteSnapshot(excluded map[int]bool, mode autoModelRequestMode)
 		Mode:             mode,
 		Now:              time.Now(),
 		Settings:         operation_setting.AutoModelRoutingSettingsSnapshot(),
+		Diagnostics:      &AutoModelRouteDiagnostics{},
 	}
 }
 
@@ -238,6 +259,7 @@ func buildAutoModelRoutePlanForRequest(c *gin.Context, group string, mode autoMo
 		Mode:       mode,
 		Categories: make(map[AutoModelRoute]string),
 		Reasons:    make(map[AutoModelRoute]string),
+		Evidence:   make(map[AutoModelRoute]autoModelEvidenceView),
 		Trial:      make(map[AutoModelRoute]bool),
 	}}
 	if c == nil || !operation_setting.AutoModelEnabled || group == "" {
@@ -254,6 +276,9 @@ func buildAutoModelRoutePlanForRequest(c *gin.Context, group string, mode autoMo
 		crossGroupRetry = common.GetContextKeyBool(c, constant.ContextKeyTokenCrossGroupRetry)
 	}
 	snapshot := newAutoModelRouteSnapshot(GetAutoModelHardExcludedChannelIDs(c), mode)
+	if snapshot.Diagnostics == nil {
+		snapshot.Diagnostics = &AutoModelRouteDiagnostics{}
+	}
 	snapshot.ExcludedRoutes = exclude
 	snapshot.ExcludedModels = getAutoModelFailedModels(c)
 	hasCandidates, hasAuthorizedCandidates := false, false
@@ -279,6 +304,9 @@ func buildAutoModelRoutePlanForRequest(c *gin.Context, group string, mode autoMo
 		for route, reason := range result.Meta.Reasons {
 			plan.Meta.Reasons[route] = reason
 		}
+		for route, view := range result.Meta.Evidence {
+			plan.Meta.Evidence[route] = view
+		}
 		for route, trial := range result.Meta.Trial {
 			plan.Meta.Trial[route] = trial
 		}
@@ -294,8 +322,10 @@ func buildAutoModelRoutePlanForRequest(c *gin.Context, group string, mode autoMo
 		}
 	}
 	if !hasAuthorizedCandidates && hasCandidates {
+		plan.Meta.Diagnostics = *snapshot.Diagnostics
 		return plan, ErrAutoModelNoAuthorizedCandidates
 	}
+	plan.Meta.Diagnostics = *snapshot.Diagnostics
 	return plan, nil
 }
 
@@ -311,6 +341,7 @@ func buildAutoModelGroupPlan(group string, authorized func(string) bool, snapsho
 		Mode:       snapshot.Mode,
 		Categories: make(map[AutoModelRoute]string),
 		Reasons:    make(map[AutoModelRoute]string),
+		Evidence:   make(map[AutoModelRoute]autoModelEvidenceView),
 		Trial:      make(map[AutoModelRoute]bool),
 	}}
 	// A caller that already snapshotted this group's targets (the status page)
@@ -331,6 +362,8 @@ func buildAutoModelGroupPlan(group string, authorized func(string) bool, snapsho
 		for _, name := range candidates {
 			if authorized(name) {
 				allowed = append(allowed, name)
+			} else if snapshot.Diagnostics != nil {
+				snapshot.Diagnostics.Unauthorized++
 			}
 		}
 		candidates = allowed
@@ -356,6 +389,16 @@ func eligibleAutoModelCandidates(group string, snapshot autoModelRouteSnapshot) 
 			allowed = append(allowed, name)
 		}
 		sort.Strings(allowed)
+	} else if snapshot.Diagnostics != nil {
+		allowedSet := make(map[string]bool, len(allowed))
+		for _, name := range allowed {
+			allowedSet[strings.TrimSpace(name)] = true
+		}
+		for name := range snapshot.Targets {
+			if !allowedSet[strings.TrimSpace(name)] {
+				snapshot.Diagnostics.WhitelistExcluded++
+			}
+		}
 	}
 	var candidates []string
 	seen := make(map[string]bool, len(allowed))
@@ -365,10 +408,22 @@ func eligibleAutoModelCandidates(group string, snapshot autoModelRouteSnapshot) 
 			continue
 		}
 		seen[name] = true
-		if len(snapshot.Targets[name]) == 0 || !positiveAutoModelWeight(autoModelRouteWeight(group, name, snapshot.ModelWeights)) || !helper.HasModelBillingConfig(name) {
+		if len(snapshot.Targets[name]) == 0 {
+			if snapshot.Diagnostics != nil {
+				snapshot.Diagnostics.NoTargets++
+			}
 			continue
 		}
-		if !autoModelSupportsChat(model.GetModelSupportEndpointTypes(name)) {
+		if !positiveAutoModelWeight(autoModelRouteWeight(group, name, snapshot.ModelWeights)) {
+			if snapshot.Diagnostics != nil {
+				snapshot.Diagnostics.ZeroWeight++
+			}
+			continue
+		}
+		if !helper.HasModelBillingConfig(name) || !autoModelSupportsChat(model.GetModelSupportEndpointTypes(name)) {
+			if snapshot.Diagnostics != nil {
+				snapshot.Diagnostics.BillingOrEndpoint++
+			}
 			continue
 		}
 		candidates = append(candidates, name)
@@ -409,23 +464,41 @@ func collectAutoModelRouteCandidates(group string, candidates []string, snapshot
 		}
 		seenModels[name] = true
 		if snapshot.ExcludedModels[autoModelFailedModelKey(group, name)] {
+			if snapshot.Diagnostics != nil {
+				snapshot.Diagnostics.ModelExcluded++
+			}
 			continue
 		}
 		modelWeight := autoModelRouteWeight(group, name, snapshot.ModelWeights)
 		if !positiveAutoModelWeight(modelWeight) {
+			if snapshot.Diagnostics != nil {
+				snapshot.Diagnostics.ZeroWeight++
+			}
 			continue
 		}
 		seenTargets := make(map[int]bool, len(snapshot.Targets[name]))
 		for _, target := range snapshot.Targets[name] {
-			if target.ChannelID <= 0 || seenTargets[target.ChannelID] || snapshot.ExcludedChannels[target.ChannelID] {
+			if target.ChannelID <= 0 || seenTargets[target.ChannelID] {
 				continue
 			}
 			seenTargets[target.ChannelID] = true
+			if snapshot.ExcludedChannels[target.ChannelID] {
+				if snapshot.Diagnostics != nil {
+					snapshot.Diagnostics.ChannelExcluded++
+				}
+				continue
+			}
 			if snapshot.ExcludedRoutes[AutoModelRoute{Group: group, ModelName: name, ChannelID: target.ChannelID}] {
+				if snapshot.Diagnostics != nil {
+					snapshot.Diagnostics.RouteExcluded++
+				}
 				continue
 			}
 			key := autoModelHealthKey(group, name, target.ChannelID)
 			if snapshot.Cooldowns[key].Until.After(snapshot.Now) {
+				if snapshot.Diagnostics != nil {
+					snapshot.Diagnostics.Cooling++
+				}
 				continue
 			}
 			routes = append(routes, autoModelRouteCandidate{
@@ -447,6 +520,7 @@ func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapsho
 		Mode:       snapshot.Mode,
 		Categories: make(map[AutoModelRoute]string),
 		Reasons:    make(map[AutoModelRoute]string),
+		Evidence:   make(map[AutoModelRoute]autoModelEvidenceView),
 		Trial:      make(map[AutoModelRoute]bool),
 	}
 	routes := collectAutoModelRouteCandidates(group, candidates, snapshot)
@@ -470,6 +544,9 @@ func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapsho
 		for route, reason := range tierMeta.Reasons {
 			meta.Reasons[route] = reason
 		}
+		for route, view := range tierMeta.Evidence {
+			meta.Evidence[route] = view
+		}
 		for route, trial := range tierMeta.Trial {
 			meta.Trial[route] = trial
 		}
@@ -482,6 +559,9 @@ func buildAutoModelRoutesFromSnapshot(group string, candidates []string, snapsho
 			meta.ColdStart = tierMeta.ColdStart
 		}
 	}
+	if snapshot.Diagnostics != nil {
+		meta.Diagnostics = *snapshot.Diagnostics
+	}
 	return plan, meta
 }
 
@@ -490,20 +570,36 @@ func buildAutoModelPriorityTier(group string, tier []autoModelRouteCandidate, sn
 		Mode:       snapshot.Mode,
 		Categories: make(map[AutoModelRoute]string),
 		Reasons:    make(map[AutoModelRoute]string),
+		Evidence:   make(map[AutoModelRoute]autoModelEvidenceView),
 		Trial:      make(map[AutoModelRoute]bool),
 	}
 	settings := snapshot.settingsSnapshot()
 	mainCandidates := make([]autoModelRouteCandidate, 0, len(tier))
+	var successfulTrialCandidates []autoModelRouteCandidate
 	var trialCandidates []autoModelRouteCandidate
 	for _, candidate := range tier {
+		route := AutoModelRoute{Group: group, ModelName: candidate.ModelName, ChannelID: candidate.ChannelID}
+		meta.Evidence[route] = candidate.View
 		if autoModelIsMainCandidate(candidate.View, settings) {
 			mainCandidates = append(mainCandidates, candidate)
+		} else if autoModelIsSuccessfulTrialCandidate(candidate.View, snapshot.Now, settings) {
+			successfulTrialCandidates = append(successfulTrialCandidates, candidate)
 		} else {
 			trialCandidates = append(trialCandidates, candidate)
 		}
 	}
 
 	pools := autoModelOrderLatencyPools(mainCandidates, settings)
+	successfulTrialPools := autoModelOrderLatencyPools(successfulTrialCandidates, settings)
+	if snapshot.Diagnostics != nil {
+		snapshot.Diagnostics.Trial += len(successfulTrialCandidates) + len(trialCandidates)
+		if len(pools) > 0 {
+			snapshot.Diagnostics.Main += len(pools[0])
+			for _, pool := range pools[1:] {
+				snapshot.Diagnostics.Backup += len(pool)
+			}
+		}
+	}
 	mainRoutes := make([]AutoModelRoute, 0, len(tier))
 	for poolIndex, pool := range pools {
 		category := "main"
@@ -521,6 +617,22 @@ func buildAutoModelPriorityTier(group string, tier []autoModelRouteCandidate, sn
 		}
 	}
 
+	// A successful business request is enough to prefer this trial over an
+	// unverified route. Keep the main-pool gates and single-flight admission:
+	// subsequent real requests collect the remaining evidence instead of
+	// spreading every cold-start request over hundreds of unknown routes.
+	var successfulTrialRoutes []AutoModelRoute
+	for _, pool := range successfulTrialPools {
+		for _, route := range sampleAutoModelCandidateRoutes(group, pool, random, func(candidate autoModelRouteCandidate) float64 {
+			return candidate.ModelWeight
+		}) {
+			successfulTrialRoutes = append(successfulTrialRoutes, route)
+			meta.Categories[route] = "successful_trial"
+			meta.Reasons[route] = "优先试用：已有成功，继续积累业务样本"
+			meta.Trial[route] = true
+		}
+	}
+
 	trialByRoute := make(map[AutoModelRoute]autoModelRouteCandidate, len(trialCandidates))
 	for _, candidate := range trialCandidates {
 		trialByRoute[AutoModelRoute{Group: group, ModelName: candidate.ModelName, ChannelID: candidate.ChannelID}] = candidate
@@ -535,14 +647,11 @@ func buildAutoModelPriorityTier(group string, tier []autoModelRouteCandidate, sn
 		meta.Trial[route] = true
 	}
 
-	layer := append(append([]AutoModelRoute(nil), mainRoutes...), trialRoutes...)
+	layer := append(append([]AutoModelRoute(nil), mainRoutes...), successfulTrialRoutes...)
+	layer = append(layer, trialRoutes...)
 	if allowExploration && len(layer) > 0 {
 		meta.ExplorationDecided = true
-		mainPoolSize := 0
-		if len(pools) > 0 {
-			mainPoolSize = len(pools[0])
-		}
-		if mainPoolSize == 0 {
+		if len(pools) == 0 && len(successfulTrialPools) == 0 {
 			meta.ColdStart = true
 			return layer, meta, true
 		}
@@ -550,8 +659,18 @@ func buildAutoModelPriorityTier(group string, tier []autoModelRouteCandidate, sn
 		for _, pool := range pools[1:] {
 			exploreCandidates = append(exploreCandidates, pool...)
 		}
+		// When no fully admitted route exists, the fastest successful trial
+		// pool receives normal traffic. Only routes outside that pool compete
+		// for the same bounded exploration draw used after warm-up.
+		trialPoolStart := 0
+		if len(pools) == 0 {
+			trialPoolStart = 1
+		}
+		for _, pool := range successfulTrialPools[trialPoolStart:] {
+			exploreCandidates = append(exploreCandidates, pool...)
+		}
 		if len(exploreCandidates) > 0 {
-			trialRatio := float64(len(trialCandidates)) / float64(len(tier))
+			trialRatio := float64(len(successfulTrialCandidates)+len(trialCandidates)) / float64(len(tier))
 			base := settings.ExploreRatio
 			maximum := settings.ExploreMaxRatio
 			meta.ExplorationRatio = base + (maximum-base)*trialRatio
@@ -573,6 +692,13 @@ func autoModelIsMainCandidate(view autoModelEvidenceView, settings operation_set
 	return view.ReliabilityKnown &&
 		view.Reliability >= settings.ReliabilityThreshold &&
 		view.LatencyKnown && !view.PendingRecovery
+}
+
+func autoModelIsSuccessfulTrialCandidate(view autoModelEvidenceView, now time.Time, settings operation_setting.AutoModelRoutingSettings) bool {
+	return view.Observations > 0 && view.Reliability >= settings.ReliabilityThreshold &&
+		!view.PendingRecovery && autoModelEvidenceFreshFor(view.LastObservedAt, now, settings.ScoreDecayMinutes) &&
+		view.LatencySamples > 0 && view.LatencyMS > 0 &&
+		autoModelEvidenceFreshFor(view.LatencyUpdatedAt, now, settings.ScoreDecayMinutes)
 }
 
 func autoModelOrderLatencyPools(candidates []autoModelRouteCandidate, settings operation_setting.AutoModelRoutingSettings) [][]autoModelRouteCandidate {
@@ -792,7 +918,8 @@ func RebuildAutoModelRoutePlanForRetry(c *gin.Context, group string, attempted m
 		return AutoModelRoutePlan{}, AutoModelRebuildFailed
 	}
 	if len(plan.Routes) == 0 {
-		return AutoModelRoutePlan{}, AutoModelRebuildEmpty
+		// Preserve diagnostics even when the rebuild has no route left.
+		return plan, AutoModelRebuildEmpty
 	}
 	plan.Meta.ExplorationDecided = true
 	plan.Meta.Explored = false

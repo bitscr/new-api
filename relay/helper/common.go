@@ -40,14 +40,8 @@ func FlushWriter(c *gin.Context) (err error) {
 }
 
 func SetEventStreamHeaders(c *gin.Context) {
-	// 检查是否已经设置过头部
-	if _, exists := c.Get("event_stream_headers_set"); exists {
-		return
-	}
-
-	// 设置标志，表示头部已经设置过
-	c.Set("event_stream_headers_set", true)
-
+	// 不用 context 标志去重:auto 候选被丢弃时会连 Header 一起恢复到尝试前的
+	// 状态，若标志还留着，下一条候选就不会重新设置 SSE 头。这里的写入是幂等的。
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")

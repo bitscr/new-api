@@ -17,7 +17,7 @@ import (
 	"gorm.io/gorm"
 )
 
-// auto 候选冷却：把"这个 (分组, 模型, 渠道) 刚才慢或者挂了"记住一段明确的时间，
+// auto 候选冷却：把"这个 (分组, 模型, 渠道) 刚才请求失败了"记住一段明确的时间，
 // 并且落库，重启后依然生效。
 //
 // 只有一层，粒度是 (分组, 模型, 渠道)：只挡这一个组合。
@@ -33,14 +33,19 @@ import (
 // 重复犯错时窗口逐级翻倍（15m → 30m → 1h → 2h → 4h → 6h 封顶）。
 //
 // 判定规则（elapsedMs 是本次请求的总耗时）：
-//   - 正常速度的成功 → 清除该组合的冷却（别的模型偶然成功不代表这个组合已经好了）。
-//   - 慢（超过 autoModelSlowLatencyMs）的成功或失败 → 该组合进冷却。
-//   - 快速失败（例如 401、余额不足）→ 同样只记该组合。
+//   - 任何成功 → 清除该组合的冷却（别的模型偶然成功不代表这个组合已经好了）。
+//   - 失败 → 记该组合；耗时超过 autoModelSlowLatencyMs 时原因里带上耗时。
 //   - 没有耗时数据 → 不动冷却，避免用猜测覆盖已知状态。
+//
+// 慢成功不再进冷却：它只是一份"这条路能成，但首 token 较慢"的延迟证据，
+// 规划器会把慢路由排进更靠后的延迟池（后备），而不是把它整体停用。过去把
+// 慢成功按失败处理，会把当时唯一能用的上游停掉，反而只能去抽挂死的路由。
 
 const (
-	// autoModelSlowLatencyMs 超过它就算"慢"。流式请求量到的是首字节时间;
-	// 非流式量不到首字节,用总耗时兜底(会包含生成长文的时间)。
+	// autoModelSlowLatencyMs 超过它就算"慢"。流式请求量到的是首 token 时间;
+	// 非流式量不到首 token,用总耗时兜底(会包含生成长文的时间)。
+	// 现在它只用于失败原因标注与"客户端取消前上游长时间零响应"的判据，
+	// 不再触发慢成功冷却（见上）。
 	autoModelSlowLatencyMs int64 = 20000
 	// autoModelCooldownBase 是抖动阶梯的起步时长"默认值"。实际运行值取
 	// operation_setting.AutoModelCooldownBaseMinutes()(面板可改,分钟),这里
@@ -92,6 +97,10 @@ type autoModelCooldownPendingWrite struct {
 	delete    bool
 }
 
+// Cooldown state is process-local. Writes are persisted before the next
+// candidate is planned so this instance reacts immediately, but other instances
+// are not notified and keep their in-memory snapshot until they reload/restart.
+// No cross-instance push or shared cache is assumed.
 var (
 	autoModelCooldowns        = types.NewRWMap[string, autoModelCooldownState]()
 	autoModelCooldownLoadOnce sync.Once
@@ -276,15 +285,15 @@ func applyAutoModelCooldownWithReasonAt(group, name string, channelID int, succe
 		observedAt = time.Now()
 	}
 	now := observedAt
-	if success && elapsedMs <= autoModelSlowLatencyMs {
+	if success {
+		// 成功就是恢复证据，不因首 token 慢而降级。慢只会让它在延迟池里
+		// 排到更快且同样可靠的路由后面。
 		clearAutoModelCooldown(group, name, channelID, now)
 		return
 	}
 
 	reason := strings.TrimSpace(failureReason)
-	if success {
-		reason = fmt.Sprintf("响应过慢（%dms）", elapsedMs)
-	} else if elapsedMs > autoModelSlowLatencyMs {
+	if elapsedMs > autoModelSlowLatencyMs {
 		if reason != "" {
 			reason = fmt.Sprintf("超时/失败（%dms）: %s", elapsedMs, reason)
 		} else {

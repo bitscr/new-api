@@ -177,6 +177,34 @@ func (observation *answerObservation) hasValidOutput() bool {
 	return observation.textSeen || observation.reasoningSeen || observation.toolsSeen
 }
 
+// ClientAnswerHasValidOutput reports whether this attempt has produced actual
+// text, reasoning or a tool call. The auto staging writer uses it to release a
+// buffered stream as soon as delivery becomes safe.
+func (info *RelayInfo) ClientAnswerHasValidOutput() bool {
+	if info == nil {
+		return false
+	}
+	return info.answer.hasValidOutput()
+}
+
+// ClientAnswerUndetermined reports that the observation layer could not decide
+// whether the delivered bytes contain a usable answer (unknown protocol shape,
+// truncated/ambiguous choices, or an observation limit). ClientAnswerUnusable
+// deliberately stays false in that state, so the caller must not turn it into a
+// success: an unjudgeable answer is neutral evidence, not a healthy delivery.
+func (info *RelayInfo) ClientAnswerUndetermined() bool {
+	if info == nil || info.answer == nil {
+		return true
+	}
+	observation := info.answer
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	if observation.protocolError || observation.textSeen || observation.reasoningSeen || observation.toolsSeen {
+		return false
+	}
+	return !observation.parsed || observation.undecidable
+}
+
 // observeNativeAnswer keeps bounded per-channel text observations for native
 // Claude/Gemini/Responses frames. A non-empty delta is not enough: the gateway
 // banner may be split across several SSE packets, and each fragment looks like

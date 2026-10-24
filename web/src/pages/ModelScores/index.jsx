@@ -74,6 +74,7 @@ function categoryColor(category) {
     case 'reliable':
       return 'green';
     case 'backup':
+    case 'successful_trial':
       return 'blue';
     case 'pending_recovery':
       return 'orange';

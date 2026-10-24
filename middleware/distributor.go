@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel/gmicloud"
 	openailocalmodel "github.com/QuantumNous/new-api/relay/channel/openailocal"
@@ -81,7 +82,13 @@ func Distribute() func(c *gin.Context) {
 				common.SetContextKey(c, constant.ContextKeyAutoModelRequestGroup, autoGroup)
 				common.SetContextKey(c, constant.ContextKeyIsStream, modelRequest.Stream)
 				plan, routeErr := service.BuildAutoModelRoutePlanForRequest(c, autoGroup, modelRequest.Stream)
+				d := plan.Meta.Diagnostics
 				if routeErr != nil {
+					logger.LogInfo(c, fmt.Sprintf("auto route diag: event=plan_failed group=%s client_model=%s stream=%t error=%s routes=%d main=%d backup=%d trial=%d exclusions(route=%d cooling=%d channel=%d model=%d unauthorized=%d whitelist=%d no_targets=%d zero_weight=%d billing_endpoint=%d) %s",
+						autoGroup, modelRequest.Model, modelRequest.Stream, routeErr.Error(), len(plan.Routes), d.Main, d.Backup, d.Trial,
+						d.RouteExcluded, d.Cooling, d.ChannelExcluded, d.ModelExcluded, d.Unauthorized,
+						d.WhitelistExcluded, d.NoTargets, d.ZeroWeight, d.BillingOrEndpoint,
+						service.AutoModelPlanDiagnostic(plan, autoGroup)))
 					if errors.Is(routeErr, service.ErrAutoModelNoAuthorizedCandidates) {
 						abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenNoModelAccess))
 						return
@@ -94,11 +101,22 @@ func Distribute() func(c *gin.Context) {
 				if len(plan.Routes) == 0 {
 					// Never reopen cooling routes, even when the token has no usable
 					// alternative. No route is preferable to dispatching a blocked one.
+					logger.LogInfo(c, fmt.Sprintf("auto route diag: event=plan_empty group=%s client_model=%s cooling=%d route_excluded=%d channel=%d model=%d unauthorized=%d whitelist=%d no_targets=%d zero_weight=%d billing_endpoint=%d %s",
+						autoGroup, modelRequest.Model, d.Cooling, d.RouteExcluded, d.ChannelExcluded, d.ModelExcluded,
+						d.Unauthorized, d.WhitelistExcluded, d.NoTargets, d.ZeroWeight, d.BillingOrEndpoint,
+						service.AutoModelPlanDiagnostic(plan, autoGroup)))
 					abortWithOpenAiMessage(c, http.StatusServiceUnavailable,
 						i18n.T(c, i18n.MsgDistributorAutoModelNoCandidates, map[string]any{"Group": autoGroup}),
 						types.ErrorCodeModelNotFound)
 					return
 				}
+				selected := plan.Routes[0]
+				logger.LogInfo(c, fmt.Sprintf("auto route diag: event=plan group=%s client_model=%s stream=%t routes=%d main=%d backup=%d trial=%d selected=%s#%d cold_start=%t explored=%t ratio=%.3f exclusions(route=%d cooling=%d channel=%d model=%d unauthorized=%d whitelist=%d no_targets=%d zero_weight=%d billing_endpoint=%d) %s",
+					autoGroup, modelRequest.Model, modelRequest.Stream, len(plan.Routes), d.Main, d.Backup, d.Trial,
+					selected.ModelName, selected.ChannelID, plan.Meta.ColdStart, plan.Meta.Explored, plan.Meta.ExplorationRatio,
+					d.RouteExcluded, d.Cooling, d.ChannelExcluded, d.ModelExcluded, d.Unauthorized,
+					d.WhitelistExcluded, d.NoTargets, d.ZeroWeight, d.BillingOrEndpoint,
+					service.AutoModelPlanDiagnostic(plan, autoGroup)))
 				common.SetContextKey(c, constant.ContextKeyAutoModelClientName, modelRequest.Model)
 				service.SetAutoModelRoutePlan(c, plan.Routes)
 				service.SetAutoModelRoutePlanMeta(c, plan.Meta)

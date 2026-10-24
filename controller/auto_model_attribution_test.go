@@ -34,6 +34,12 @@ func newAutoModelAttributionContext(t *testing.T, upstreamURL, effort string) (*
 
 func newAutoModelAttributionContextForBody(t *testing.T, upstreamURL, model string, payload map[string]any) (*gin.Context, *relaycommon.RelayInfo) {
 	t.Helper()
+	c, info, _ := newAutoModelAttributionContextForBodyWithRecorder(t, upstreamURL, model, payload)
+	return c, info
+}
+
+func newAutoModelAttributionContextForBodyWithRecorder(t *testing.T, upstreamURL, model string, payload map[string]any) (*gin.Context, *relaycommon.RelayInfo, *httptest.ResponseRecorder) {
+	t.Helper()
 	if service.GetHttpClient() == nil {
 		service.InitHttpClient()
 	}
@@ -45,7 +51,8 @@ func newAutoModelAttributionContextForBody(t *testing.T, upstreamURL, model stri
 
 	body, err := common.Marshal(payload)
 	require.NoError(t, err)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
 	c.Request.Header.Set("Content-Type", "application/json")
 	common.SetContextKey(c, constant.ContextKeyAutoModelClientName, "auto")
@@ -62,7 +69,7 @@ func newAutoModelAttributionContextForBody(t *testing.T, upstreamURL, model stri
 	require.NoError(t, err)
 	info.DisablePing = true
 	t.Cleanup(func() { common.CleanupBodyStorage(c) })
-	return c, info
+	return c, info, recorder
 }
 
 // Keep this regression on pre-existing APIs: it must fail on a queued outcome,

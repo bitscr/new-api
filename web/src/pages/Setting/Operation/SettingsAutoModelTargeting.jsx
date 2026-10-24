@@ -443,7 +443,7 @@ export default function SettingsAutoModelTargeting(props) {
                 field={'AutoModelMinObservations'}
                 label={t('最低业务观测数')}
                 extraText={t(
-                  '默认 5，可设 1～70。少于该数量的路线只进入试用，不进入主流量。',
+                  '默认 5，可设 1～70。样本不足的路线仍处于试用；近期已有成功的路线优先继续使用，积累业务样本。',
                 )}
                 onChange={(value) =>
                   setInputs({ ...inputs, AutoModelMinObservations: value })
@@ -510,7 +510,7 @@ export default function SettingsAutoModelTargeting(props) {
             style={{ display: 'block', marginTop: 12 }}
           >
             {t(
-              '主流量顺序：渠道 priority 降序 → 可靠性准入 → 成功延迟接近的候选池 → 池内渠道/模型权重随机。可靠性不足、样本不足、证据陈旧、待恢复或明显较慢的路线进入试用/探索范围；探索只使用真实业务请求，不会主动测活。',
+              '主流量顺序：渠道 priority 降序 → 可靠性准入 → 成功延迟接近的候选池 → 池内渠道/模型权重随机。同一优先级内，近期已有成功但样本不足的路线优先于未验证路线；探索按配置的小比例使用真实请求。慢成功保留为后备。',
             )}
           </Text>
           <Row style={{ marginTop: 12 }}>
