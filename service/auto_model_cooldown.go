@@ -35,7 +35,7 @@ import (
 // 判定规则（elapsedMs 是本次请求的总耗时）：
 //   - 任何成功 → 清除该组合的冷却（别的模型偶然成功不代表这个组合已经好了）。
 //   - 失败 → 记该组合；耗时超过 autoModelSlowLatencyMs 时原因里带上耗时。
-//   - 没有耗时数据 → 不动冷却，避免用猜测覆盖已知状态。
+//   - 耗时未知也按真实成败处理，不猜测延迟。
 //
 // 慢成功不再进冷却：它只是一份"这条路能成，但首 token 较慢"的延迟证据，
 // 规划器会把慢路由排进更靠后的延迟池（后备），而不是把它整体停用。过去把
@@ -79,7 +79,7 @@ func AutoModelCooldownSecondTierForValidation() time.Duration {
 }
 
 // autoModelCooldownState 是一条冷却记录的内存态。
-// 只有抖动(普通)冷却一种:确定性失败不再进冷却,命中关键词的组合会被直接摘除。
+// 只有抖动(普通)冷却一种:确定性失败直接摘除组合；摘除写入失败时用普通冷却隔离。
 type autoModelCooldownState struct {
 	Until     time.Time
 	Level     int
@@ -114,7 +114,7 @@ var (
 	autoModelCooldownMutex sync.Mutex
 )
 
-// LoadAutoModelCooldowns 从数据库重新载入冷却记录，过期的顺手清库。
+// LoadAutoModelCooldowns 从数据库重新载入冷却记录，包括已到期的失败记忆。
 // 可重复调用（测试也用它）；生产路径只缓存成功的首次载入。
 func LoadAutoModelCooldowns() {
 	db := model.DB
@@ -139,8 +139,8 @@ func loadAutoModelCooldownsLocked(ctx context.Context, db *gorm.DB) bool {
 		common.SysError("failed to load auto model cooldowns: " + err.Error())
 		return false
 	}
-	now := time.Now()
 	loaded := make(map[string]autoModelCooldownState, len(rows))
+	health := autoModelHealth.ReadAll()
 	for _, row := range rows {
 		if err := ctx.Err(); err != nil {
 			common.SysError("failed to finish auto model cooldown load: " + err.Error())
@@ -166,16 +166,28 @@ func loadAutoModelCooldownsLocked(ctx context.Context, db *gorm.DB) bool {
 			continue
 		}
 		until := time.Unix(row.Until, 0)
-		if !until.After(now) {
-			purge("expired", row)
-			continue
-		}
-		loaded[autoModelHealthKey(row.Group, row.Model, row.ChannelId)] = autoModelCooldownState{
+		// Expiry only permits another recovery attempt. Preserve the failure
+		// reason and escalation level until a real success or administrator
+		// clear, including when score evidence has expired or the process restarts.
+		key := autoModelHealthKey(row.Group, row.Model, row.ChannelId)
+		state := autoModelCooldownState{
 			Until:     until,
 			Level:     row.Level,
 			Reason:    row.Reason,
 			UpdatedAt: time.Unix(row.UpdatedAt, 0),
 		}
+		// A restored business success may have been saved before a failed
+		// cooldown deletion. Cooldown timestamps have only second precision:
+		// require success in a later second to avoid reversing same-second events.
+		if outcome := health[key]; outcome.SuccessCount > 0 && !outcome.PendingRecovery &&
+			outcome.LastObservedAt.Unix() > row.UpdatedAt {
+			state.Until = time.Time{}
+			state.pending = &autoModelCooldownPendingWrite{group: row.Group, name: row.Model, channelID: row.ChannelId, delete: true}
+			if recoveredAt := autoModelCooldownRecoveries[key]; outcome.LastObservedAt.After(recoveredAt) {
+				autoModelCooldownRecoveries[key] = outcome.LastObservedAt
+			}
+		}
+		loaded[key] = state
 	}
 	// A successful retry must not replace feedback accepted while the database
 	// was unavailable with an older database snapshot. Tombstones win as well:
@@ -278,9 +290,6 @@ func applyAutoModelCooldownWithReasonAt(group, name string, channelID int, succe
 	if group == "" || name == "" || channelID <= 0 {
 		return
 	}
-	if success && elapsedMs <= 0 {
-		return // 成功但没有耗时数据：不动冷却
-	}
 	if observedAt.IsZero() {
 		observedAt = time.Now()
 	}
@@ -372,8 +381,8 @@ func tripAutoModelCooldown(group, name string, channelID int, reason string, now
 // 命中即把该 (分组, 模型, 渠道) 组合直接摘除(见 RetireAutoModelCombination):
 // 模型从渠道声明里删除、abilities 同步失效;渠道被摘空时自动禁用。
 //
-// 摘除失败(如数据库暂不可用)只记错误日志,组合保持可选,下次再撞上同一失败
-// 会再次尝试摘除——绝不退回抖动冷却,那会让摘除动作被一个 15 分钟窗口顶掉。
+// 摘除失败(如数据库暂不可用)时先隔离该组合，防止新的请求持续撞上它。
+// 冷却到期后只作为待恢复后备；再次失败仍会尝试摘除。
 func RecordAutoModelPermanentFailure(group, name string, channelID int, reason string) {
 	RecordAutoModelPermanentFailureAt(group, name, channelID, reason, time.Now())
 }
@@ -388,6 +397,9 @@ func RecordAutoModelPermanentFailureAt(group, name string, channelID int, reason
 	if group == "" || name == "" || channelID <= 0 {
 		return
 	}
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
 	key := autoModelHealthKey(group, name, channelID)
 	unlock := lockAutoModelRoute(key)
 	defer unlock()
@@ -399,6 +411,12 @@ func RecordAutoModelPermanentFailureAt(group, name string, channelID int, reason
 	// this point installs its tombstone/barrier after the retirement.
 	if err := retireAutoModelCombinationLocked(group, name, channelID, reason); err != nil {
 		common.SysError(fmt.Sprintf("auto model: retire %s(渠道 %d) failed: %s", name, channelID, err.Error()))
+		autoModelScoreMutex.Lock()
+		autoModelHealth.Update(key, func(current autoModelOutcome, exists bool) autoModelOutcome {
+			return updateAutoModelOutcome(current, exists, false, false, false, 0, observedAt)
+		})
+		autoModelScoreMutex.Unlock()
+		tripAutoModelCooldown(group, name, channelID, "摘除待重试: "+reason, observedAt)
 	}
 }
 
@@ -408,7 +426,7 @@ func RecordAutoModelPermanentFailureAt(group, name string, channelID int, reason
 // 取消路径默认不记任何东西。但有一个例外必须处理:本次尝试确实派发了,却整整
 // 20 秒(autoModelSlowLatencyMs)以上一个字节都没写出来——挂死的上游会一直占住
 // 计划头部,每个请求都死在它身上,健康的候选永远轮不到;而取消路径不留任何证据,
-// 下一批请求会原样再撞一遍。这类长挂起按抖动冷却处理(只冷却,不动评分),让
+// 下一批请求会原样再撞一遍。这类长挂起记录失败证据并按抖动冷却处理，让
 // 计划头尽快让位;短取消(<20s)仍然不记,保护"用户主动停止"的正常场景。
 func RecordAutoModelAbandonedAttempt(group, name string, channelID int, elapsedMs int64) {
 	group = strings.TrimSpace(group)
@@ -650,7 +668,7 @@ type AutoModelCooldownInfo struct {
 // ListAutoModelCooldowns 返回当前仍在冷却的组合,按到期时间从近到远排序。
 //
 // 为什么要它:抖动冷却阶梯是自我强化的(起步时长起步、翻倍、封顶可配),而清除
-// 条件是"一次 20 秒内的快速成功"——冷却中的组合根本不会被路由,所以它只能等
+// 条件是一次真实成功（耗时不限）——冷却中的组合根本不会被路由,所以它只能等
 // 窗口自然到期。没有这个入口,管理员在故障时看不到 auto 挡住了谁、为什么、还要
 // 多久,只能手改数据库。共享同一把读锁,不改动任何状态。
 func ListAutoModelCooldowns(now time.Time) []AutoModelCooldownInfo {

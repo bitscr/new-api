@@ -42,10 +42,11 @@ type AutoAttemptResponseWriter struct {
 	relay         *relayResponseWriter
 	initialHeader http.Header
 
-	mu        sync.Mutex
-	body      bytes.Buffer
-	discarded bool
-	overflow  bool
+	mu          sync.Mutex
+	body        bytes.Buffer
+	discarded   bool
+	overflow    bool
+	exploration *AutoExplorationAttempt
 	// status/committed stay atomic because the underlying relay writer reads
 	// c.Writer.Status()/Written() while a commit is in progress; taking mu there
 	// would re-enter the write path and deadlock.
@@ -194,6 +195,15 @@ func (w *AutoAttemptResponseWriter) Written() bool {
 	return w.committed.Load()
 }
 
+// SetExplorationAttempt captures this attempt's guard before dispatch. Writer
+// goroutines must not read the RelayInfo pointer while the controller resets it
+// for a subsequent attempt.
+func (w *AutoAttemptResponseWriter) SetExplorationAttempt(attempt *AutoExplorationAttempt) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.exploration = attempt
+}
+
 // Commit delivers the staged status, headers and body exactly once.
 func (w *AutoAttemptResponseWriter) Commit() error {
 	w.mu.Lock()
@@ -207,6 +217,9 @@ func (w *AutoAttemptResponseWriter) commitLocked() error {
 	}
 	if w.discarded {
 		return errAutoAttemptResponseDiscarded
+	}
+	if !w.exploration.protect() {
+		return ErrAutoExplorationTimeout
 	}
 	status := int(w.status.Load())
 	if status == 0 {

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -157,7 +158,11 @@ func RecordAutoModelTestOutcome(channel *model.Channel, modelName string, succes
 	for _, group := range strings.Split(channel.Group, ",") {
 		group = strings.TrimSpace(group)
 		if group != "" {
-			RecordAutoModelPermanentFailure(group, name, channel.Id, "手动测试失败: "+reason)
+			// 手动测试的摘除失败仍不能伪造业务失败证据。真实业务反馈走
+			// RecordAutoModelPermanentFailure，只有它需要失败隔离后备。
+			if err := RetireAutoModelCombination(group, name, channel.Id, "手动测试失败: "+reason); err != nil {
+				common.SysError(fmt.Sprintf("auto model: manual test retire %s(渠道 %d) failed: %s", name, channel.Id, err.Error()))
+			}
 		}
 	}
 }
@@ -364,6 +369,10 @@ func updateAutoModelOutcome(current autoModelOutcome, exists, success, stream, l
 	isLatest := !observedAt.Before(previousObservedAt)
 	if success {
 		current.SuccessCount++
+		if isLatest {
+			// Recovery is business success evidence even if timing was unavailable.
+			current.PendingRecovery = false
+		}
 	} else {
 		current.FailureCount++
 		if isLatest {
@@ -401,12 +410,6 @@ func updateAutoModelOutcome(current autoModelOutcome, exists, success, stream, l
 			}
 			current.NonStreamLatencySamples++
 			current.NonStreamLatencyUpdatedAt = latencyAt
-		}
-		if isLatest {
-			// A success clears the recovery flag regardless of its latency.
-			// Slow is only a latency-pool ordering signal; it must not keep the
-			// route out of the main pool while faster routes fail.
-			current.PendingRecovery = false
 		}
 	}
 	capAutoModelEvidence(&current)

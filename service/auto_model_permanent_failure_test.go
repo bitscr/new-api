@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // AutoModelPermanentFailure 的判据完全来自数据库里管理员配置的关键词:
@@ -89,7 +90,6 @@ func TestTransientKeywordDowngradesPermanentMatch(t *testing.T) {
 		types.ErrorCodeModelNotFound, http.StatusNotFound)
 	require.False(t, AutoModelPermanentFailure(err))
 }
-
 
 // 老行(没有 permanent 列/值为假)必须按抖动冷却载入,不能被误升为永久。
 func TestLegacyCooldownRowLoadsAsTransient(t *testing.T) {
@@ -170,4 +170,32 @@ func TestPermanentFailureDisablesEmptiedChannel(t *testing.T) {
 	require.Empty(t, channel.Models)
 	require.Equal(t, common.ChannelStatusAutoDisabled, channel.Status,
 		"渠道没有剩余模型时应被自动禁用")
+}
+
+func TestPermanentFailureRetirementWriteFailureIsIsolated(t *testing.T) {
+	db := setupAutoModelRouteRequestTest(t)
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 41, Key: "k", Status: common.ChannelStatusEnabled, Group: "g", Models: "failed,healthy",
+	}).Error)
+	require.NoError(t, db.Create(&[]model.Ability{
+		{Group: "g", Model: "failed", ChannelId: 41, Enabled: true},
+		{Group: "g", Model: "healthy", ChannelId: 41, Enabled: true},
+	}).Error)
+	callback := "test:retirement-failure"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table == "channels" {
+			tx.AddError(errors.New("injected retirement write failure"))
+		}
+	}))
+	t.Cleanup(func() { _ = db.Callback().Update().Remove(callback) })
+	RecordAutoModelPermanentFailure("g", "failed", 41, "model_not_found")
+	channel, err := model.GetChannelById(41, false)
+	require.NoError(t, err)
+	require.Equal(t, "failed,healthy", channel.Models, "failed transaction must preserve channel declarations")
+	require.True(t, autoModelCooldownActive("g", "failed", []int{41}))
+	require.False(t, autoModelCooldownActive("g", "healthy", []int{41}), "sibling model must remain available")
+	outcome, ok := autoModelHealth.Get(autoModelHealthKey("g", "failed", 41))
+	require.True(t, ok)
+	require.True(t, outcome.PendingRecovery)
+	require.Len(t, cooldownRows(t), 1)
 }

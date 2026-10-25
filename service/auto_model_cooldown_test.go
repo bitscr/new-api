@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -179,6 +180,33 @@ func TestAutoModelSlowSuccessIsRecoveryNotFailure(t *testing.T) {
 	require.False(t, outcome.PendingRecovery, "慢成功不能把路由留在待恢复状态")
 }
 
+func TestAutoModelSuccessWithoutTimingClearsFailedRecovery(t *testing.T) {
+	setupAutoModelCooldownTestDB(t)
+	group, name, channelID := "unknown-timing-recovery", "slow", 45
+	key := autoModelHealthKey(group, name, channelID)
+	now := time.Now()
+	t.Cleanup(func() { autoModelHealth.Delete(key) })
+	recordAutoModelOutcome(group, name, channelID, false, true, false, 0, 1000, false, "failed", now.Add(-time.Second))
+	outcome, ok := autoModelHealth.Get(key)
+	require.True(t, ok)
+	require.True(t, outcome.PendingRecovery)
+	require.True(t, autoModelCooldownActive(group, name, []int{channelID}))
+	recordAutoModelOutcome(group, name, channelID, true, true, false, 0, 0, false, "", now)
+	outcome, ok = autoModelHealth.Get(key)
+	require.True(t, ok)
+	require.False(t, outcome.PendingRecovery)
+	require.Zero(t, outcome.StreamLatencySamples, "unknown latency must stay unknown")
+	require.Zero(t, outcome.StreamLatencyMS)
+	require.False(t, autoModelCooldownActive(group, name, []int{channelID}))
+	require.Empty(t, cooldownRows(t))
+	// Older success without timing still cannot clear a newer failure.
+	recordAutoModelOutcome(group, name, channelID, false, true, false, 0, 1000, false, "new failure", now.Add(time.Second))
+	recordAutoModelOutcome(group, name, channelID, true, true, false, 0, 0, false, "", now)
+	outcome, _ = autoModelHealth.Get(key)
+	require.True(t, outcome.PendingRecovery)
+	require.True(t, autoModelCooldownActive(group, name, []int{channelID}))
+}
+
 func TestAutoModelCooldownKeepsFailureReason(t *testing.T) {
 	setupAutoModelCooldownTestDB(t)
 
@@ -243,7 +271,7 @@ func TestAutoModelCooldownSurvivesReload(t *testing.T) {
 	require.True(t, autoModelCooldownActive(group, "slow-model", []int{1}), "重启后仍应记得这个模型在冷却")
 }
 
-// 过期的冷却不该继续挡路，而且载入时应顺手清库。
+// 过期冷却不再挡路，但保留失败记忆与阶梯，避免重启后从零反复撞错。
 func TestAutoModelCooldownExpiry(t *testing.T) {
 	setupAutoModelCooldownTestDB(t)
 	group := "default"
@@ -255,7 +283,16 @@ func TestAutoModelCooldownExpiry(t *testing.T) {
 	}))
 	LoadAutoModelCooldowns()
 	require.False(t, autoModelCooldownActive(group, "old-model", []int{1}), "过期冷却应失效")
-	require.Empty(t, cooldownRows(t), "过期记录应被清掉")
+	require.Len(t, cooldownRows(t), 1, "到期只解除隔离，不应清除失败记忆")
+	state, ok := autoModelCooldowns.Get(autoModelHealthKey(group, "old-model", 1))
+	require.True(t, ok)
+	require.Equal(t, 1, state.Level)
+	view := autoModelRouteEvidenceView(autoModelOutcome{}, state, autoModelRequestNonStream, time.Now(), operation_setting.AutoModelRoutingSettingsSnapshot())
+	require.True(t, view.PendingRecovery, "重启后评分不存在也不能把失败组合变成未观察候选")
+	applyAutoModelCooldown(group, "old-model", 1, false, 100)
+	state, ok = autoModelCooldowns.Get(autoModelHealthKey(group, "old-model", 1))
+	require.True(t, ok)
+	require.Equal(t, 2, state.Level, "重启后的再次失败应继续升级")
 }
 
 // GetAutoModelCooldown 暴露给报错日志读取当前冷却等级。

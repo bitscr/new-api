@@ -26,7 +26,8 @@ planner separates reliability from speed:
    channel by channel weight, then a model by model weight. Ten models on one
    channel do not multiply that channel's share.
 4. A small, request-scoped exploration draw may prepend one candidate from
-   outside the main pool (trial, stale, pending, or a slower reliable route).
+   outside the main pool (unverified/stale trial or a slower successful route).
+   Known failures and pending-recovery routes do not participate in this draw.
    The base ratio is `AutoModelExploreRatio` (default 0.05), rising toward
    `AutoModelExploreMaxRatio` (default 0.10) with the share of candidates that
    still need evidence. The two values are validated and saved as one pair;
@@ -45,6 +46,18 @@ planner separates reliability from speed:
    traffic uses the fastest successful trial pool and the configured small
    exploration draw applies to candidates outside it. Fully random cold-start
    fallback is used only while that tier has no qualifying successful trial.
+   Within that tier untouched trials precede known failures. A failed route
+   remains a last recovery fallback after cooldown expiry, subject to its trial
+   slot; neither evidence decay nor a restart turns it into an untouched route.
+
+An unverified exploration attempt with an immediate successful fallback has a
+20-second wait limit from actual upstream dispatch, while the response remains
+uncommitted. Expiry cancels only that upstream attempt and records pair-scoped
+failure before replanning. It does not exclude or disable the channel, which may
+also serve the successful fallback. A committed answer stops the timer; late first
+output after expiry is discarded. Ordinary manual-priority selection, cold-start
+selection and demonstrated slow successful routes keep their existing timeouts.
+The limit requires remaining retry budget and the normal request retry guards.
 
 Priority remains a hard boundary: exploration, trial admission or a faster route
 never jumps ahead of a higher-priority tier. Every concrete `(group, model,
@@ -201,7 +214,7 @@ Observed failures and unusable delivered answers can cool
 only the observed `(group, model, channel)`. A slow but successful answer is latency
 evidence, not a failure: it stays eligible and is ordered into a slower backup pool,
 never cooled. Cooldown is strict and survives a restart. Any successful recovery
-clears that pair's cooldown and escalation state;
+clears that pair's cooldown and escalation state, even if timing was unavailable;
 another model succeeding does not clear it. The latest recovery time is kept as an
 ordering barrier even after the cooldown row is deleted, so a failure observed before
 recovery and published after a long backup attempt cannot re-cool the route. The
@@ -225,6 +238,9 @@ the database (`AutoModelPermanentKeywords`); nothing is built into the source, s
 an unconfigured deployment has no deterministic criteria at all. A keyword match
 has exactly one effect: the pair is retired immediately. The channel itself is
 kept — credentials and configuration are reused — and no probe is ever sent.
+If the retirement transaction fails, the pair is cooled and marked pending
+recovery immediately, so database failure cannot leave it repeatedly selectable.
+Manual channel-test retirement failures do not create business evidence.
 Transient keywords (`AutoModelTransientKeywords`) outrank deterministic ones and
 pin a self-healing error to the jitter ladder; context overflow is a protected
 transient failure that no keyword can override.
@@ -251,11 +267,16 @@ the panel must show exactly which criteria are configured.
 The evidence decay window (`AutoModelScoreDecayMinutes`, default 360 minutes)
 must stay longer than the early tiers of the transient cooldown ladder (15
 minutes, doubling). At a shorter window, success/failure counts and latency
-sample counts would already be gone when the cooldown expired, so the route
-would return with no memory of why it was cooled. Freshness is derived as one
+sample counts would already be gone when the cooldown expired, leaving only
+the cooldown's failure marker. Freshness is derived as one
 quarter of this window. Latency values remain the last observed values; they are
 not decayed toward zero, so stale evidence becomes unknown instead of appearing
-faster.
+faster. Expired cooldown rows retain failure memory and their escalation level
+until business success or an administrator clear. They no longer block dispatch,
+but remain a source of pending-recovery classification if score evidence was
+pruned or lost before a restart. A restored success from a strictly later second
+reconciles an older cooldown left by a failed deletion; ambiguous same-second
+events remain conservative because cooldown timestamps have second precision.
 
 ## Clearing evidence
 
@@ -295,7 +316,8 @@ previews.
 
 Auto routing emits stable `auto route diag:` events for the initial plan (`plan`),
 candidate selection (`attempt stage=selected`), confirmed upstream dispatch
-(`attempt stage=dispatched`), each successful reroute (`switch`), blocked reroutes
+(`attempt stage=dispatched`), each completed dispatched attempt (`result`),
+feedback publication (`feedback`), each successful reroute (`switch`), blocked reroutes
 (`no_switch`: response committed, budget exhausted, client canceled, channel lock,
 staging unavailable, plan empty, rebuild failed, or retry classification), an
 unclassifiable committed answer (`unknown_answer`), and a final `stop` summary.
@@ -304,6 +326,49 @@ excluded, cooling, channel excluded, model excluded, unauthorized, whitelist
 excluded, no targets, zero weight and billing/endpoint excluded, plus main/backup/
 trial split. Logs contain route metadata and error codes only, never keys, prompts
 or response bodies.
+
+All events use the existing request logger, including its severity, timestamp and
+request ID, and the same console/daily `oneapi-YYYYMMDD.log` output. There is no
+separate diagnostic file. New free-text diagnostic fields collapse line breaks and
+tabs and have length limits so one event remains one line.
+
+Plans include the planning time, request mode, actual exploration draw/probability,
+captured routing settings and runtime retry/cooldown controls. Each previewed route
+shows its actual priority and channel/model weights, effective business and latency
+sample counts, evidence ages, and missing main-admission gates. `priority=hard`
+records the manual-priority rule: successful routes are preferred within the same
+group and priority tier. The preview is capped at ten routes; category totals cover
+the entire plan, and selected/result events carry the selected route's evidence
+even beyond that preview. Cooling entries show their real group, escalation level,
+remaining duration and whether a database write is pending. Failed plan reads are
+marked `plan_complete=false`; counts then describe only the part already read.
+
+`result` separates full attempt processing time from actual upstream dispatch time
+and reports first valid output when known. Its `attempt` matches the selected
+attempt index, while `real_dispatched` counts only actual upstream dispatches;
+local rejections cannot make these counters look like spent dispatch budget.
+`exploration_guard` and
+`exploration_timeout` record the bounded wait and immediate fallback. `stop` retains
+the existing last-attempt `elapsed_ms`, and adds `request_elapsed_ms` from the
+existing request start timestamp plus `last_attempt_elapsed_ms`. The server can
+report a request-context deadline when one exists; `client_deadline_remaining_ms=?`
+means the external client's timeout is unknown, rather than unlimited. Feedback
+events show the in-memory evidence and cooldown after publication. This state can
+include another request's newer feedback; it is not confirmation that the
+asynchronous score snapshot has reached the database. `persist_pending` refers to
+the cooldown write/delete only.
+
+Warnings and advice are conditional on the captured facts: exhausted dispatch
+budgets point to `AutoModelMaxAttempts`; an excluded retry status points to
+`AutomaticRetryStatusCodes`; insufficient successful business samples point to
+`AutoModelMinObservations`; a freshness window shorter than the first cooldown
+points to `AutoModelScoreDecayMinutes`. Repeated failed exploration can justify
+lowering `AutoModelExploreRatio`/`AutoModelExploreMaxRatio`. Local request errors,
+fixed skip rules, missing channel metadata and client cancellation are reported
+separately because increasing budgets or retry status ranges cannot fix them.
+Successful slow routes prompt a comparison with client waiting time. Advice does
+not modify configuration or recommend bypassing manual priority, cooling a slow
+success, or treating an expired failure cooldown as proof of recovery.
 
 ## Verification
 

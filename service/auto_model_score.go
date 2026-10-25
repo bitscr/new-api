@@ -87,8 +87,8 @@ func listAutoModelRouteStatus(now time.Time, stream bool) ([]AutoModelScoreInfo,
 			for _, target := range routes {
 				key := autoModelHealthKey(group, name, target.ChannelID)
 				outcome := health[key]
-				streamView := autoModelEvidenceViewForSettings(outcome, autoModelRequestStream, now, settings)
-				nonStreamView := autoModelEvidenceViewForSettings(outcome, autoModelRequestNonStream, now, settings)
+				streamView := autoModelRouteEvidenceView(outcome, cooldowns[key], autoModelRequestStream, now, settings)
+				nonStreamView := autoModelRouteEvidenceView(outcome, cooldowns[key], autoModelRequestNonStream, now, settings)
 				view := nonStreamView
 				if stream {
 					view = streamView
@@ -151,6 +151,9 @@ func autoModelRouteStatusCategory(view autoModelEvidenceView, cooling bool, sett
 	if cooling {
 		return "cooling", "冷却中"
 	}
+	if view.PendingRecovery {
+		return "pending_recovery", "待恢复：已有失败，仅作最后后备，不参与探索"
+	}
 	if view.Observations == 0 {
 		return "unobserved", "未观察"
 	}
@@ -159,9 +162,6 @@ func autoModelRouteStatusCategory(view autoModelEvidenceView, cooling bool, sett
 			return "insufficient", "业务样本不足"
 		}
 		return "stale", "证据陈旧"
-	}
-	if view.PendingRecovery {
-		return "pending_recovery", "待恢复"
 	}
 	if view.Reliability < settings.ReliabilityThreshold {
 		return "unreliable", "可靠性不足"

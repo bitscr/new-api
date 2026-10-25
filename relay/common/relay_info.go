@@ -103,6 +103,7 @@ type RelayInfo struct {
 	AttemptFirstValidOutputTime time.Time
 	AttemptEndTime              time.Time
 	upstreamDispatch            bool
+	AutoExplorationAttempt      *AutoExplorationAttempt
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool
@@ -756,6 +757,7 @@ func (info *RelayInfo) MarkUpstreamDispatch() {
 		return
 	}
 	info.upstreamDispatch = true
+	info.AutoExplorationAttempt.Start()
 	if info.AttemptDispatchTime.IsZero() && info.AttemptEndTime.IsZero() {
 		info.AttemptDispatchTime = time.Now()
 	}
