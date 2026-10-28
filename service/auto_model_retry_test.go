@@ -35,6 +35,29 @@ func TestClassifyAutoModelRetryConditionalAccountLimit(t *testing.T) {
 	}
 }
 
+func TestClassifyAutoModelRetryFreeSelectorIncompatibility(t *testing.T) {
+	setAutoModelRetryTestStatusCodes(t, "503")
+	for _, tc := range []struct {
+		message string
+		code    string
+		want    service.AutoModelRetryScope
+	}{
+		{"No free model is compatible with this request", "bad_request", service.AutoModelRetryNextModel},
+		{"Provider: No free model is compatible with the request.", "bad_request", service.AutoModelRetryNextModel},
+		{"No free model is compatible with this request only if the estimate is correct.", "bad_request", service.AutoModelRetryStop},
+		{"If no free model is compatible with this request, select another.", "bad_request", service.AutoModelRetryStop},
+		{"The provider rejected the request as invalid. Check the model, input, and parameters.", "bad_request", service.AutoModelRetryStop},
+		{"No free model is compatible with this request", "invalid_api_key", service.AutoModelRetryStop},
+	} {
+		t.Run(tc.message+"/"+tc.code, func(t *testing.T) {
+			err := autoModelRetryTestError(400, tc.code, "", tc.message)
+			if got := service.ClassifyAutoModelRetry(err); got != tc.want {
+				t.Fatalf("free selector compatibility scope=%v want=%v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestClassifyAutoModelRetryAccountRateLimitForms(t *testing.T) {
 	for _, tc := range []struct{ name, message string }{
 		{"failure-before-for", "Your account rate limit exceeded for model 'gpt-4o'."},

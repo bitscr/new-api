@@ -13,17 +13,19 @@ const conversationCaptureContextKey = "conversation_capture"
 type ConversationCapture struct {
 	mu sync.Mutex
 
-	clientRequestBody    []byte
-	upstreamRequestBody  []byte
-	upstreamResponseBody []byte
-	clientResponseBody   []byte
+	clientRequestBody               []byte
+	upstreamRequestBody             []byte
+	upstreamResponseBody            []byte
+	clientResponseBody              []byte
+	upstreamSessionHeaderDiagnostic string
 }
 
 type ConversationCaptureSnapshot struct {
-	ClientRequestBody    []byte
-	UpstreamRequestBody  []byte
-	UpstreamResponseBody []byte
-	ClientResponseBody   []byte
+	ClientRequestBody               []byte
+	UpstreamRequestBody             []byte
+	UpstreamResponseBody            []byte
+	ClientResponseBody              []byte
+	UpstreamSessionHeaderDiagnostic string
 }
 
 func NewConversationCapture() *ConversationCapture {
@@ -65,6 +67,17 @@ func (capture *ConversationCapture) AppendClientResponseBody(data []byte) {
 	capture.appendBytes(&capture.clientResponseBody, data)
 }
 
+// Retain only the diagnostic fingerprints, never usable header values, so a
+// four-stage export includes the final session-header evidence for this request.
+func (capture *ConversationCapture) SetUpstreamSessionHeaderDiagnostic(fields string) {
+	if capture == nil {
+		return
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	capture.upstreamSessionHeaderDiagnostic = fields
+}
+
 func (capture *ConversationCapture) Snapshot() ConversationCaptureSnapshot {
 	if capture == nil {
 		return ConversationCaptureSnapshot{}
@@ -72,10 +85,11 @@ func (capture *ConversationCapture) Snapshot() ConversationCaptureSnapshot {
 	capture.mu.Lock()
 	defer capture.mu.Unlock()
 	return ConversationCaptureSnapshot{
-		ClientRequestBody:    cloneBytes(capture.clientRequestBody),
-		UpstreamRequestBody:  cloneBytes(capture.upstreamRequestBody),
-		UpstreamResponseBody: cloneBytes(capture.upstreamResponseBody),
-		ClientResponseBody:   cloneBytes(capture.clientResponseBody),
+		ClientRequestBody:               cloneBytes(capture.clientRequestBody),
+		UpstreamRequestBody:             cloneBytes(capture.upstreamRequestBody),
+		UpstreamResponseBody:            cloneBytes(capture.upstreamResponseBody),
+		ClientResponseBody:              cloneBytes(capture.clientResponseBody),
+		UpstreamSessionHeaderDiagnostic: capture.upstreamSessionHeaderDiagnostic,
 	}
 }
 

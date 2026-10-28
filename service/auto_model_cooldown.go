@@ -44,8 +44,7 @@ import (
 const (
 	// autoModelSlowLatencyMs 超过它就算"慢"。流式请求量到的是首 token 时间;
 	// 非流式量不到首 token,用总耗时兜底(会包含生成长文的时间)。
-	// 现在它只用于失败原因标注与"客户端取消前上游长时间零响应"的判据，
-	// 不再触发慢成功冷却（见上）。
+	// 用于失败耗时标注、诊断与探索等待上限；客户端取消和慢成功均不因此冷却。
 	autoModelSlowLatencyMs int64 = 20000
 	// autoModelCooldownBase 是抖动阶梯的起步时长"默认值"。实际运行值取
 	// operation_setting.AutoModelCooldownBaseMinutes()(面板可改,分钟),这里
@@ -418,30 +417,6 @@ func RecordAutoModelPermanentFailureAt(group, name string, channelID int, reason
 		autoModelScoreMutex.Unlock()
 		tripAutoModelCooldown(group, name, channelID, "摘除待重试: "+reason, observedAt)
 	}
-}
-
-// RecordAutoModelAbandonedAttempt 记录一次"客户端取消前,上游长时间零响应"的挂起。
-//
-// 客户端取消本身不是上游的证据(它可能只是等不及一个慢而正常的流式响应),所以
-// 取消路径默认不记任何东西。但有一个例外必须处理:本次尝试确实派发了,却整整
-// 20 秒(autoModelSlowLatencyMs)以上一个字节都没写出来——挂死的上游会一直占住
-// 计划头部,每个请求都死在它身上,健康的候选永远轮不到;而取消路径不留任何证据,
-// 下一批请求会原样再撞一遍。这类长挂起记录失败证据并按抖动冷却处理，让
-// 计划头尽快让位;短取消(<20s)仍然不记,保护"用户主动停止"的正常场景。
-func RecordAutoModelAbandonedAttempt(group, name string, channelID int, elapsedMs int64) {
-	group = strings.TrimSpace(group)
-	name = strings.TrimSpace(name)
-	if group == "" || name == "" || channelID <= 0 {
-		return
-	}
-	if elapsedMs < autoModelSlowLatencyMs {
-		return
-	}
-	reason := fmt.Sprintf("客户端取消(上游 %dms 零响应)", elapsedMs)
-	// A 20s+ zero-byte upstream attempt is real failure evidence: it must also
-	// mark the pair pending recovery so a cooldown expiry cannot silently make it
-	// a main-traffic candidate again.
-	recordAutoModelOutcome(group, name, channelID, false, false, false, 0, elapsedMs, false, reason, time.Now())
 }
 
 // RetireAutoModelCombination 把一个命中确定性关键词的 (分组, 模型, 渠道) 组合从

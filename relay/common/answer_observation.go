@@ -3,6 +3,7 @@ package common
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	basecommon "github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
 )
 
 // 背景（实测 2026-10-07）：
@@ -77,13 +79,14 @@ var answerBannerPrefixes = []string{
 
 type answerObservation struct {
 	mu             sync.Mutex
-	parsed         bool // 见过结构可识别的完成体（OpenAI choices 或原生协议正文通道）
-	protocolError  bool // 显式上游协议错误，即使已有部分正文也不能算成功
-	textSeen       bool // 横幅之外还有正文
-	reasoningSeen  bool // 见过思考内容
-	toolsSeen      bool // 见过工具调用
-	undecidable    bool // 截断/过滤、选择索引不明或观察超限：不下结论
-	deliveryBroken bool // 有一批字节没能写完：客户端在交付完成前断开
+	parsed         bool               // 见过结构可识别的完成体（OpenAI choices 或原生协议正文通道）
+	protocolError  bool               // 显式上游协议错误，即使已有部分正文也不能算成功
+	protocolDetail *types.OpenAIError // bounded original error fields, before lossy conversion
+	textSeen       bool               // 横幅之外还有正文
+	reasoningSeen  bool               // 见过思考内容
+	toolsSeen      bool               // 见过工具调用
+	undecidable    bool               // 截断/过滤、选择索引不明或观察超限：不下结论
+	deliveryBroken bool               // 有一批字节没能写完：客户端在交付完成前断开
 	// exhausted 由 streamScanner 在上游正常收尾(EOF/DONE 且无软错误)时置位。
 	// 它回答的是"上游这条流是不是已经结束",而不是"有没有内容",所以零内容流
 	// 同样会置位,供 ClientAnswerUnusable 区分"结束且为空"和"还没走到这里"。
@@ -742,8 +745,8 @@ func answerTextLooksLikeBannerStart(text string) bool {
 // 为什么需要它:有的失败不以 HTTP 状态码体现,而是 200 流里夹一个终止事件
 // (Responses 的 response.failed / response.error,内容里的显式 error 等)。
 // 这类事件被 sr.Stop() 记为软错误后,流就不算"正常收尾",exhausted 不置位;
-// 而 hasExplicitProtocolError 只认顶层 error 键,response.failed 的 error 是
-// 嵌在 response 里的,也认不出来。结果 ClientAnswerUnusable 判不出来,
+// 如果只观察顶层 error 键,response.failed 嵌在 response 里的 error 就会丢失。
+// 没有结构化错误字段的失败事件仍需此标记,否则 ClientAnswerUnusable 判不出来,
 // 这次尝试反而被记成成功——实测渠道 #5 的 410(它自己作为中转把候选全试失败,
 // 用 response.failed 回话)就是这样既没冷却也没换候选。
 //
@@ -758,50 +761,113 @@ func (info *RelayInfo) MarkUpstreamProtocolError() {
 	observation.protocolError = true
 }
 
-// ObserveUpstreamError only records explicit top-level protocol errors in raw JSON.
+// ObserveUpstreamError records explicit protocol errors in raw JSON, including
+// the error fields of known Responses failure events.
 // Call before lossy response conversions; raw choices must never count as a
 // delivered answer. Repeated upstream/client observations are idempotent.
 func (info *RelayInfo) ObserveUpstreamError(payload []byte) {
-	if info == nil || info.answer == nil || !hasExplicitProtocolError(payload) {
+	if info == nil || info.answer == nil {
+		return
+	}
+	detail := extractExplicitProtocolError(payload)
+	if detail == nil {
 		return
 	}
 	observation := info.answer
 	observation.mu.Lock()
 	defer observation.mu.Unlock()
 	observation.protocolError = true
+	if observation.protocolDetail == nil {
+		// Keep only the first original error, not echoed input, tool arguments,
+		// response metadata or the full response body.
+		observation.protocolDetail = detail
+	}
 }
 
-func hasExplicitProtocolError(payload []byte) bool {
+func extractExplicitProtocolError(payload []byte) *types.OpenAIError {
 	// JSON Unicode escapes may hide the literal error key.
-	if !bytes.Contains(payload, []byte(`"error"`)) && !bytes.ContainsRune(payload, '\\') {
-		return false
+	if !bytes.Contains(payload, []byte(`"error"`)) && !bytes.Contains(payload, []byte(`"response.failed"`)) &&
+		!bytes.Contains(payload, []byte(`"response.error"`)) && !bytes.ContainsRune(payload, '\\') {
+		return nil
 	}
 	var envelope map[string]any
 	if err := basecommon.Unmarshal(payload, &envelope); err != nil {
-		return false
+		return nil
 	}
-	switch value := envelope["error"].(type) {
-	case string:
-		return strings.TrimSpace(value) != ""
-	case map[string]any:
-		for _, key := range []string{"message", "type"} {
-			if text, ok := value[key].(string); ok && strings.TrimSpace(text) != "" {
-				return true
+	value := envelope["error"]
+	flatEvent := false
+	if value == nil {
+		switch envelope["type"] {
+		case "response.failed":
+			if response, ok := envelope["response"].(map[string]any); ok {
+				value = response["error"]
 			}
+		case "error", "response.error":
+			value = envelope // Native Responses errors can have flat message/code fields.
+			flatEvent = true
 		}
+	}
+	switch value := value.(type) {
+	case string:
+		if strings.TrimSpace(value) != "" {
+			return &types.OpenAIError{Message: boundedProtocolErrorText(value, answerContentLimit)}
+		}
+	case map[string]any:
+		getText := func(key string, limit int) string {
+			text, _ := value[key].(string)
+			return boundedProtocolErrorText(text, limit)
+		}
+		detail := &types.OpenAIError{
+			Message: getText("message", answerContentLimit), Type: getText("type", 256), Param: getText("param", 256),
+		}
+		if flatEvent {
+			// An event name by itself is not a structured rejection reason.
+			detail.Type = ""
+		}
+		failed := strings.TrimSpace(detail.Message) != "" || strings.TrimSpace(detail.Type) != ""
 		switch code := value["code"].(type) {
 		case string:
+			detail.Code = boundedProtocolErrorText(code, 256)
 			switch strings.ToLower(strings.TrimSpace(code)) {
 			case "", "0", "200", "success", "ok":
-				return false
 			default:
-				return true
+				failed = true
 			}
 		case float64:
-			return code != 0 && code != 200
+			detail.Code = code
+			failed = failed || (code != 0 && code != 200)
+		}
+		if failed {
+			return detail
 		}
 	}
-	return false
+	return nil
+}
+
+func boundedProtocolErrorText(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	text = text[:limit]
+	for !utf8.ValidString(text) && len(text) > 0 {
+		text = text[:len(text)-1]
+	}
+	return text
+}
+
+// UpstreamProtocolError returns an independent error for keyword classification
+// and diagnostics. It never changes the response already delivered to a client.
+func (info *RelayInfo) UpstreamProtocolError() *types.NewAPIError {
+	if info == nil || info.answer == nil {
+		return nil
+	}
+	observation := info.answer
+	observation.mu.Lock()
+	defer observation.mu.Unlock()
+	if observation.protocolDetail == nil {
+		return nil
+	}
+	return types.WithOpenAIError(*observation.protocolDetail, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 }
 
 // HasExplicitProtocolError 报告上游是否在响应里明确报了错。

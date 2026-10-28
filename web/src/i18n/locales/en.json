@@ -1885,6 +1885,8 @@
     "您无权访问此页面，请联系管理员": "You do not have permission to access this page. Please contact the administrator.",
     "您需要先启用两步验证或 Passkey 才能查看敏感信息。": "You need to enable two-factor authentication or Passkey before you can view sensitive information.",
     "您需要先启用两步验证或 Passkey 才能执行此操作": "You need to enable two-factor authentication or Passkey before you can perform this operation",
+    "您需要先启用两步验证、Passkey 或设置登录密码才能查看敏感信息。": "Enable two-factor authentication or a passkey, or set a login password, to view sensitive information.",
+    "您需要先启用两步验证、Passkey 或设置登录密码才能执行此操作": "Enable two-factor authentication or a passkey, or set a login password, to perform this operation",
     "您正在删除自己的帐户，将清空所有数据且不可恢复": "You are deleting your account. All data will be cleared and cannot be recovered.",
     "您正在使用 MySQL 数据库。MySQL 是一个可靠的关系型数据库管理系统，适合生产环境使用。": "You are using the MySQL database. MySQL is a reliable relational database management system, suitable for production environments.",
     "您正在使用 PostgreSQL 数据库。PostgreSQL 是一个功能强大的开源关系型数据库系统，提供了出色的可靠性和数据完整性，适合生产环境使用。": "You are using the PostgreSQL database. PostgreSQL is a powerful open-source relational database system that provides excellent reliability and data integrity, suitable for production environments.",

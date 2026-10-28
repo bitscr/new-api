@@ -2000,6 +2000,8 @@
     "您无权访问此页面，请联系管理员": "Bạn không có quyền truy cập trang này. Vui lòng liên hệ với quản trị viên.",
     "您需要先启用两步验证或 Passkey 才能查看敏感信息。": "Bạn cần bật xác thực hai yếu tố hoặc Passkey trước khi có thể xem thông tin nhạy cảm.",
     "您需要先启用两步验证或 Passkey 才能执行此操作": "Bạn cần bật xác thực hai yếu tố hoặc Passkey trước khi có thể thực hiện thao tác này",
+    "您需要先启用两步验证、Passkey 或设置登录密码才能查看敏感信息。": "Hãy bật xác thực hai yếu tố hoặc passkey, hoặc đặt mật khẩu đăng nhập để xem thông tin nhạy cảm.",
+    "您需要先启用两步验证、Passkey 或设置登录密码才能执行此操作": "Hãy bật xác thực hai yếu tố hoặc passkey, hoặc đặt mật khẩu đăng nhập để thực hiện thao tác này",
     "您正在删除自己的帐户，将清空所有数据且不可恢复": "Bạn đang xóa tài khoản của mình. Tất cả dữ liệu sẽ bị xóa và không thể khôi phục.",
     "您正在使用 MySQL 数据库。MySQL 是一个可靠的关系型数据库管理系统，适合生产环境使用。": "Bạn đang sử dụng cơ sở dữ liệu MySQL. MySQL là một hệ thống quản lý cơ sở dữ liệu quan hệ đáng tin cậy, phù hợp cho môi trường sản xuất.",
     "您正在使用 PostgreSQL 数据库。PostgreSQL 是一个功能强大的开源关系型数据库系统，提供了出色的可靠性和数据完整性，适合生产环境使用。": "Bạn đang sử dụng cơ sở dữ liệu PostgreSQL. PostgreSQL là một hệ thống cơ sở dữ liệu quan hệ mã nguồn mở mạnh mẽ cung cấp độ tin cậy và tính toàn vẹn dữ liệu tuyệt vời, phù hợp cho môi trường sản xuất.",

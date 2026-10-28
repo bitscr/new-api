@@ -133,6 +133,8 @@ const PersonalSetting = () => {
         hasPasskey:
           passkeyRequiredVerificationMethod === 'passkey' &&
           passkeyVerificationMethods.hasPasskey,
+        // 这个受限流程要求使用指定的 2FA/Passkey 方式，密码不能作为旁路。
+        hasPassword: false,
       }
     : passkeyVerificationMethods;
 

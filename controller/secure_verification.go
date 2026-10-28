@@ -26,7 +26,7 @@ const (
 )
 
 type UniversalVerifyRequest struct {
-	Method string `json:"method"` // "2fa" 或 "passkey"
+	Method string `json:"method"` // "2fa"、"passkey" 或 "password"
 	Code   string `json:"code,omitempty"`
 }
 
@@ -36,7 +36,7 @@ type VerificationStatusResponse struct {
 }
 
 // UniversalVerify 通用验证接口
-// 支持 2FA 和 Passkey 验证，验证成功后在 session 中记录时间戳
+// 支持 2FA、Passkey 和登录密码验证，验证成功后在 session 中记录时间戳
 func UniversalVerify(c *gin.Context) {
 	userId := c.GetInt("id")
 	if userId == 0 {
@@ -72,11 +72,6 @@ func UniversalVerify(c *gin.Context) {
 	passkey, passkeyErr := model.GetPasskeyByUserID(userId)
 	hasPasskey := passkeyErr == nil && passkey != nil
 
-	if !has2FA && !hasPasskey {
-		common.ApiError(c, fmt.Errorf("用户未启用2FA或Passkey"))
-		return
-	}
-
 	// 根据验证方式进行验证
 	var verified bool
 	var verifyMethod string
@@ -111,6 +106,24 @@ func UniversalVerify(c *gin.Context) {
 			return
 		}
 		verifyMethod = "Passkey"
+
+	case "password":
+		// 登录密码作为未启用 2FA/Passkey 时的可用验证方式。账号必须已经设置密码；
+		// 路由上的 CriticalRateLimit 负责限制暴力尝试。
+		if req.Code == "" {
+			common.ApiError(c, fmt.Errorf("密码不能为空"))
+			return
+		}
+		if user.Password == "" {
+			common.ApiError(c, fmt.Errorf("该账号未设置登录密码，请使用两步验证或 Passkey"))
+			return
+		}
+		if !common.ValidatePasswordAndHash(req.Code, user.Password) {
+			common.ApiError(c, fmt.Errorf("密码错误"))
+			return
+		}
+		verified = true
+		verifyMethod = "Password"
 
 	default:
 		common.ApiError(c, fmt.Errorf("不支持的验证方式: %s", req.Method))

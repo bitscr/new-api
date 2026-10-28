@@ -162,8 +162,7 @@ func OaiStreamHandlerWithDataTransformer(c *gin.Context, info *relaycommon.Relay
 	isAudioModel := strings.Contains(strings.ToLower(model), "audio")
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
-		// Conversions and usage-only suppression can discard protocol errors.
-		info.ObserveUpstreamError(common.StringToByteSlice(data))
+		// The shared scanner observes raw errors before this conversion.
 		if transform != nil && data != "" {
 			transformedData, err := transform(data)
 			if err != nil {
@@ -221,12 +220,15 @@ func OaiStreamHandlerWithDataTransformer(c *gin.Context, info *relaycommon.Relay
 
 	// 处理最后的响应
 	shouldSendLastResp := true
-	if err := handleLastResponse(lastStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
-		&containStreamUsage, info, &shouldSendLastResp); err != nil {
-		logger.LogError(c, fmt.Sprintf("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
+	if lastStreamData != "" {
+		if err := handleLastResponse(lastStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
+			&containStreamUsage, info, &shouldSendLastResp); err != nil {
+			logger.LogError(c, fmt.Sprintf("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
+		}
 	}
 
-	if info.RelayFormat == types.RelayFormatOpenAI {
+	clientCanceled := c.Request != nil && c.Request.Context().Err() != nil
+	if info.RelayFormat == types.RelayFormatOpenAI && !clientCanceled {
 		if shouldSendLastResp {
 			_ = sendStreamData(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
 		}
@@ -244,7 +246,11 @@ func OaiStreamHandlerWithDataTransformer(c *gin.Context, info *relaycommon.Relay
 
 	applyUsagePostProcessing(info, usage, common.StringToByteSlice(lastStreamData))
 
-	if !upstreamStreamError {
+	// A synthetic [DONE]/native stop event would tell the client that a broken
+	// upstream stream completed successfully. Keep usage accounting, but only
+	// emit terminal success frames after a normal stream end.
+	normalEnd := info.StreamStatus == nil || (info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors())
+	if !upstreamStreamError && normalEnd && !clientCanceled {
 		HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
 	}
 

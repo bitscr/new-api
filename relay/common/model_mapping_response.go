@@ -3,6 +3,7 @@ package common
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +18,10 @@ type relayResponseWriter struct {
 	gin.ResponseWriter
 	context       *gin.Context
 	sseEventError bool
+}
+
+func (w *relayResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func SetRelayInfo(c *gin.Context, info *RelayInfo) {
@@ -69,12 +74,20 @@ func (w *relayResponseWriter) WriteHeaderNow() {
 }
 
 func (w *relayResponseWriter) Flush() {
+	_ = w.FlushError()
+}
+
+func (w *relayResponseWriter) FlushError() error {
 	info := GetRelayInfo(w.context)
 	if (info != nil && info.IsModelMappingFullActive()) ||
 		(w.ResponseWriter.Status() >= 400 && shouldHideChannelErrorDetails(w.context)) {
 		w.Header().Del("Content-Length")
 	}
-	w.ResponseWriter.Flush()
+	err := FlushResponseWriter(w.ResponseWriter)
+	if err != nil {
+		markClientDeliveryBroken(w.context)
+	}
+	return err
 }
 
 func (w *relayResponseWriter) Write(data []byte) (int, error) {

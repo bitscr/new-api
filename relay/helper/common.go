@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -30,13 +31,7 @@ func FlushWriter(c *gin.Context) (err error) {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
-	flusher, ok := c.Writer.(http.Flusher)
-	if !ok {
-		return errors.New("streaming error: flusher not found")
-	}
-
-	flusher.Flush()
-	return nil
+	return relaycommon.FlushResponseWriter(c.Writer)
 }
 
 func SetEventStreamHeaders(c *gin.Context) {
@@ -95,7 +90,10 @@ func StringData(c *gin.Context, str string) error {
 
 	data := "data: " + str
 	relaycommon.AppendConversationClientResponse(c, []byte(data+"\n\n"))
-	c.Render(-1, common.CustomEvent{Data: data})
+	event := common.CustomEvent{Data: data}
+	if err := event.Render(c.Writer); err != nil {
+		return err
+	}
 	return FlushWriter(c)
 }
 
@@ -108,6 +106,15 @@ func PingData(c *gin.Context) error {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
+	// Bound the actual write/flush instead of timing out a detached writer
+	// that might resume after Gin has reused this request's context.
+	controller := http.NewResponseController(c.Writer)
+	if err := controller.SetWriteDeadline(time.Now().Add(streamPingWriteTimeout)); err == nil {
+		defer func() { _ = controller.SetWriteDeadline(time.Time{}) }()
+	}
+	if c.Request != nil && c.Request.Context().Err() != nil {
+		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
+	}
 	pingData := []byte(": PING\n\n")
 	relaycommon.AppendConversationClientResponse(c, pingData)
 	if _, err := c.Writer.Write(pingData); err != nil {

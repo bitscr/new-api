@@ -284,8 +284,15 @@ func Get2FAStatus(c *gin.Context) {
 	}
 
 	status := map[string]interface{}{
-		"enabled": false,
-		"locked":  false,
+		"enabled":      false,
+		"locked":       false,
+		"has_password": false,
+	}
+
+	// 安全验证弹窗需要知道能否用登录密码作为替代验证方式。
+	user := &model.User{Id: userId}
+	if err := user.FillUserById(); err == nil {
+		status["has_password"] = user.Password != ""
 	}
 
 	if twoFA != nil {

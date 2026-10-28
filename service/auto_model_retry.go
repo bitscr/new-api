@@ -279,6 +279,11 @@ func autoModelRetryModelEvidence(err *types.NewAPIError) (modelScoped, incompati
 	if autoModelRetryCompatibilityMessage.MatchString(message) || autoModelRetryContextOverflow(message) {
 		return true, true
 	}
+	if autoModelRetryFreeModelCompatibilityMessage.MatchString(message) {
+		// A provider's free-model selector has exhausted compatible models for
+		// this input. Other candidates can still answer the unchanged request.
+		return true, true
+	}
 	return autoModelRetryScopedMessage.MatchString(message), false
 }
 
@@ -442,6 +447,9 @@ var autoModelRetryCompatibilityMessage = regexp.MustCompile(
 		`(?:` + autoModelRetryFeatureRef + `\s+)?does not support (?:[^\r\n.!?;:]|\.[0-9]){1,120} with ` + autoModelRetryTargetRef + `(?:[.!?,;:]|$)|` +
 		`models/[a-z0-9._:/-]+\s+(?:is\s+)?(?:not found|not supported)\b|` +
 		autoModelRetryContextLimit + `(?: of \d+ tokens)? (?:(?:has been|is|was) )?exceeded` + autoModelRetryContextClaimEnd + `)`)
+
+var autoModelRetryFreeModelCompatibilityMessage = regexp.MustCompile(
+	autoModelRetryClauseStart + `no free model is compatible with (?:this|the) request(?:[.!?]|$)`)
 
 // Account-prefixed limits are owned by autoModelRetryAccountClauseScope, not
 // this model-only fallback, even when the account owner found no complete claim.

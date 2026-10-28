@@ -90,6 +90,10 @@ type freeStreamWriter struct {
 	stream *freeStream
 }
 
+func (w *freeStreamWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func (w *freeStreamWriter) Write(data []byte) (int, error) {
 	if w.stream.Err() != nil {
 		return len(data), nil
@@ -103,9 +107,13 @@ func (w *freeStreamWriter) WriteString(data string) (int, error) {
 	return w.ResponseWriter.WriteString(data)
 }
 func (w *freeStreamWriter) Flush() {
+	_ = w.FlushError()
+}
+func (w *freeStreamWriter) FlushError() error {
 	if w.stream.Err() == nil {
-		w.ResponseWriter.Flush()
+		return relaycommon.FlushResponseWriter(w.ResponseWriter)
 	}
+	return nil
 }
 func (w *freeStreamWriter) WriteHeader(code int) {
 	if w.stream.Err() == nil {

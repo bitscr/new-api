@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -547,7 +548,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 					relayInfo.LastError = nil
 					return
 				}
-				recordRelayErrorLog(c, types.NewErrorWithStatusCode(errors.New("HTTP 200 unusable answer: "+failureClass), types.ErrorCodeBadResponse, http.StatusOK, types.ErrOptionWithSkipRetry()))
+				protocolErr := relayInfo.UpstreamProtocolError()
+				if protocolErr != nil {
+					recordRelayErrorLog(c, protocolErr)
+				} else {
+					recordRelayErrorLog(c, types.NewErrorWithStatusCode(errors.New("HTTP 200 unusable answer: "+failureClass), types.ErrorCodeBadResponse, http.StatusOK, types.ErrOptionWithSkipRetry()))
+				}
 				blocked := autoModelInvalidSwitchBlockedReason(c, relayInfo, autoBudget, stagedAutoResponse)
 				if blocked == "" && stagedAutoResponse != nil {
 					stagedAutoResponse.Discard()
@@ -655,12 +661,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if canceledErr := autoModelCanceledRequestError(c, newAPIError); canceledErr != nil && autoModelClientAbandoned(c, relayInfo) {
 			// The client disappearing is not evidence against this upstream. Keep
 			// earlier real failures queued, but do not penalize or retry this attempt.
-			// 例外:派发了却 20 秒+零响应的长挂起是上游自己的证据。不记的话,挂死的
-			// 组合永远不留痕,每个客户端超时都死在同一个组合上,健康的候选永远轮不到。
-			if relayInfo.HasUpstreamDispatch() && relayInfo.ChannelMeta != nil {
-				service.RecordAutoModelAbandonedAttempt(relayInfo.UsingGroup, relayInfo.OriginModelName,
-					relayInfo.ChannelMeta.ChannelId, relayInfo.AttemptElapsed().Milliseconds())
-			}
+			// Elapsed time does not change that rule: a proven slow successful
+			// model can legitimately outlast the client's wait. Unverified trial
+			// timeouts are owned by the gateway's separate exploration guard.
 			traceAutoModelAttempt(c, relayInfo, "client_gone", "")
 			autoStopReason = "client_canceled"
 			newAPIError = canceledErr
@@ -1757,6 +1760,14 @@ func recordAutoModelUnusableAnswer(c *gin.Context, info *relaycommon.RelayInfo, 
 	if !shouldRecordAutoHealthFeedback(c, info) {
 		return
 	}
+	if err := info.UpstreamProtocolError(); err != nil && service.AutoModelPermanentFailure(err) {
+		// A 200 SSE envelope must not hide a configured deterministic rejection.
+		// Pin the decision now, before a retry resets this attempt's observer.
+		queueAutoModelFeedback(c, info, autoModelFeedback{
+			stream: info.IsStream, permanent: true, reason: service.AutoModelFailureReason(err),
+		})
+		return
+	}
 	queueAutoModelFeedback(c, info, autoModelFeedback{stream: info.IsStream, unusable: true, reason: reason})
 }
 
@@ -1765,11 +1776,26 @@ func recordAutoModelUnusableAnswer(c *gin.Context, info *relaycommon.RelayInfo, 
 // 不能只看 c.Request.Context().Err()：客户端收完正文后正常关闭连接（curl、SDK、
 // 下位机都是收到完整响应立即断开）时 ctx 同样是 canceled，于是每个正常完成的请求
 // 都会被判成"客户端断开"，全部 auto 反馈被丢弃——分数不更新、冷却也无法记录。
-// 所以以"写入没能完成"为主信号（ClientDeliveryBroken），ctx 取消只在一个字节都
-// 没写出去（客户端在等到任何内容前就断了）时才成立。
+// 流明确以 client_gone 结束时，即使已交付部分内容也属于客户端中断；正常收尾
+// 后的取消仍保留反馈。没有流结束信号时，ctx 取消只在尚未写入时作为离场证据。
 func autoModelClientAbandoned(c *gin.Context, info *relaycommon.RelayInfo) bool {
 	if info != nil && info.ClientDeliveryBroken() {
 		return true
+	}
+	if info != nil && info.StreamStatus != nil {
+		status := info.StreamStatus
+		if status.EndReason == relaycommon.StreamEndReasonClientGone &&
+			!errors.Is(status.EndError, relaycommon.ErrAutoExplorationTimeout) {
+			return true
+		}
+		// Older/custom scanners can report a canceled upstream read before the
+		// client-gone branch wins. Require the live request's cancellation too;
+		// a read failure on an active request remains upstream evidence.
+		if status.EndReason == relaycommon.StreamEndReasonScannerErr &&
+			c != nil && c.Request != nil && c.Request.Context().Err() != nil &&
+			(errors.Is(status.EndError, context.Canceled) || errors.Is(status.EndError, context.DeadlineExceeded)) {
+			return true
+		}
 	}
 	if autoModelRequestContextError(c) == nil {
 		return false

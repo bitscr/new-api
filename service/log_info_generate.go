@@ -43,7 +43,7 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	other["cache_ratio"] = cacheRatio
 	other["model_price"] = modelPrice
 	other["user_group_ratio"] = userGroupRatio
-	other["frt"] = float64(relayInfo.FirstResponseTime.UnixMilli() - relayInfo.StartTime.UnixMilli())
+	appendResponseTiming(relayInfo, other)
 	if relayInfo.ReasoningEffort != "" {
 		other["reasoning_effort"] = relayInfo.ReasoningEffort
 	}
@@ -80,6 +80,41 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	appendParamOverrideInfo(relayInfo, other)
 	appendStreamStatus(relayInfo, other)
 	return other
+}
+
+func appendResponseTiming(relayInfo *relaycommon.RelayInfo, other map[string]interface{}) {
+	if relayInfo == nil || other == nil {
+		return
+	}
+	other["frt_known"] = false
+	if relayInfo.StartTime.IsZero() {
+		return
+	}
+
+	// frt remains request-relative, but must describe the final attempt. A
+	// failed attempt's first response was never delivered by auto staging and
+	// must not make a later successful response appear faster than it was.
+	firstResponse := relayInfo.FirstResponseTime
+	responseKnown := !firstResponse.IsZero()
+	if !relayInfo.AttemptStartTime.IsZero() {
+		latency, known := relayInfo.AttemptFirstResponseLatency()
+		responseKnown = known
+		if known {
+			firstResponse = relayInfo.AttemptStartTime.Add(latency)
+		}
+	}
+	if responseKnown && !firstResponse.Before(relayInfo.StartTime) {
+		other["frt"] = float64(firstResponse.Sub(relayInfo.StartTime).Milliseconds())
+		other["frt_known"] = true
+	}
+
+	// A first response can be metadata or a heartbeat. Keep the actual answer
+	// observation separate, including its dispatch-relative route sample.
+	if latency, known := relayInfo.AttemptFirstValidOutputLatency(); known &&
+		!relayInfo.AttemptFirstValidOutputTime.Before(relayInfo.StartTime) {
+		other["first_valid_output_ms"] = float64(relayInfo.AttemptFirstValidOutputTime.Sub(relayInfo.StartTime).Milliseconds())
+		other["attempt_first_valid_output_ms"] = float64(latency.Milliseconds())
+	}
 }
 
 func appendParamOverrideInfo(relayInfo *relaycommon.RelayInfo, other map[string]interface{}) {

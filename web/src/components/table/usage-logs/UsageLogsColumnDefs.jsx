@@ -236,7 +236,15 @@ function renderUseTime(type, t) {
 }
 
 function renderFirstUseTime(type, t) {
-  let time = parseFloat(type) / 1000.0;
+  const firstResponseMs = Number.parseFloat(type);
+  if (!Number.isFinite(firstResponseMs) || firstResponseMs < 0) {
+    return (
+      <Tag color='grey' shape='circle'>
+        {t('未知')}
+      </Tag>
+    );
+  }
+  let time = firstResponseMs / 1000.0;
   time = time.toFixed(1);
   if (time < 3) {
     return (

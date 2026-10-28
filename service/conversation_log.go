@@ -59,6 +59,7 @@ func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.
 	if len(snapshot.ClientRequestBody) == 0 && len(snapshot.ClientResponseBody) == 0 {
 		return
 	}
+	logConversationDiagnostic(ctx, relayInfo, snapshot)
 	upstreamModelName := relayInfo.UpstreamModelName
 	if relayInfo.IsModelMappingFullActive() {
 		displayModel := relayInfo.GetDisplayModelName()
@@ -83,6 +84,7 @@ func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.
 		"final_request_format":     relayInfo.GetFinalRequestRelayFormat(),
 		"other":                    other,
 		"node_name":                common.NodeName,
+		"upstream_session_headers": snapshot.UpstreamSessionHeaderDiagnostic,
 	})
 
 	log := &model.ConversationLog{

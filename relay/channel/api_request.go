@@ -501,14 +501,14 @@ func DoWssRequestWithResponse(a Adaptor, c *gin.Context, info *common.RelayInfo)
 	return dialer.DialContext(c.Request.Context(), fullRequestURL, targetHeader)
 }
 
-// startPingKeepAlive starts the SSE keepalive. The returned stop function
-// cancels the ticker and waits for the ping goroutine and any in-flight write,
-// so the caller may safely replace c.Writer after it returns.
+// startPingKeepAlive starts the SSE keepalive. Shutdown must wait for writes
+// before the caller replaces c.Writer or returns its Gin context to the pool.
 func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) func() {
 	pingerCtx, stopPinger := context.WithCancel(context.Background())
+	requestCtx := c.Request.Context()
+	logCtx := context.WithValue(requestCtx, common2.RequestIdKey, c.GetString(common2.RequestIdKey))
+	stopWriteCancellation := helper.BeginStreamWriteCancellation(c)
 	stopped := make(chan struct{})
-	var inFlight sync.WaitGroup
-	var pingMutex sync.Mutex
 
 	gopool.Go(func() {
 		defer close(stopped)
@@ -550,7 +550,12 @@ func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) func() {
 			select {
 			// 发送 ping 数据
 			case <-ticker.C:
-				if err := sendPingData(c, pingerCtx, &pingMutex, &inFlight); err != nil {
+				if pingerCtx.Err() != nil || requestCtx.Err() != nil {
+					return
+				}
+				// A detached write could resume after Gin reuses c for another request.
+				if err := helper.PingData(c); err != nil {
+					logger.LogError(logCtx, "SSE ping error: "+err.Error())
 					if common2.DebugEnabled {
 						println("SSE ping error, stopping goroutine:", err.Error())
 					}
@@ -560,7 +565,7 @@ func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) func() {
 			case <-pingerCtx.Done():
 				return
 			// request 结束
-			case <-c.Request.Context().Done():
+			case <-requestCtx.Done():
 				return
 			// 超时保护，防止goroutine无限运行
 			case <-pingTimeout.C:
@@ -573,66 +578,29 @@ func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) func() {
 	})
 
 	return func() {
+		defer stopWriteCancellation()
 		stopPinger()
 		select {
 		case <-stopped:
 		case <-time.After(5 * time.Second):
-			return
+			logger.LogWarn(logCtx, "SSE ping shutdown waiting for client write; retaining request writer")
+			<-stopped
 		}
-		// A write that already timed out may still be inside the writer. Wait
-		// for it (bounded) so a later writer swap cannot overlap with it.
-		drained := make(chan struct{})
-		gopool.Go(func() {
-			inFlight.Wait()
-			close(drained)
-		})
-		select {
-		case <-drained:
-		case <-time.After(5 * time.Second):
-		}
-	}
-}
-
-func sendPingData(c *gin.Context, ctx context.Context, mutex *sync.Mutex, inFlight *sync.WaitGroup) error {
-	// 增加超时控制，防止锁死等待
-	done := make(chan error, 1)
-	inFlight.Add(1)
-	go func() {
-		defer inFlight.Done()
-		mutex.Lock()
-		defer mutex.Unlock()
-
-		err := helper.PingData(c)
-		if err != nil {
-			logger.LogError(c, "SSE ping error: "+err.Error())
-			done <- err
-			return
-		}
-
-		if common2.DebugEnabled {
-			println("SSE ping data sent.")
-		}
-		done <- nil
-	}()
-
-	// 设置发送ping数据的超时时间
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(10 * time.Second):
-		return errors.New("SSE ping data send timeout")
-	case <-ctx.Done():
-		// Normal shutdown: the loop exits on the next select without logging.
-		return nil
-	case <-c.Request.Context().Done():
-		return errors.New("request context cancelled during ping")
 	}
 }
 
 func DoRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
 	return doRequest(c, req, info)
 }
+
+// Keep the upstream 3xx response at the relay boundary instead of silently
+// forwarding credentials, request bodies, or session headers to another target.
+func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	service.LogConversationUpstreamHeaderDiagnostic(c, info, req.Header)
 	var client *http.Client
 	var err error
 	if info.ChannelSetting.Proxy != "" {
@@ -643,6 +611,10 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	} else {
 		client = service.GetHttpClient()
 	}
+	// Clients are cached and shared across channels. Copy the client before
+	// overriding redirect behavior, while retaining its transport and pools.
+	relayClient := *client
+	relayClient.CheckRedirect = keepUpstreamRedirectResponse
 
 	var stopPinger func()
 	if info.IsStream {
@@ -664,7 +636,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		}
 	}
 
-	resp, err := client.Do(req)
+	resp, err := relayClient.Do(req)
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))

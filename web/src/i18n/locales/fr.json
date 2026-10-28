@@ -1831,6 +1831,8 @@
     "您无权访问此页面，请联系管理员": "Vous n'êtes pas autorisé à accéder à cette page. Veuillez contacter l'administrateur.",
     "您需要先启用两步验证或 Passkey 才能查看敏感信息。": "Vous devez d'abord activer l'authentification à deux facteurs ou Passkey pour afficher les informations sensibles.",
     "您需要先启用两步验证或 Passkey 才能执行此操作": "Vous devez d'abord activer l'authentification à deux facteurs ou Passkey pour effectuer cette opération",
+    "您需要先启用两步验证、Passkey 或设置登录密码才能查看敏感信息。": "Activez l'authentification à deux facteurs ou une clé d'accès, ou définissez un mot de passe de connexion, pour afficher les informations sensibles.",
+    "您需要先启用两步验证、Passkey 或设置登录密码才能执行此操作": "Activez l'authentification à deux facteurs ou une clé d'accès, ou définissez un mot de passe de connexion, pour effectuer cette opération",
     "您正在删除自己的帐户，将清空所有数据且不可恢复": "Vous êtes sur le point de supprimer votre compte. Toutes les données seront effacées et ne pourront pas être récupérées.",
     "您正在使用 MySQL 数据库。MySQL 是一个可靠的关系型数据库管理系统，适合生产环境使用。": "Vous utilisez la base de données MySQL. MySQL est un système de gestion de base de données relationnelle fiable, adapté aux environnements de production.",
     "您正在使用 PostgreSQL 数据库。PostgreSQL 是一个功能强大的开源关系型数据库系统，提供了出色的可靠性和数据完整性，适合生产环境使用。": "Vous utilisez la base de données PostgreSQL. PostgreSQL est un système de base de données relationnelle open-source puissant qui offre une excellente fiabilité et intégrité des données, adapté aux environnements de production.",

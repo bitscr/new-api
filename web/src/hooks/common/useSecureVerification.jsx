@@ -44,6 +44,7 @@ export const useSecureVerification = ({
   const [verificationMethods, setVerificationMethods] = useState({
     has2FA: false,
     hasPasskey: false,
+    hasPassword: false,
     passkeySupported: false,
   });
 
@@ -52,7 +53,7 @@ export const useSecureVerification = ({
 
   // 当前验证状态
   const [verificationState, setVerificationState] = useState({
-    method: null, // '2fa' | 'passkey'
+    method: null, // '2fa' | 'passkey' | 'password'
     loading: false,
     code: '',
     apiCall: null,
@@ -90,8 +91,10 @@ export const useSecureVerification = ({
       // 检查验证方式
       const methods = await checkVerificationMethods();
 
-      if (!methods.has2FA && !methods.hasPasskey) {
-        const errorMessage = t('您需要先启用两步验证或 Passkey 才能执行此操作');
+      if (!methods.has2FA && !methods.hasPasskey && !methods.hasPassword) {
+        const errorMessage = t(
+          '您需要先启用两步验证、Passkey 或设置登录密码才能执行此操作',
+        );
         showError(errorMessage);
         onError?.(new Error(errorMessage));
         return false;
@@ -104,6 +107,8 @@ export const useSecureVerification = ({
           defaultMethod = 'passkey';
         } else if (methods.has2FA) {
           defaultMethod = '2fa';
+        } else if (methods.hasPassword) {
+          defaultMethod = 'password';
         }
       }
 
@@ -197,6 +202,8 @@ export const useSecureVerification = ({
             verificationMethods.hasPasskey &&
             verificationMethods.passkeySupported
           );
+        case 'password':
+          return verificationMethods.hasPassword;
         default:
           return false;
       }
@@ -214,6 +221,9 @@ export const useSecureVerification = ({
     }
     if (verificationMethods.has2FA) {
       return '2fa';
+    }
+    if (verificationMethods.hasPassword) {
+      return 'password';
     }
     return null;
   }, [verificationMethods]);
@@ -267,7 +277,9 @@ export const useSecureVerification = ({
 
     // 便捷属性
     hasAnyVerificationMethod:
-      verificationMethods.has2FA || verificationMethods.hasPasskey,
+      verificationMethods.has2FA ||
+      verificationMethods.hasPasskey ||
+      verificationMethods.hasPassword,
     isLoading: verificationState.loading,
     currentMethod: verificationState.method,
     code: verificationState.code,

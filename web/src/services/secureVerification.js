@@ -55,6 +55,9 @@ export class SecureVerificationService {
       const hasPasskey =
         passkeyResponse.data?.success &&
         passkeyResponse.data?.data?.enabled === true;
+      const hasPassword =
+        twoFAResponse.data?.success &&
+        twoFAResponse.data?.data?.has_password === true;
 
       console.log('has2FA calculation:', {
         success: twoFAResponse.data?.success,
@@ -73,6 +76,7 @@ export class SecureVerificationService {
       const result = {
         has2FA,
         hasPasskey,
+        hasPassword,
         passkeySupported,
       };
 
@@ -82,6 +86,7 @@ export class SecureVerificationService {
       return {
         has2FA: false,
         hasPasskey: false,
+        hasPassword: false,
         passkeySupported: false,
       };
     }
@@ -167,9 +172,29 @@ export class SecureVerificationService {
   }
 
   /**
+   * 执行登录密码验证
+   * @param {string} password - 当前账号的登录密码
+   * @returns {Promise<void>}
+   */
+  static async verifyPassword(password) {
+    if (!password?.trim()) {
+      throw new Error('请输入登录密码');
+    }
+
+    const verifyResponse = await API.post('/api/verify', {
+      method: 'password',
+      code: password.trim(),
+    });
+
+    if (!verifyResponse.data?.success) {
+      throw new Error(verifyResponse.data?.message || '验证失败');
+    }
+  }
+
+  /**
    * 通用验证方法，根据验证类型执行相应的验证流程
-   * @param {string} method - 验证方式: '2fa' | 'passkey'
-   * @param {string} code - 2FA验证码（当method为'2fa'时必需）
+   * @param {string} method - 验证方式: '2fa' | 'passkey' | 'password'
+   * @param {string} code - 2FA 验证码或登录密码
    * @returns {Promise<void>}
    */
   static async verify(method, code = '') {
@@ -178,6 +203,8 @@ export class SecureVerificationService {
         return await this.verify2FA(code);
       case 'passkey':
         return await this.verifyPasskey();
+      case 'password':
+        return await this.verifyPassword(code);
       default:
         throw new Error(`不支持的验证方式: ${method}`);
     }

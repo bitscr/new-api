@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,102 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestStreamScannerHandler_RetainsRequestUntilBlockedCallbackExits(t *testing.T) {
+	// The old cleanup returned after five seconds while this callback could
+	// still write through a Gin context that the server had already reused.
+	c, resp, info := setupStreamTest(t, strings.NewReader("data: old-machine-environment\n\n"))
+	requestCtx, cancelRequest := context.WithCancel(c.Request.Context())
+	defer cancelRequest()
+	c.Request = c.Request.WithContext(requestCtx)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	returned := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	go func() {
+		StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+			close(entered)
+			<-release
+			_, _ = c.Writer.Write([]byte(data))
+		})
+		close(returned)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("callback did not enter")
+	}
+	cancelRequest()
+	select {
+	case <-returned:
+		t.Fatal("request returned with a callback still able to write into a reused Gin context")
+	case <-time.After(5200 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("request did not finish after its callback exited")
+	}
+	assert.Equal(t, relaycommon.StreamEndReasonClientGone, info.StreamStatus.EndReason)
+	assert.Equal(t, 1, info.ReceivedResponseCount)
+}
+
+func TestStreamScannerHandler_CancellationDropsQueuedMachineContent(t *testing.T) {
+	c, resp, info := setupStreamTest(t, strings.NewReader("data: first-machine\ndata: queued-machine\ndata: [DONE]\n"))
+	requestCtx, cancelRequest := context.WithCancel(c.Request.Context())
+	defer cancelRequest()
+	c.Request = c.Request.WithContext(requestCtx)
+	var got []string
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		got = append(got, data)
+		cancelRequest()
+	})
+	assert.Equal(t, []string{"first-machine"}, got)
+	assert.Equal(t, relaycommon.StreamEndReasonClientGone, info.StreamStatus.EndReason)
+}
+
+func TestStreamScannerHandler_CancellationRetainsExplorationCause(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cause  error
+		reason relaycommon.StreamEndReason
+		failed bool
+	}{
+		{"client-cancel", context.Canceled, relaycommon.StreamEndReasonClientGone, false},
+		{"exploration-timeout", relaycommon.ErrAutoExplorationTimeout, relaycommon.StreamEndReasonTimeout, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, resp, info := setupStreamTest(t, strings.NewReader("data: partial-answer\ndata: queued-answer\n"))
+			parent := c.Request.Context()
+			ctx, cancel := context.WithCancelCause(parent)
+			defer cancel(context.Canceled)
+			c.Request = c.Request.WithContext(ctx)
+			StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+				cancel(tc.cause)
+			})
+			require.Equal(t, 1, info.ReceivedResponseCount)
+			require.Equal(t, tc.reason, info.StreamStatus.EndReason)
+			require.ErrorIs(t, info.StreamStatus.EndError, tc.cause)
+			require.Equal(t, tc.failed, info.StreamStatus.IsUpstreamFailure())
+			require.NoError(t, parent.Err(), "canceling one attempt must leave its parent request active")
+		})
+	}
+}
+
+func TestStreamScannerHandler_SlowDeliveryDoesNotFailCompletedUpstream(t *testing.T) {
+	c, resp, info := setupStreamTest(t, strings.NewReader("data: complete-machine-answer\ndata: [DONE]\n"))
+	constant.StreamingTimeout = 1
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		// The upstream has already sent its terminal event while the client
+		// takes longer than the upstream silence timeout to process this chunk.
+		time.Sleep(1200 * time.Millisecond)
+	})
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	assert.False(t, info.StreamStatus.IsUpstreamFailure())
+}
 
 func init() {
 	gin.SetMode(gin.TestMode)

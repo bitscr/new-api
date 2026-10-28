@@ -3,13 +3,64 @@ package channel
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+type blockedPingResponseWriter struct {
+	gin.ResponseWriter
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockedPingResponseWriter) Write(data []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.release
+	return w.ResponseWriter.Write(data)
+}
+
+func TestPingKeepAlive_ShutdownRetainsBlockedRequestWriter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	writer := &blockedPingResponseWriter{
+		ResponseWriter: c.Writer,
+		entered:        make(chan struct{}),
+		release:        make(chan struct{}),
+	}
+	c.Writer = writer
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(writer.release) }) }
+	defer unblock()
+	stop := startPingKeepAlive(c, time.Millisecond)
+	select {
+	case <-writer.entered:
+	case <-time.After(time.Second):
+		t.Fatal("ping did not enter the writer")
+	}
+	stopped := make(chan struct{})
+	go func() { stop(); close(stopped) }()
+	select {
+	case <-stopped:
+		t.Fatal("shutdown returned while a ping could still use a recycled Gin context")
+	case <-time.After(5200 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not complete after the writer returned")
+	}
+	require.Equal(t, ": PING\n\n", recorder.Body.String())
+}
 
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
 	t.Parallel()

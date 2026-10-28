@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
 	"testing"
 
@@ -40,4 +41,70 @@ func TestAutoModelClientAbandonedOnlyOnInterruptedDelivery(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, autoModelClientAbandoned(c, info),
 		"ctx 取消但正文已经写完：客户端是收完才关的，必须照常记分")
+}
+
+func TestAutoModelClientAbandonedRecognizesCanceledPartialStreams(t *testing.T) {
+	for _, auto := range []bool{false, true} {
+		for _, tc := range []struct {
+			name     string
+			reason   relaycommon.StreamEndReason
+			endErr   error
+			canceled bool
+			want     bool
+		}{
+			{"client-gone", relaycommon.StreamEndReasonClientGone, context.Canceled, true, true},
+			{"scanner-cancel-race", relaycommon.StreamEndReasonScannerErr, fmt.Errorf("read: %w", context.Canceled), true, true},
+			{"scanner-deadline-race", relaycommon.StreamEndReasonScannerErr, context.DeadlineExceeded, true, true},
+			{"active-read-canceled", relaycommon.StreamEndReasonScannerErr, context.Canceled, false, false},
+			{"real-read-failure", relaycommon.StreamEndReasonScannerErr, fmt.Errorf("unexpected EOF"), true, false},
+			{"normal-done", relaycommon.StreamEndReasonDone, nil, true, false},
+			{"normal-eof", relaycommon.StreamEndReasonEOF, nil, true, false},
+			{"exploration-timeout", relaycommon.StreamEndReasonTimeout, relaycommon.ErrAutoExplorationTimeout, false, false},
+		} {
+			t.Run(fmt.Sprintf("%s/auto=%t", tc.name, auto), func(t *testing.T) {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				if auto {
+					common.SetContextKey(c, constant.ContextKeyAutoModelClientName, "auto")
+				}
+				request := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+				ctx, cancel := context.WithCancel(request.Context())
+				defer cancel()
+				c.Request = request.WithContext(ctx)
+				_, err := c.Writer.Write([]byte("partial answer"))
+				require.NoError(t, err)
+				if tc.canceled {
+					cancel()
+				}
+				info := &relaycommon.RelayInfo{StreamStatus: relaycommon.NewStreamStatus()}
+				info.StreamStatus.SetEndReason(tc.reason, tc.endErr)
+				require.Equal(t, tc.want, autoModelClientAbandoned(c, info))
+			})
+		}
+	}
+}
+
+func TestCanceledPartialStreamPreservesEarlierFailureFeedback(t *testing.T) {
+	c := newAutoModelFeedbackTestContext()
+	request := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	ctx, cancel := context.WithCancel(request.Context())
+	defer cancel()
+	c.Request = request.WithContext(ctx)
+	info := &relaycommon.RelayInfo{
+		UsingGroup: "default", OriginModelName: "earlier-failure",
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 1},
+	}
+	info.MarkUpstreamDispatch()
+	recordAutoModelStreamFailure(c, info, "unexpected EOF")
+	info.OriginModelName = "canceled-partial"
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	_, err := c.Writer.Write([]byte("partial answer"))
+	require.NoError(t, err)
+	cancel()
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, context.Canceled)
+	recordAutoModelStreamFailure(c, info, info.StreamStatus.Summary())
+	recordAutoModelFeedback(c, info, true)
+	recordAutoModelUnusableAnswer(c, info, "partial response")
+	pending := takeAutoModelFeedback(c)
+	require.Len(t, pending, 1, "client cancellation must neither cool this pair nor erase an earlier real failure")
+	require.Equal(t, "unexpected EOF", pending[autoModelFeedbackKey{group: "default", modelName: "earlier-failure", channelID: 1}].reason)
 }

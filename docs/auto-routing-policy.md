@@ -104,6 +104,10 @@ that status is absent from the ordinary retry list. Examples include a structure
 A generic bad request, missing endpoint, method error, or mere mention of a model
 is not enough to activate this exception. Clear account/authentication evidence
 must not become model-scoped merely because the message also mentions a model.
+An explicit upstream `No free model is compatible with this request` rejection
+also qualifies: the provider's free selector cannot serve this input, while
+another model can. Conditional wording and generic invalid-input errors do not
+gain this exception.
 Account-limit text has one scope owner: a conditional or unexplained continuation
 rejected there cannot be accepted again by a broader account-prefix fallback.
 Affirmative model-specific limits retain sibling fallback, including the existing
@@ -244,6 +248,23 @@ Manual channel-test retirement failures do not create business evidence.
 Transient keywords (`AutoModelTransientKeywords`) outrank deterministic ones and
 pin a self-healing error to the jitter ladder; context overflow is a protected
 transient failure that no keyword can override.
+The transient list may be empty: unmatched business failures already use the
+jitter ladder. Avoid broad wrapper text such as `all candidates failed` there,
+because it also suppresses a deterministic keyword inside the wrapped error.
+
+Client cancellation during a partial stream is neutral feedback even when some
+answer bytes were delivered. A scanner cancellation is treated this way only
+when the incoming request is also canceled; genuine read failures remain
+upstream evidence. A gateway exploration expiry retains its timeout cause and
+failure feedback. Normal stream completion followed by client cancellation
+continues to record the completed outcome. OpenAI stream relaying does not emit
+a synthetic success terminator after an interrupted upstream stream.
+Original structured SSE error fields are retained with bounded lengths before
+adaptor conversions, including known Responses failure events. Deterministic
+and transient keywords therefore apply to these HTTP-200 protocol rejections as
+well. Matching metadata, quoted answer text, or tool arguments cannot retire a
+model. Each new attempt clears this error observation. Error logs retain the
+original rejection instead of only the generic `protocol_error` label.
 
 Keyword writes are validated before they reach the database, because a keyword is a
 high-consequence criterion: a match removes the pair immediately. Entries shorter than
@@ -369,6 +390,61 @@ separately because increasing budgets or retry status ranges cannot fix them.
 Successful slow routes prompt a comparison with client waiting time. Advice does
 not modify configuration or recommend bypassing manual priority, cooling a slow
 success, or treating an expired failure cooldown as proof of recovery.
+
+Client cancellation is neutral regardless of how long the current attempt has
+waited. It does not add failure evidence, escalate cooldown, or erase historical
+successful latency samples. A speculative unverified route still has the
+gateway-owned exploration deadline; that timeout is distinct from a client's
+decision to stop waiting.
+
+Consumption-log `frt` is request-relative first-response time for the final
+attempt, including time spent on earlier discarded attempts. It can include
+metadata and is not first valid output. Missing timing omits `frt` and records
+`frt_known=false`; the dashboard displays unknown instead of a negative value.
+`first_valid_output_ms` is request-relative valid-output observation time, while
+`attempt_first_valid_output_ms` is the dispatch-relative sample used for route
+speed evidence.
+
+## Conversation isolation and incident evidence
+
+An API key authenticates a caller; it does not identify a conversation. Two
+clients can share a key and last question while sending different complete
+contexts. Channel affinity stores a route, not prompt history or answers.
+
+SSE callbacks and downstream writes must finish before their relay handler
+returns. Gin reuses request contexts, so a timed-out background callback cannot
+be abandoned while it still holds that context or a client writer. The scanner
+may read ahead through a bounded event queue, but provider callbacks run within
+the caller's lifetime, including semantic stop and client cancellation.
+
+When a channel's existing root-only `conversation_log_enabled` capture is
+enabled, `conversation diag:` events use the same request logger and daily
+`oneapi-YYYYMMDD.log`. They record byte counts and SHA-256 fingerprints for the
+client request, upstream request, upstream response and client response, plus
+derived assistant/tool fingerprints. Session/cache identifiers are recorded
+only as fingerprints with client/upstream field names. Final session-header
+fingerprints expose changed or injected values after header overrides. These
+diagnostics neither enable capture automatically nor print prompts, answers,
+credentials or session values.
+
+The upstream-header event records `checked=true` even if none of the known
+session headers are present. Its fingerprint fields are also retained in capture
+metadata as `upstream_session_headers`, so exported captures distinguish an
+inspected request without those headers from missing diagnostic evidence.
+
+Relay requests retain upstream 3xx responses instead of automatically following
+them. Redirect policy is applied to a copy of the shared HTTP client, preserving
+connection reuse and other callers' behavior. Error-aware flushes preserve
+candidate staging: an unvalidated auto attempt must not flush the network, while
+a real client flush failure marks delivery as broken instead of successful.
+
+Correlate captures using request ID. If foreign context is already in the client
+request, inspect client history. If it first appears in the upstream request,
+inspect gateway conversion, system prompt and overrides. If the upstream answer
+introduces it, investigate upstream session/cache handling or model fabrication.
+If the upstream answer is correct but delivered content differs, investigate the
+gateway's response conversion and delivery. Shared cache hints, equal last
+questions or cache-token hits alone do not establish conversation leakage.
 
 ## Verification
 

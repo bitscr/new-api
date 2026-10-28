@@ -54,6 +54,10 @@ type AutoAttemptResponseWriter struct {
 	committed atomic.Bool
 }
 
+func (w *AutoAttemptResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 // InstallAutoAttemptResponseWriter installs a fresh staging writer for the next
 // real upstream attempt. It refuses when the response has already started or
 // when the relay writer is not the expected concrete wrapper.
@@ -167,12 +171,17 @@ func (w *AutoAttemptResponseWriter) WriteString(data string) (int, error) {
 }
 
 func (w *AutoAttemptResponseWriter) Flush() {
+	_ = w.FlushError()
+}
+
+func (w *AutoAttemptResponseWriter) FlushError() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.committed.Load() {
-		w.ResponseWriter.Flush()
+		return FlushResponseWriter(w.ResponseWriter)
 	}
 	// Before validation, a flush must not commit the candidate.
+	return nil
 }
 
 func (w *AutoAttemptResponseWriter) Status() int {
